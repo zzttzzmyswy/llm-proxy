@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -194,5 +195,173 @@ func TestAPIKeyFallsBackToConfig(t *testing.T) {
 
 	if got := apiKey(); got != "file-key" {
 		t.Fatalf("config key should be used when env var is empty, got %q", got)
+	}
+}
+
+func TestContainsImageNested(t *testing.T) {
+	cases := []struct {
+		name string
+		req  string
+		want bool
+	}{
+		{"tool_result wraps image", `{"model":"sonnet","messages":[{"role":"user","content":[{"type":"tool_result","content":[{"type":"image","source":{"type":"base64","data":"x"}}]}]}]}`, true},
+		{"openai tool message wraps image_url", `{"model":"sonnet","messages":[{"role":"tool","content":[{"type":"image_url","image_url":{"url":"https://x"}}]}]}`, true},
+		{"plain text still false", `{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}`, false},
+		{"nested array in content", `{"model":"sonnet","messages":[{"role":"user","content":[[{"type":"image","source":{"type":"base64","data":"x"}}]]}]}`, true},
+	}
+	for _, c := range cases {
+		var req map[string]interface{}
+		if err := json.Unmarshal([]byte(c.req), &req); err != nil {
+			t.Fatalf("%s: bad json: %v", c.name, err)
+		}
+		if got := containsImage(req); got != c.want {
+			t.Errorf("%s: containsImage = %v, want %v", c.name, got, c.want)
+		} else {
+			t.Logf("%s: ok (got %v)", c.name, got)
+		}
+	}
+}
+
+// stripThinking removes thinking blocks from the outgoing request. DeepSeek-family
+// text models reject the thinking mode: they require `content[].thinking` from the
+// prior turn to be passed back verbatim, which Claude Code omits → 400
+// "content[].thinking in the thinking mode must be passed back to the API".
+func TestStripThinkingRemovesUserThinkingBlocks(t *testing.T) {
+	body := `{"model":"sonnet","messages":[{"role":"user","content":[{"type":"thinking","thinking":"secret chain"},{"type":"text","text":"hi"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"x"},{"type":"text","text":"done"}]}]}`
+	got, changed := stripThinking([]byte(body))
+	if !changed {
+		t.Fatal("stripThinking should report changed=true when thinking blocks are removed")
+	}
+	if strings.Contains(string(got), `"type":"thinking"`) {
+		t.Fatalf("thinking blocks must be removed, got: %s", got)
+	}
+	if !strings.Contains(string(got), `"type":"text"`) {
+		t.Fatalf("text blocks must be preserved, got: %s", got)
+	}
+}
+
+func TestStripThinkingLeavesPlainRequestUntouched(t *testing.T) {
+	body := `{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}`
+	got, changed := stripThinking([]byte(body))
+	if changed {
+		t.Fatal("stripThinking should report changed=false when no thinking blocks exist")
+	}
+	if string(got) != body {
+		t.Fatalf("stripThinking must not alter requests without thinking blocks, got: %s", got)
+	}
+}
+
+func TestStripThinkingNoThinkingContent(t *testing.T) {
+	body := `{"model":"sonnet","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
+	_, changed := stripThinking([]byte(body))
+	if changed {
+		t.Fatal("stripThinking should report changed=false when content has no thinking blocks")
+	}
+}
+
+// 400 "Model do not support image input" on the first attempt must transparently
+// retry with the VLM model and return the successful reply.
+func TestImageRejectRetriesWithVLM(t *testing.T) {
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+		cfg.Routing.Sonnet = ""
+	})
+
+	var mu sync.Mutex
+	models := []string{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		if json.Unmarshal(b, &m) == nil {
+			mu.Lock()
+			models = append(models, m["model"].(string))
+			mu.Unlock()
+		}
+		if m["model"] == "DeepSeek-V4-Flash-0731" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(400)
+			io.WriteString(w, `{"error":{"message":"Model do not support image input","param":"image_url","code":"InvalidParameter"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"ok"}],"model":"MiniMax-M3","id":"r1","usage":{"input_tokens":5,"output_tokens":5}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	// A request whose image is missed by static detection (e.g. hidden in an
+	// unexpected nesting), sent as sonnet → DeepSeek → 400 → must retry as MiniMax.
+	reqBody := `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}]}`
+	// containsImage DOES detect this shape, so force the missed case through an
+	// undetectable wrapper to prove the retry path is independent of detection.
+	reqBody = `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":{"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}}]}]}`
+
+	resp := callHandleMessages(t, reqBody)
+	if resp == "" {
+		t.Fatal("expected a successful reply after VLM retry, got empty")
+	}
+	if !strings.Contains(resp, `"ok"`) {
+		t.Fatalf("expected VLM success body, got: %q", resp)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(models) != 2 || models[0] != "DeepSeek-V4-Flash-0731" || models[1] != "MiniMax-M3" {
+		t.Fatalf("expected retry sequence [DeepSeek, MiniMax], got %v", models)
+	}
+}
+
+// A non-image 400 must NOT trigger the VLM retry.
+func TestNonImage400DoesNotRetry(t *testing.T) {
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	t.Cleanup(func() { cfg.Proxy.VLMModel = "" })
+
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		io.WriteString(w, `{"error":{"message":"some other error"}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	resp := callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
+	if calls != 1 {
+		t.Fatalf("non-image 400 must not retry, got %d upstream calls", calls)
+	}
+	if resp == "" {
+		t.Fatal("expected the 400 body to pass through")
+	}
+	if !strings.Contains(resp, "some other error") {
+		t.Fatalf("expected the original 400 body, got: %q", resp)
+	}
+}
+
+// When the VLM model is not configured, an image 400 must pass through unchanged.
+func TestImage400WithoutVLMConfigPassesThrough(t *testing.T) {
+	cfg.Proxy.VLMModel = ""
+	t.Cleanup(func() { cfg.Proxy.VLMModel = "" })
+
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		io.WriteString(w, `{"error":{"message":"Model do not support image input"}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
+	if calls != 1 {
+		t.Fatalf("without VLM config there must be no retry, got %d upstream calls", calls)
 	}
 }

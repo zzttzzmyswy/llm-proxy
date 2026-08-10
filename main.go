@@ -164,23 +164,44 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		body, _ = json.Marshal(req)
 	}
 
-	log.Printf("[%s] %s -> %s len=%d\n", time.Now().Format("15:04:05"), model, newModel, len(body))
-
-	proxyReq, _ := http.NewRequest("POST", cfg.Upstream.AnthropicURL+"/v1/messages", bytes.NewReader(body))
-	proxyReq.Header.Set("Content-Type", "application/json")
-	proxyReq.Header.Set("x-api-key", apiKey())
-	proxyReq.Header.Set("anthropic-version", "2023-06-01")
-	proxyReq.Header.Set("Accept", "application/json")
-
-	if beta := r.Header.Get("anthropic-beta"); beta != "" {
-		proxyReq.Header.Set("anthropic-beta", beta)
+	// Text models reject thinking mode: they require content[].thinking from the
+	// prior turn to be passed back verbatim, which Claude Code omits → 400
+	// "content[].thinking in the thinking mode must be passed back to the API".
+	// Strip thinking blocks so the request is acceptable to the text upstream.
+	if stripped, changed := stripThinking(body); changed {
+		json.Unmarshal(stripped, &req)
+		body = stripped
+		log.Printf("[THINKING] stripped thinking blocks\n")
 	}
 
-	resp, err := httpClient().Do(proxyReq)
+	log.Printf("[%s] %s -> %s len=%d\n", time.Now().Format("15:04:05"), model, newModel, len(body))
+
+	resp, err := doUpstreamRequest(body, r)
 	if err != nil {
 		log.Printf("[RESP] error: %v\n", err)
 		http.Error(w, "upstream error", 502)
 		return
+	}
+
+	// Fallback: if the text upstream rejects an image-carrying request that static
+	// detection missed (400 "Model do not support image input"), retry once with the
+	// VLM model. A non-image 400 passes through unchanged.
+	if resp.StatusCode == 400 && cfg.Proxy.VLMModel != "" && newModel != cfg.Proxy.VLMModel {
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if strings.Contains(string(respBody), "do not support image") {
+			log.Printf("[RETRY] image 400 -> vlm %s\n", cfg.Proxy.VLMModel)
+			req["model"] = cfg.Proxy.VLMModel
+			body, _ = json.Marshal(req)
+			resp, err = doUpstreamRequest(body, r)
+			if err != nil {
+				log.Printf("[RESP] retry error: %v\n", err)
+				http.Error(w, "upstream error", 502)
+				return
+			}
+		} else {
+			resp.Body = io.NopCloser(bytes.NewReader(respBody))
+		}
 	}
 	defer resp.Body.Close()
 
@@ -235,8 +256,72 @@ func routeModel(model string) string {
 	return ""
 }
 
+// doUpstreamRequest forwards the (already model-routed) body to the Anthropic
+// upstream and returns the response. Reused for the initial attempt and the VLM
+// image-fallback retry.
+func doUpstreamRequest(body []byte, r *http.Request) (*http.Response, error) {
+	proxyReq, err := http.NewRequest("POST", cfg.Upstream.AnthropicURL+"/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	proxyReq.Header.Set("Content-Type", "application/json")
+	proxyReq.Header.Set("x-api-key", apiKey())
+	proxyReq.Header.Set("anthropic-version", "2023-06-01")
+	proxyReq.Header.Set("Accept", "application/json")
+	if beta := r.Header.Get("anthropic-beta"); beta != "" {
+		proxyReq.Header.Set("anthropic-beta", beta)
+	}
+	return httpClient().Do(proxyReq)
+}
+
+// stripThinking removes `thinking` content blocks from every message. Text
+// upstreams that do not support thinking mode reject requests that carry thinking
+// blocks but omit the required pass-back, so they are dropped before forwarding.
+// Returns the modified body and whether anything changed.
+func stripThinking(body []byte) ([]byte, bool) {
+	var req map[string]interface{}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body, false
+	}
+	messages, ok := req["messages"].([]interface{})
+	if !ok {
+		return body, false
+	}
+	changed := false
+	for _, m := range messages {
+		msg, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		content, ok := msg["content"].([]interface{})
+		if !ok {
+			continue
+		}
+		filtered := content[:0]
+		for _, block := range content {
+			b, ok := block.(map[string]interface{})
+			if ok && b["type"] == "thinking" {
+				changed = true
+				continue
+			}
+			filtered = append(filtered, block)
+		}
+		msg["content"] = filtered
+	}
+	if !changed {
+		return body, false
+	}
+	out, err := json.Marshal(req)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
 // containsImage reports whether any message in the request carries an image block
 // (Anthropic "image" or OpenAI "image_url"), which text-only upstreams reject.
+// The scan recurses into nested content (tool results, arrays) because Claude Code
+// routinely wraps screenshots inside tool_result blocks.
 func containsImage(req map[string]interface{}) bool {
 	messages, ok := req["messages"].([]interface{})
 	if !ok {
@@ -247,17 +332,39 @@ func containsImage(req map[string]interface{}) bool {
 		if !ok {
 			continue
 		}
-		content, ok := msg["content"].([]interface{})
-		if !ok {
-			continue
+		if contentHasImage(msg["content"]) {
+			return true
 		}
-		for _, block := range content {
-			b, ok := block.(map[string]interface{})
-			if !ok {
-				continue
+	}
+	return false
+}
+
+func contentHasImage(v interface{}) bool {
+	switch c := v.(type) {
+	case string:
+		return false
+	case []interface{}:
+		for _, item := range c {
+			if blockHasImage(item) {
+				return true
 			}
-			switch b["type"] {
-			case "image", "image_url":
+		}
+	}
+	return false
+}
+
+func blockHasImage(v interface{}) bool {
+	switch b := v.(type) {
+	case map[string]interface{}:
+		switch b["type"] {
+		case "image", "image_url":
+			return true
+		}
+		// Recurse into wrapped content (e.g. tool_result.content, nested arrays).
+		return contentHasImage(b["content"])
+	case []interface{}:
+		for _, item := range b {
+			if blockHasImage(item) {
 				return true
 			}
 		}
