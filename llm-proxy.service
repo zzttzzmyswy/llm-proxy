@@ -1,0 +1,13 @@
+[Unit]
+Description=LLM Proxy Go
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/llm-proxy
+Restart=always
+RestartSec=3
+# Optional: pass secrets via the environment instead of the config file
+# Environment=SOPHNET_API_KEY=your-key-here
+
+[Install]
+WantedBy=multi-user.target

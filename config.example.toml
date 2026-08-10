@@ -1,0 +1,22 @@
+# Example configuration for llm-proxy.
+# Copy to /etc/llm-proxy/config.toml (or point LLM_PROXY_CONFIG at it) and fill in
+# your real upstream key. Never commit a config that contains a real key.
+
+[proxy]
+port = 8088
+# VLM model used for image-carrying requests (text-only upstreams reject images).
+vlm_model = "MiniMax-M3"
+
+[upstream]
+anthropic_url = "https://www.sophnet.com/api/open-apis/anthropic"
+openai_url = "https://www.sophnet.com/api/open-apis/openai"
+
+[keys]
+# Alternative: export SOPHNET_API_KEY=... and leave this empty.
+sophnet = ""
+
+[routing]
+sonnet = "DeepSeek-V4-Flash-0731"
+opus = "DeepSeek-V4-Flash-0731"
+# haiku defaults to sonnet when omitted
+# haiku = "DeepSeek-V4-Flash-0731"
