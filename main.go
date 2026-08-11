@@ -23,8 +23,9 @@ type Config struct {
 }
 
 type ProxyConfig struct {
-	Port     int    `toml:"port"`
-	VLMModel string `toml:"vlm_model"`
+	Port         int    `toml:"port"`
+	VLMModel     string `toml:"vlm_model"`
+	VLMMaxTokens int    `toml:"vlm_max_tokens"`
 }
 
 type UpstreamConfig struct {
@@ -79,6 +80,9 @@ func loadConfig() error {
 	}
 	if cfg.Proxy.VLMModel == "" {
 		cfg.Proxy.VLMModel = "Qwen3.5-397B-A17B"
+	}
+	if cfg.Proxy.VLMMaxTokens == 0 {
+		cfg.Proxy.VLMMaxTokens = 8000
 	}
 	if cfg.Upstream.AnthropicURL == "" {
 		cfg.Upstream.AnthropicURL = "https://www.sophnet.com/api/open-apis/anthropic"
@@ -151,13 +155,23 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		model = m
 	}
 
-	// Route model: image-carrying requests go to the VLM model (text models like
-	// DeepSeek reject image input with 400 InvalidParameter). Otherwise map by name.
-	newModel := ""
+	// Routing strategy:
+	//   - text-only requests go to the mapped text model (LLM)
+	//   - image-carrying requests first send each image to the VLM for a
+	//     description, replace the image blocks with text describing them, then
+	//     route the now text-only request to the text model
+	//   - if the VLM describe pass fails (upstream error / timeout), fall back to
+	//     routing the original request to the VLM so the images are still handled
+	newModel := routeModel(model)
 	if containsImage(req) && cfg.Proxy.VLMModel != "" {
-		newModel = cfg.Proxy.VLMModel
-	} else {
-		newModel = routeModel(model)
+		if describeImages(req) {
+			body, _ = json.Marshal(req)
+		} else {
+			// Describe failed partway (some images replaced, some not): restore the
+			// original request and route the whole thing to the VLM so no image is lost.
+			json.Unmarshal(body, &req)
+			newModel = cfg.Proxy.VLMModel
+		}
 	}
 	if newModel != "" {
 		req["model"] = newModel
@@ -351,6 +365,209 @@ func contentHasImage(v interface{}) bool {
 		}
 	}
 	return false
+}
+
+// describeImages replaces every image block in the request with a text block that
+// carries the VLM's description of that image ("这里有一个 image，其内容如下：xxx").
+// The image itself is decoded to base64 and sent to the VLM. Returns false when the
+// describe pass fails (e.g. upstream unavailable), in which case the caller falls
+// back to routing the unmodified request to the VLM model.
+func describeImages(req map[string]interface{}) bool {
+	messages, hasMessages := req["messages"].([]interface{})
+	if !hasMessages {
+		return true
+	}
+	ok := true
+	for _, m := range messages {
+		msg, isMap := m.(map[string]interface{})
+		if !isMap {
+			continue
+		}
+		if !describeContent(msg["content"]) {
+			ok = false
+		}
+	}
+	return ok
+}
+
+func describeContent(v interface{}) bool {
+	switch c := v.(type) {
+	case string:
+		return true
+	case []interface{}:
+		for i, item := range c {
+			if !describeBlock(item) {
+				return false
+			}
+			if b, isMap := item.(map[string]interface{}); isMap && isImageBlock(b) {
+				block, ok := imageDescriptionBlock(b)
+				if !ok {
+					return false
+				}
+				c[i] = block
+			}
+		}
+		return true
+	}
+	return true
+}
+
+func describeBlock(v interface{}) bool {
+	switch b := v.(type) {
+	case map[string]interface{}:
+		if isImageBlock(b) {
+			return true
+		}
+		return describeContent(b["content"])
+	case []interface{}:
+		return describeContent(b)
+	}
+	return true
+}
+
+func isImageBlock(b map[string]interface{}) bool {
+	switch b["type"] {
+	case "image", "image_url":
+		return true
+	}
+	return false
+}
+
+// imageDescriptionBlock asks the VLM to describe the image and returns a text block
+// carrying that description. ok is false when the describe call failed, signalling
+// the caller to fall back to VLM routing instead of losing the image.
+func imageDescriptionBlock(b map[string]interface{}) (block map[string]interface{}, ok bool) {
+	desc, ok := describeImageWithVLM(b)
+	if !ok {
+		return nil, false
+	}
+	return map[string]interface{}{
+		"type": "text",
+		"text": fmt.Sprintf("这里有一个 image，其内容如下：%s", desc),
+	}, true
+}
+
+// describeImageWithVLM calls the VLM model with the single image block and returns
+// the model's description.
+func describeImageWithVLM(block map[string]interface{}) (string, bool) {
+	img := block
+	// OpenAI-style image_url with a data URL must be converted to an Anthropic
+	// image block, or the upstream rejects it. Non-data image_urls (remote URLs)
+	// are passed through as-is.
+	if b, ok := block["type"].(string); ok && b == "image_url" {
+		if u, ok := block["image_url"].(map[string]interface{}); ok {
+			if url, ok := u["url"].(string); ok && strings.HasPrefix(url, "data:") {
+				if anthro := imageBlockFromDataURL(url); anthro != nil {
+					img = anthro
+				}
+			}
+		}
+	}
+
+	req := map[string]interface{}{
+		"model":      cfg.Proxy.VLMModel,
+		"max_tokens": cfg.Proxy.VLMMaxTokens,
+		"messages": []interface{}{
+			map[string]interface{}{
+				"role": "user",
+				"content": []interface{}{
+					img,
+					map[string]interface{}{"type": "text", "text": "请详细描述这张图片的内容。"},
+				},
+			},
+		},
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return "", false
+	}
+
+	httpReq, err := http.NewRequest("POST", cfg.Upstream.AnthropicURL+"/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		return "", false
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-api-key", apiKey())
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	httpReq.Header.Set("Accept", "application/json")
+
+	resp, err := httpClient().Do(httpReq)
+	if err != nil {
+		log.Printf("[VLM] describe error: %v\n", err)
+		return "", false
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		log.Printf("[VLM] describe status=%d body=%s\n", resp.StatusCode, truncate(string(respBody), 200))
+		return "", false
+	}
+
+	desc := extractTextFromResponse(respBody)
+	if desc == "" {
+		log.Printf("[VLM] describe returned empty text\n")
+		return "", false
+	}
+	log.Printf("[VLM] described image: %s\n", truncate(desc, 200))
+	return desc, true
+}
+
+// imageBlockFromDataURL converts a `data:<media_type>;base64,<data>` URL into an
+// Anthropic image block. Returns nil if the URL is not a base64 data URL.
+func imageBlockFromDataURL(url string) map[string]interface{} {
+	i := strings.Index(url, ",")
+	if i < 0 {
+		return nil
+	}
+	meta := strings.TrimPrefix(url[:i], "data:")
+	parts := strings.Split(meta, ";")
+	mediaType := ""
+	for _, p := range parts {
+		if strings.HasPrefix(p, "image/") {
+			mediaType = p
+			break
+		}
+	}
+	if mediaType == "" {
+		return nil
+	}
+	return map[string]interface{}{
+		"type": "image",
+		"source": map[string]interface{}{
+			"type":       "base64",
+			"media_type": mediaType,
+			"data":       url[i+1:],
+		},
+	}
+}
+
+// extractTextFromResponse concatenates the top-level text blocks from a
+// non-streaming Anthropic /v1/messages response.
+func extractTextFromResponse(respBody []byte) string {
+	var resp struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, c := range resp.Content {
+		if c.Type == "text" {
+			sb.WriteString(c.Text)
+		}
+	}
+	return sb.String()
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 func blockHasImage(v interface{}) bool {

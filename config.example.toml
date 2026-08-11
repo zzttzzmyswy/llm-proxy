@@ -4,8 +4,11 @@
 
 [proxy]
 port = 8088
-# VLM model used for image-carrying requests (text-only upstreams reject images).
+# VLM model used to describe image-carrying requests before they are routed to the
+# text model (the description is inserted in place of the image).
 vlm_model = "MiniMax-M3"
+# Max output tokens for each image-description call.
+vlm_max_tokens = 8000
 
 [upstream]
 anthropic_url = "https://www.sophnet.com/api/open-apis/anthropic"

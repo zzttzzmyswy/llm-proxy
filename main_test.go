@@ -57,21 +57,9 @@ func callHandleMessages(t *testing.T, reqBody string) string {
 	return w.Body.String()
 }
 
-// An Anthropic request carrying an image block must be routed to the VLM model,
-// not the text model that rejects image input.
-func TestImageRequestRoutedToVLM(t *testing.T) {
-	cfg.Proxy.VLMModel = "MiniMax-M3"
-	t.Cleanup(func() { cfg.Proxy.VLMModel = "" })
-
-	got := modelSentToUpstream(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"describe"}]}]}`)
-
-	if got != "MiniMax-M3" {
-		t.Fatalf("image request should route to VLM model, upstream received %q", got)
-	}
-}
-
-// An Anthropic request without images keeps the text routing.
-func TestTextRequestKeepsTextRouting(t *testing.T) {
+// An Anthropic request carrying an image block must first have its images described
+// by the VLM, then route the now-text-only request to the text model.
+func TestImageRequestDescribedThenRoutedToText(t *testing.T) {
 	cfg.Proxy.VLMModel = "MiniMax-M3"
 	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
 	t.Cleanup(func() {
@@ -79,22 +67,269 @@ func TestTextRequestKeepsTextRouting(t *testing.T) {
 		cfg.Routing.Sonnet = ""
 	})
 
-	got := modelSentToUpstream(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"describe this"}]}`)
+	got := modelSentToUpstream(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"describe"}]}]}`)
 
 	if got != cfg.Routing.Sonnet {
-		t.Fatalf("text request should keep text routing, upstream received %q", got)
+		t.Fatalf("image request should route to text model after describe, upstream received %q", got)
 	}
 }
 
-// OpenAI-style image_url blocks (Claude Code adapters) must also route to the VLM.
-func TestImageURLBlockRoutedToVLM(t *testing.T) {
+// A request carrying an image must have the image replaced by a VLM description
+// (text block "这里有一个 image，其内容如下：...") before being sent to the text model.
+func TestImageReplacedWithVLMDescription(t *testing.T) {
 	cfg.Proxy.VLMModel = "MiniMax-M3"
-	t.Cleanup(func() { cfg.Proxy.VLMModel = "" })
+	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+		cfg.Routing.Sonnet = ""
+	})
 
-	got := modelSentToUpstream(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},{"type":"text","text":"describe"}]}]}`)
+	var describeCalls int
+	var finalBody string
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		if json.Unmarshal(b, &m) != nil {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		model, _ := m["model"].(string)
+		if model == "MiniMax-M3" {
+			describeCalls++
+			// VLM describe reply
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"这是 MiniMax 对图片的描述。"}],"model":"MiniMax-M3","id":"vlm-1","usage":{"input_tokens":5,"output_tokens":5}}`)
+			return
+		}
+		finalBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, nonStreamJSONBody)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
 
-	if got != "MiniMax-M3" {
-		t.Fatalf("image_url request should route to VLM model, upstream received %q", got)
+	reqBody := `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"describe"}]}]}`
+	callHandleMessages(t, reqBody)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if describeCalls != 1 {
+		t.Fatalf("expected exactly 1 VLM describe call, got %d", describeCalls)
+	}
+	if !strings.Contains(finalBody, "这里有一个 image，其内容如下：这是 MiniMax 对图片的描述。") {
+		t.Fatalf("final request must carry the VLM description inserted in place of the image, got: %s", finalBody)
+	}
+	if strings.Contains(finalBody, `"type":"image"`) {
+		t.Fatalf("final request must not carry the original image block, got: %s", finalBody)
+	}
+	var m map[string]interface{}
+	json.Unmarshal([]byte(finalBody), &m)
+	if mm, _ := m["model"].(string); mm != "DeepSeek-V4-Flash-0731" {
+		t.Fatalf("final request must go to the text model, got model %q", mm)
+	}
+}
+
+// When the VLM describe call fails (non-200), the request must fall back to routing
+// to the VLM model unchanged so the image is not lost.
+func TestImageDescribeFailFallsBackToVLM(t *testing.T) {
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+		cfg.Routing.Sonnet = ""
+	})
+
+	var calls int
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		json.Unmarshal(b, &m)
+		mu.Lock()
+		calls++
+		n := calls
+		model, _ := m["model"].(string)
+		mu.Unlock()
+		if model == "MiniMax-M3" {
+			if n == 1 {
+				// First MiniMax call is the describe pass: fail it.
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(500)
+				io.WriteString(w, `{"error":{"message":"vlm down"}}`)
+				return
+			}
+			// Second MiniMax call is the VLM fallback: succeed with an image-aware reply.
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"vlm fallback ok"}],"model":"MiniMax-M3","id":"vlm-2","usage":{"input_tokens":5,"output_tokens":5}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, nonStreamJSONBody)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	reqBody := `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
+	resp := callHandleMessages(t, reqBody)
+
+	mu.Lock()
+	defer mu.Unlock()
+	// describe (1, fails) + fallback to VLM (2)
+	if calls != 2 {
+		t.Fatalf("expected 2 upstream calls (describe fail + VLM fallback), got %d", calls)
+	}
+	if !strings.Contains(resp, "vlm fallback ok") {
+		t.Fatalf("expected the VLM fallback reply, got: %q", resp)
+	}
+}
+
+// OpenAI-style image_url data URLs must also be described by the VLM, then routed
+// to the text model. The VLM describe call must convert the data URL to an Anthropic
+// image block.
+func TestImageURLDataDescribedThenRoutedToText(t *testing.T) {
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+		cfg.Routing.Sonnet = ""
+	})
+
+	var describeBody string
+	var finalModel string
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		json.Unmarshal(b, &m)
+		mu.Lock()
+		defer mu.Unlock()
+		model, _ := m["model"].(string)
+		if model == "MiniMax-M3" {
+			describeBody = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"图片描述结果"}],"model":"MiniMax-M3","id":"vlm-1","usage":{"input_tokens":5,"output_tokens":5}}`)
+			return
+		}
+		finalModel = model
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, nonStreamJSONBody)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	reqBody := `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,QUFB"}},{"type":"text","text":"describe"}]}]}`
+	callHandleMessages(t, reqBody)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if finalModel != "DeepSeek-V4-Flash-0731" {
+		t.Fatalf("image_url request should route to text model after describe, got %q", finalModel)
+	}
+	if !strings.Contains(describeBody, `"type":"image"`) {
+		t.Fatalf("VLM describe call should convert data URL to Anthropic image block, got: %s", describeBody)
+	}
+	if !strings.Contains(describeBody, `"media_type":"image/png"`) {
+		t.Fatalf("VLM describe call should carry media_type, got: %s", describeBody)
+	}
+}
+
+// Images nested inside tool_result content must be described and replaced too.
+func TestNestedToolResultImageDescribed(t *testing.T) {
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+		cfg.Routing.Sonnet = ""
+	})
+
+	var finalBody string
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		json.Unmarshal(b, &m)
+		mu.Lock()
+		defer mu.Unlock()
+		model, _ := m["model"].(string)
+		if model == "MiniMax-M3" {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"截图描述"}],"model":"MiniMax-M3","id":"vlm-1","usage":{"input_tokens":5,"output_tokens":5}}`)
+			return
+		}
+		finalBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, nonStreamJSONBody)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	reqBody := `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}]}`
+	callHandleMessages(t, reqBody)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(finalBody, "这里有一个 image，其内容如下：截图描述") {
+		t.Fatalf("nested tool_result image must be replaced with VLM description, got: %s", finalBody)
+	}
+	if strings.Contains(finalBody, `"type":"image"`) {
+		t.Fatalf("nested image must be replaced, got: %s", finalBody)
+	}
+}
+
+// A request with multiple images must describe each and replace them all in order.
+func TestMultipleImagesAllDescribed(t *testing.T) {
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+		cfg.Routing.Sonnet = ""
+	})
+
+	var describeCount int
+	var finalBody string
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		json.Unmarshal(b, &m)
+		mu.Lock()
+		defer mu.Unlock()
+		model, _ := m["model"].(string)
+		if model == "MiniMax-M3" {
+			describeCount++
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"描述"}],"model":"MiniMax-M3","id":"vlm-1","usage":{"input_tokens":5,"output_tokens":5}}`)
+			return
+		}
+		finalBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, nonStreamJSONBody)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	reqBody := `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"A"}},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"B"}}]}]}`
+	callHandleMessages(t, reqBody)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if describeCount != 2 {
+		t.Fatalf("expected 2 VLM describe calls, got %d", describeCount)
+	}
+	if n := strings.Count(finalBody, "这里有一个 image，其内容如下：描述"); n != 2 {
+		t.Fatalf("expected 2 descriptions inserted, got %d: %s", n, finalBody)
 	}
 }
 
