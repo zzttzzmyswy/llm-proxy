@@ -19,6 +19,8 @@ Claude Code 默认只认 Anthropic 官方模型名（`sonnet` / `opus` / `haiku`
              └─ 描述失败时回退：整请求原样路由到 VLM，保证图片不丢失
 ```
 
+> **描述缓存**：VLM 描述按图片内容哈希缓存（上限 20MB，LRU 淘汰）。对话历史里的同一张图在后续轮次重复出现时直接复用已有描述，不再重复调用 VLM。
+
 ## 功能
 
 | 特性 | 说明 |
@@ -26,6 +28,7 @@ Claude Code 默认只认 Anthropic 官方模型名（`sonnet` / `opus` / `haiku`
 | 模型路由 | `sonnet` / `opus` / `haiku` 按配置映射到上游模型名 |
 | haiku 缺省 | 配置未声明 `haiku` 时自动沿用 `sonnet` 的目标 |
 | 图片先描述后路由 | 带图请求先经 VLM 描述，把说明文本插入原图位置，再发给文本模型 |
+| 描述缓存（20MB） | 同一图片只描述一次，历史重复出现时命中缓存复用，避免每轮重复调 VLM |
 | 描述失败回退 | VLM 描述调用失败时整请求路由到 VLM，图片不丢失 |
 | 图像数据 URL 转换 | OpenAI 风格 `image_url` 的 `data:` URL 转成 Anthropic image 块再送 VLM |
 | SSE 透传 | `io.Copy` + `flushWriter` 零解析转发流式响应 |
@@ -42,6 +45,7 @@ Claude Code ──HTTP──> llm-proxy (:8088) ──HTTP──> 上游 anthrop
                           │
                           ├─ 文字请求 → 按模型名映射到文本目标模型
                           └─ 带图请求 → VLM 描述后插入文本，再发文本模型
+                                          └─ 描述按图片哈希缓存（20MB LRU）
 ```
 
 ## 快速开始
@@ -121,7 +125,7 @@ export ANTHROPIC_AUTH_TOKEN="<任意值，代理会替换为真实上游密钥>"
 go test ./...
 ```
 
-覆盖：文本/图像/`image_url` 路由、图像经 VLM 描述后插入文本并路由到文本模型、嵌套 `tool_result` 图片替换、多图逐一描述、VLM 描述失败回退到 VLM、haiku 显式路由与缺省回退、非流式 JSON 原样透传、SSE 安全网补帧与去重、环境变量覆盖配置路径与密钥。
+覆盖：文本/图像/`image_url` 路由、图像经 VLM 描述后插入文本并路由到文本模型、嵌套 `tool_result` 图片替换、多图逐一描述、VLM 描述失败回退到 VLM、描述缓存（同图跨请求命中、异图不混淆、超限淘汰、不可缓存 URL）、haiku 显式路由与缺省回退、非流式 JSON 原样透传、SSE 安全网补帧与去重、环境变量覆盖配置路径与密钥。
 
 ## 日志
 

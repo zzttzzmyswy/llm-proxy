@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -447,72 +450,6 @@ func imageDescriptionBlock(b map[string]interface{}) (block map[string]interface
 	}, true
 }
 
-// describeImageWithVLM calls the VLM model with the single image block and returns
-// the model's description.
-func describeImageWithVLM(block map[string]interface{}) (string, bool) {
-	img := block
-	// OpenAI-style image_url with a data URL must be converted to an Anthropic
-	// image block, or the upstream rejects it. Non-data image_urls (remote URLs)
-	// are passed through as-is.
-	if b, ok := block["type"].(string); ok && b == "image_url" {
-		if u, ok := block["image_url"].(map[string]interface{}); ok {
-			if url, ok := u["url"].(string); ok && strings.HasPrefix(url, "data:") {
-				if anthro := imageBlockFromDataURL(url); anthro != nil {
-					img = anthro
-				}
-			}
-		}
-	}
-
-	req := map[string]interface{}{
-		"model":      cfg.Proxy.VLMModel,
-		"max_tokens": cfg.Proxy.VLMMaxTokens,
-		"messages": []interface{}{
-			map[string]interface{}{
-				"role": "user",
-				"content": []interface{}{
-					img,
-					map[string]interface{}{"type": "text", "text": "请详细描述这张图片的内容。"},
-				},
-			},
-		},
-	}
-	body, err := json.Marshal(req)
-	if err != nil {
-		return "", false
-	}
-
-	httpReq, err := http.NewRequest("POST", cfg.Upstream.AnthropicURL+"/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return "", false
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", apiKey())
-	httpReq.Header.Set("anthropic-version", "2023-06-01")
-	httpReq.Header.Set("Accept", "application/json")
-
-	resp, err := httpClient().Do(httpReq)
-	if err != nil {
-		log.Printf("[VLM] describe error: %v\n", err)
-		return "", false
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		log.Printf("[VLM] describe status=%d body=%s\n", resp.StatusCode, truncate(string(respBody), 200))
-		return "", false
-	}
-
-	desc := extractTextFromResponse(respBody)
-	if desc == "" {
-		log.Printf("[VLM] describe returned empty text\n")
-		return "", false
-	}
-	log.Printf("[VLM] described image: %s\n", truncate(desc, 200))
-	return desc, true
-}
-
 // imageBlockFromDataURL converts a `data:<media_type>;base64,<data>` URL into an
 // Anthropic image block. Returns nil if the URL is not a base64 data URL.
 func imageBlockFromDataURL(url string) map[string]interface{} {
@@ -587,6 +524,240 @@ func blockHasImage(v interface{}) bool {
 		}
 	}
 	return false
+}
+
+// imageDescCache memoizes VLM descriptions keyed by the hash of the image bytes.
+// Conversation history is resent in full on every request, so without this cache a
+// screenshot that appears in the history is re-described on every agent turn — the
+// same image would trigger a VLM call N times. The cache is capped at 20MB of
+// combined payload + description bytes to bound process memory.
+type imageDescCache struct {
+	mu      sync.Mutex
+	max     int
+	size    int
+	entries map[string]*imgCacheEntry
+	head    *imgCacheEntry
+	tail    *imgCacheEntry
+}
+
+type imgCacheEntry struct {
+	key  string
+	desc string
+	size int
+	prev *imgCacheEntry
+	next *imgCacheEntry
+}
+
+var descCache = &imageDescCache{
+	max:     20 * 1024 * 1024,
+	entries: map[string]*imgCacheEntry{},
+}
+
+// resetImageDescCacheForTests clears the cache. Tests share the global cache, so a
+// cached description from one test would mask the VLM call in another.
+func resetImageDescCacheForTests() {
+	descCache.mu.Lock()
+	defer descCache.mu.Unlock()
+	descCache.entries = map[string]*imgCacheEntry{}
+	descCache.size = 0
+	descCache.head = nil
+	descCache.tail = nil
+}
+
+// get returns the cached description for key, or "" on miss.
+func (c *imageDescCache) get(key string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	if !ok {
+		return ""
+	}
+	// Move to front (LRU).
+	if e != c.head {
+		if e.prev != nil {
+			e.prev.next = e.next
+		}
+		if e.next != nil {
+			e.next.prev = e.prev
+		}
+		if e == c.tail {
+			c.tail = e.prev
+		}
+		e.prev = nil
+		e.next = c.head
+		c.head.prev = e
+		c.head = e
+	}
+	return e.desc
+}
+
+// put stores desc under key, evicting least-recently-used entries while total size
+// exceeds the cap.
+func (c *imageDescCache) put(key, desc string, size int) {
+	if size > c.max {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.entries[key]; ok {
+		e.desc = desc
+		e.size = size
+		c.size = c.size - e.size + size
+		return
+	}
+	e := &imgCacheEntry{key: key, desc: desc, size: size}
+	c.entries[key] = e
+	if c.head == nil {
+		c.head, c.tail = e, e
+	} else {
+		e.next = c.head
+		c.head.prev = e
+		c.head = e
+	}
+	c.size += size
+	for c.size > c.max && c.tail != nil {
+		c.removeLocked(c.tail)
+	}
+}
+
+// removeLocked drops e from the LRU list and the map. Caller holds the lock.
+func (c *imageDescCache) removeLocked(e *imgCacheEntry) {
+	delete(c.entries, e.key)
+	if e.prev != nil {
+		e.prev.next = e.next
+	}
+	if e.next != nil {
+		e.next.prev = e.prev
+	}
+	if c.head == e {
+		c.head = e.next
+	}
+	if c.tail == e {
+		c.tail = e.prev
+	}
+	c.size -= e.size
+}
+
+func (c *imageDescCache) len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.entries)
+}
+
+// imageCacheKey returns a stable cache key for an image block: the sha256 of the
+// encoded image payload. Remote image_urls (non-data URLs) have no payload to hash,
+// so they always miss and go to the VLM.
+func imageCacheKey(block map[string]interface{}) (string, bool) {
+	img := block
+	if b, ok := block["type"].(string); ok && b == "image_url" {
+		if u, ok := block["image_url"].(map[string]interface{}); ok {
+			if url, ok := u["url"].(string); ok && strings.HasPrefix(url, "data:") {
+				if anthro := imageBlockFromDataURL(url); anthro != nil {
+					img = anthro
+				} else {
+					return "", false
+				}
+			} else {
+				return "", false
+			}
+		} else {
+			return "", false
+		}
+	}
+
+	src, ok := img["source"].(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	data, ok := src["data"].(string)
+	if !ok || data == "" {
+		return "", false
+	}
+	h := sha256.Sum256([]byte(data))
+	return hex.EncodeToString(h[:]), true
+}
+
+// describeImageWithVLM calls the VLM model with the single image block and returns
+// the model's description. The result is memoized by image content hash so repeated
+// turns that resend the same image reuse the description instead of re-calling VLM.
+func describeImageWithVLM(block map[string]interface{}) (string, bool) {
+	img := block
+	// OpenAI-style image_url with a data URL must be converted to an Anthropic
+	// image block, or the upstream rejects it. Non-data image_urls (remote URLs)
+	// are passed through as-is.
+	if b, ok := block["type"].(string); ok && b == "image_url" {
+		if u, ok := block["image_url"].(map[string]interface{}); ok {
+			if url, ok := u["url"].(string); ok && strings.HasPrefix(url, "data:") {
+				if anthro := imageBlockFromDataURL(url); anthro != nil {
+					img = anthro
+				}
+			}
+		}
+	}
+
+	// Cache lookup before any network call.
+	if key, ok := imageCacheKey(block); ok {
+		if desc := descCache.get(key); desc != "" {
+			log.Printf("[VLM] cached image description hit len=%d\n", len(desc))
+			return desc, true
+		}
+	}
+
+	req := map[string]interface{}{
+		"model":      cfg.Proxy.VLMModel,
+		"max_tokens": cfg.Proxy.VLMMaxTokens,
+		"messages": []interface{}{
+			map[string]interface{}{
+				"role": "user",
+				"content": []interface{}{
+					img,
+					map[string]interface{}{"type": "text", "text": "请详细描述这张图片的内容。"},
+				},
+			},
+		},
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return "", false
+	}
+
+	httpReq, err := http.NewRequest("POST", cfg.Upstream.AnthropicURL+"/v1/messages", bytes.NewReader(body))
+	if err != nil {
+		return "", false
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-api-key", apiKey())
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	httpReq.Header.Set("Accept", "application/json")
+
+	resp, err := httpClient().Do(httpReq)
+	if err != nil {
+		log.Printf("[VLM] describe error: %v\n", err)
+		return "", false
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		log.Printf("[VLM] describe status=%d body=%s\n", resp.StatusCode, truncate(string(respBody), 200))
+		return "", false
+	}
+
+	desc := extractTextFromResponse(respBody)
+	if desc == "" {
+		log.Printf("[VLM] describe returned empty text\n")
+		return "", false
+	}
+	// Memoize the description so the same image in a later turn does not re-call VLM.
+	if key, ok := imageCacheKey(block); ok {
+		// Entry size: hashed payload length + description length.
+		entrySize := len(key) + len(desc)
+		descCache.put(key, desc, entrySize)
+		log.Printf("[VLM] described image: %s\n", truncate(desc, 200))
+	} else {
+		log.Printf("[VLM] described image (uncacheable): %s\n", truncate(desc, 200))
+	}
+	return desc, true
 }
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {

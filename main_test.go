@@ -60,6 +60,7 @@ func callHandleMessages(t *testing.T, reqBody string) string {
 // An Anthropic request carrying an image block must first have its images described
 // by the VLM, then route the now-text-only request to the text model.
 func TestImageRequestDescribedThenRoutedToText(t *testing.T) {
+	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
 	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
 	t.Cleanup(func() {
@@ -77,6 +78,7 @@ func TestImageRequestDescribedThenRoutedToText(t *testing.T) {
 // A request carrying an image must have the image replaced by a VLM description
 // (text block "这里有一个 image，其内容如下：...") before being sent to the text model.
 func TestImageReplacedWithVLMDescription(t *testing.T) {
+	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
 	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
 	t.Cleanup(func() {
@@ -136,6 +138,7 @@ func TestImageReplacedWithVLMDescription(t *testing.T) {
 // When the VLM describe call fails (non-200), the request must fall back to routing
 // to the VLM model unchanged so the image is not lost.
 func TestImageDescribeFailFallsBackToVLM(t *testing.T) {
+	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
 	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
 	t.Cleanup(func() {
@@ -193,6 +196,7 @@ func TestImageDescribeFailFallsBackToVLM(t *testing.T) {
 // to the text model. The VLM describe call must convert the data URL to an Anthropic
 // image block.
 func TestImageURLDataDescribedThenRoutedToText(t *testing.T) {
+	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
 	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
 	t.Cleanup(func() {
@@ -243,6 +247,7 @@ func TestImageURLDataDescribedThenRoutedToText(t *testing.T) {
 
 // Images nested inside tool_result content must be described and replaced too.
 func TestNestedToolResultImageDescribed(t *testing.T) {
+	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
 	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
 	t.Cleanup(func() {
@@ -288,6 +293,7 @@ func TestNestedToolResultImageDescribed(t *testing.T) {
 
 // A request with multiple images must describe each and replace them all in order.
 func TestMultipleImagesAllDescribed(t *testing.T) {
+	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
 	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
 	t.Cleanup(func() {
@@ -330,6 +336,170 @@ func TestMultipleImagesAllDescribed(t *testing.T) {
 	}
 	if n := strings.Count(finalBody, "这里有一个 image，其内容如下：描述"); n != 2 {
 		t.Fatalf("expected 2 descriptions inserted, got %d: %s", n, finalBody)
+	}
+}
+
+// The same image repeated across turns must be described only once: the second
+// request reuses the cached description without calling the VLM again.
+func TestImageDescriptionCachedAcrossRequests(t *testing.T) {
+	resetImageDescCacheForTests()
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+		cfg.Routing.Sonnet = ""
+	})
+
+	var describeCalls int
+	var finalBodies []string
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		json.Unmarshal(b, &m)
+		mu.Lock()
+		defer mu.Unlock()
+		model, _ := m["model"].(string)
+		if model == "MiniMax-M3" {
+			describeCalls++
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"稳定的图片描述"}],"model":"MiniMax-M3","id":"vlm-1","usage":{"input_tokens":5,"output_tokens":5}}`)
+			return
+		}
+		finalBodies = append(finalBodies, string(b))
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, nonStreamJSONBody)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	reqBody := `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"SAMEIMAGE"}},{"type":"text","text":"describe"}]}]}`
+	callHandleMessages(t, reqBody) // first turn: VLM call, cached
+	callHandleMessages(t, reqBody) // second turn: cache hit
+
+	mu.Lock()
+	defer mu.Unlock()
+	if describeCalls != 1 {
+		t.Fatalf("same image across turns must be described once, got %d VLM calls", describeCalls)
+	}
+	if len(finalBodies) != 2 {
+		t.Fatalf("expected 2 final upstream calls, got %d", len(finalBodies))
+	}
+	for i, fb := range finalBodies {
+		if !strings.Contains(fb, "这里有一个 image，其内容如下：稳定的图片描述") {
+			t.Fatalf("turn %d must carry the cached description, got: %s", i+1, fb)
+		}
+	}
+}
+
+// Different images must each be described; the cache must not conflate them.
+func TestDistinctImagesBothDescribed(t *testing.T) {
+	resetImageDescCacheForTests()
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+		cfg.Routing.Sonnet = ""
+	})
+
+	var describeCalls int
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		json.Unmarshal(b, &m)
+		mu.Lock()
+		defer mu.Unlock()
+		model, _ := m["model"].(string)
+		if model == "MiniMax-M3" {
+			describeCalls++
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"desc"}],"model":"MiniMax-M3","id":"vlm-1","usage":{"input_tokens":5,"output_tokens":5}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, nonStreamJSONBody)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"IMG-A"}}]}]}`)
+	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"IMG-B"}}]}]}`)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if describeCalls != 2 {
+		t.Fatalf("distinct images must each be described, got %d VLM calls", describeCalls)
+	}
+}
+
+// The cache must not grow without bound: total entry bytes stay under the 20MB cap.
+func TestImageDescCacheEvictionEnforcesCap(t *testing.T) {
+	resetImageDescCacheForTests()
+
+	oldMax := descCache.max
+	descCache.max = 100 // tiny cap for test
+	t.Cleanup(func() { descCache.max = oldMax })
+
+	// A single entry larger than the cap is not stored.
+	bigKey := strings.Repeat("k", 40)
+	descCache.put(bigKey, strings.Repeat("d", 200), 200)
+	if got := descCache.get(bigKey); got != "" {
+		t.Fatalf("entry larger than the cap must not be stored, got %q", got)
+	}
+
+	// Two entries that together exceed the cap evict the LRU one.
+	descCache.put("a", "a-desc", 60)
+	descCache.put("b", "b-desc", 60)
+	if got := descCache.get("a"); got != "" {
+		t.Fatalf("LRU entry a should be evicted once the cap is exceeded, got %q", got)
+	}
+	if got := descCache.get("b"); got != "b-desc" {
+		t.Fatalf("most-recent entry b must survive, got %q", got)
+	}
+
+	// Total size never exceeds the cap after eviction.
+	descCache.mu.Lock()
+	under := descCache.size <= descCache.max
+	descCache.mu.Unlock()
+	if !under {
+		t.Fatalf("cache size %d exceeds cap %d", descCache.size, descCache.max)
+	}
+}
+
+// imageCacheKey must return a stable key for the same image and miss for remote URLs.
+func TestImageCacheKey(t *testing.T) {
+	resetImageDescCacheForTests()
+
+	var blk map[string]interface{}
+	json.Unmarshal([]byte(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"ABCD"}}`), &blk)
+	k1, ok := imageCacheKey(blk)
+	if !ok || k1 == "" {
+		t.Fatalf("base64 image must produce a cache key, got %q ok=%v", k1, ok)
+	}
+	// Same data → same key.
+	var blk2 map[string]interface{}
+	json.Unmarshal([]byte(`{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"ABCD"}}`), &blk2)
+	k2, _ := imageCacheKey(blk2)
+	if k2 != k1 {
+		t.Fatalf("same image bytes must produce the same key, got %q vs %q", k1, k2)
+	}
+	// Different data → different key.
+	var blk3 map[string]interface{}
+	json.Unmarshal([]byte(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"ABCE"}}`), &blk3)
+	k3, _ := imageCacheKey(blk3)
+	if k3 == k1 {
+		t.Fatalf("different image bytes must produce different keys, got %q", k1)
+	}
+	// Remote image_url (no payload) → no key.
+	var blk4 map[string]interface{}
+	json.Unmarshal([]byte(`{"type":"image_url","image_url":{"url":"https://example.com/x.png"}}`), &blk4)
+	if k, ok := imageCacheKey(blk4); ok {
+		t.Fatalf("remote image_url must not be cacheable, got key %q", k)
 	}
 }
 
@@ -497,6 +667,7 @@ func TestStripThinkingNoThinkingContent(t *testing.T) {
 // 400 "Model do not support image input" on the first attempt must transparently
 // retry with the VLM model and return the successful reply.
 func TestImageRejectRetriesWithVLM(t *testing.T) {
+	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
 	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
 	t.Cleanup(func() {
