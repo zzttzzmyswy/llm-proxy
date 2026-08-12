@@ -771,3 +771,94 @@ func TestImage400WithoutVLMConfigPassesThrough(t *testing.T) {
 		t.Fatalf("without VLM config there must be no retry, got %d upstream calls", calls)
 	}
 }
+
+// stripThinking must flip the `thinking` parameter to disabled when it strips
+// thinking blocks, so the upstream does not stream a thinking response back.
+func TestStripThinkingDisablesThinkingParam(t *testing.T) {
+	body := `{"model":"sonnet","thinking":{"type":"enabled","budget_tokens":1024},"messages":[{"role":"user","content":[{"type":"thinking","thinking":"secret"},{"type":"text","text":"hi"}]}]}`
+	got, changed := stripThinking([]byte(body))
+	if !changed {
+		t.Fatal("stripThinking should report changed=true when thinking blocks are removed")
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(got, &req); err != nil {
+		t.Fatalf("stripped body must be valid JSON: %v", err)
+	}
+	thinking, ok := req["thinking"].(map[string]interface{})
+	if !ok {
+		t.Fatal("thinking param must remain present")
+	}
+	if thinking["type"] != "disabled" {
+		t.Fatalf("thinking.type should be disabled after stripping, got %q", thinking["type"])
+	}
+}
+
+// stripThinking with an adaptive thinking param must also disable it.
+func TestStripThinkingDisablesAdaptiveParam(t *testing.T) {
+	body := `{"model":"sonnet","thinking":{"type":"adaptive"},"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"x"},{"type":"text","text":"done"}]}]}`
+	got, changed := stripThinking([]byte(body))
+	if !changed {
+		t.Fatal("stripThinking should report changed=true")
+	}
+	var req map[string]interface{}
+	json.Unmarshal(got, &req)
+	thinking := req["thinking"].(map[string]interface{})
+	if thinking["type"] != "disabled" {
+		t.Fatalf("thinking.type should be disabled, got %q", thinking["type"])
+	}
+}
+
+// A thinking block whose `thinking` field is missing must be pinned to an empty
+// string so Claude Code does not crash on `.thinking.length`.
+func TestNormalizeThinkingBlockMissingThinkingField(t *testing.T) {
+	raw := json.RawMessage(`{"type":"thinking","signature":"sig123"}`)
+	out, ok := normalizeThinkingBlock(raw)
+	if !ok {
+		t.Fatal("normalize should rewrite a thinking block missing the thinking field")
+	}
+	var block map[string]interface{}
+	json.Unmarshal(out, &block)
+	if block["thinking"] != "" {
+		t.Fatalf("thinking field should be empty string, got %#v", block["thinking"])
+	}
+	if block["signature"] != "sig123" {
+		t.Fatalf("signature must be preserved, got %#v", block["signature"])
+	}
+}
+
+// A valid thinking block with a string thinking field must pass through unchanged.
+func TestNormalizeThinkingBlockValidPassesThrough(t *testing.T) {
+	raw := json.RawMessage(`{"type":"thinking","thinking":"hello","signature":"sig123"}`)
+	if _, ok := normalizeThinkingBlock(raw); ok {
+		t.Fatal("normalize should not rewrite a valid thinking block")
+	}
+}
+
+// A non-thinking block must never be rewritten.
+func TestNormalizeThinkingBlockNonThinking(t *testing.T) {
+	raw := json.RawMessage(`{"type":"text","text":"hi"}`)
+	if _, ok := normalizeThinkingBlock(raw); ok {
+		t.Fatal("normalize should not rewrite a text block")
+	}
+}
+
+// The SSE normalizing reader must rewrite a broken thinking content_block_start and
+// leave the rest of the stream intact.
+func TestThinkingNormalizingReaderRewritesBrokenThinkingStart(t *testing.T) {
+	stream := "event: message_start\ndata: {\"type\":\"message_start\"}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"signature\":\"sig123\"}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	out, err := io.ReadAll(newThinkingNormalizingReader(strings.NewReader(stream)))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.Contains(string(out), `"thinking":""`) {
+		t.Fatalf("thinking field should be normalized to empty string, got: %s", out)
+	}
+	if !strings.Contains(string(out), `"signature":"sig123"`) {
+		t.Fatalf("signature must be preserved, got: %s", out)
+	}
+	if !strings.Contains(string(out), "event: message_stop") {
+		t.Fatalf("stream tail must be preserved, got: %s", out)
+	}
+}

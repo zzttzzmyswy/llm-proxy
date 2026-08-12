@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -245,18 +246,28 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	flusher, _ := w.(http.Flusher)
 	fw := &flushWriter{w: w, f: flusher}
 
-	var buf bytes.Buffer
-	totalBytes, _ := io.Copy(io.MultiWriter(fw, &buf), resp.Body)
-
 	// Safety net: only SSE streams may be missing the closing message_stop frame.
 	// Non-streaming JSON replies must pass through untouched, or the appended SSE
 	// footer corrupts the body into invalid JSON ("API Error: Failed to parse JSON").
 	isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
-	if isSSE && !strings.Contains(buf.String(), "message_stop") {
-		log.Printf("[STREAM_END] + safety_stop bytes=%d\n", totalBytes)
-		fmt.Fprintf(fw, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	if isSSE {
+		// Streaming response: normalize malformed thinking blocks while proxying.
+		// If the upstream emits a `content_block_start` for a thinking block without a
+		// `thinking` field (observed after empty-response retries), Claude Code writes
+		// that `{type, signature}` block into its transcript and later crashes on
+		// `.thinking.length`. Rewriting the field to an empty string keeps the block
+		// valid without altering its content.
+		var buf bytes.Buffer
+		totalBytes, _ := io.Copy(io.MultiWriter(fw, &buf), newThinkingNormalizingReader(resp.Body))
+		if !strings.Contains(buf.String(), "message_stop") {
+			log.Printf("[STREAM_END] + safety_stop bytes=%d\n", totalBytes)
+			fmt.Fprintf(fw, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+		} else {
+			log.Printf("[STREAM_END] ok bytes=%d\n", totalBytes)
+		}
 	} else {
-		log.Printf("[STREAM_END] ok bytes=%d\n", totalBytes)
+		_, _ = io.Copy(fw, resp.Body)
+		log.Printf("[STREAM_END] ok bytes=non-stream\n")
 	}
 }
 
@@ -271,6 +282,98 @@ func routeModel(model string) string {
 		return cfg.Routing.Sonnet
 	}
 	return ""
+}
+
+// newThinkingNormalizingReader wraps an SSE stream and rewrites malformed thinking
+// blocks. If a `content_block_start` event carries a thinking block whose `thinking`
+// field is missing or not a string, the field is set to an empty string before the
+// event is forwarded. Upstreams (DeepSeek-family via sophnet) have been observed to
+// emit `{"type":"thinking","signature":...}` after empty-response retries; Claude
+// Code persists such a block verbatim and later crashes reading `.thinking.length`.
+// Normalizing at the proxy keeps the block structurally valid without altering text.
+func newThinkingNormalizingReader(r io.Reader) io.Reader {
+	pr, pw := io.Pipe()
+	go func() {
+		sc := bufio.NewScanner(r)
+		sc.Buffer(make([]byte, 64*1024), 1024*1024)
+		var event string
+		var data strings.Builder
+		for sc.Scan() {
+			line := sc.Text()
+			if line == "" {
+				// End of a SSE event block: emit the (possibly normalized) event.
+				emitEvent(pw, event, data.String())
+				event = ""
+				data.Reset()
+				continue
+			}
+			if strings.HasPrefix(line, ":") {
+				continue
+			}
+			if strings.HasPrefix(line, "event:") {
+				event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+				continue
+			}
+			if strings.HasPrefix(line, "data:") {
+				d := strings.TrimPrefix(line, "data:")
+				if d != "" && d[0] == ' ' {
+					d = d[1:]
+				}
+				if data.Len() > 0 {
+					data.WriteString("\n")
+				}
+				data.WriteString(d)
+			}
+		}
+		if event != "" || data.Len() > 0 {
+			emitEvent(pw, event, data.String())
+		}
+		pw.CloseWithError(sc.Err())
+	}()
+	return pr
+}
+
+// emitEvent writes one normalized SSE event block to pw. It rewrites the JSON payload
+// of `content_block_start` events whose content_block is a thinking block missing a
+// string `thinking` field.
+func emitEvent(pw *io.PipeWriter, event, data string) {
+	out := data
+	if event == "content_block_start" && data != "" {
+		var ev struct {
+			Type         string          `json:"type"`
+			ContentBlock json.RawMessage `json:"content_block"`
+		}
+		if json.Unmarshal([]byte(data), &ev) == nil && ev.Type == "content_block_start" {
+			if normalized, ok := normalizeThinkingBlock(ev.ContentBlock); ok {
+				out = string(normalized)
+			}
+		}
+	}
+	fmt.Fprintf(pw, "event: %s\ndata: %s\n\n", event, out)
+}
+
+// normalizeThinkingBlock returns a rewritten content_block JSON with a guaranteed
+// string `thinking` field when the block is a thinking block missing one. ok is
+// false when no rewrite is needed.
+func normalizeThinkingBlock(raw json.RawMessage) ([]byte, bool) {
+	var block map[string]interface{}
+	if json.Unmarshal(raw, &block) != nil {
+		return nil, false
+	}
+	if t, _ := block["type"].(string); t != "thinking" {
+		return nil, false
+	}
+	if s, isStr := block["thinking"].(string); isStr {
+		_ = s
+		return nil, false
+	}
+	// thinking field missing, null, or a non-string value → pin to empty string.
+	block["thinking"] = ""
+	out, err := json.Marshal(block)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // doUpstreamRequest forwards the (already model-routed) body to the Anthropic
@@ -294,6 +397,12 @@ func doUpstreamRequest(body []byte, r *http.Request) (*http.Response, error) {
 // stripThinking removes `thinking` content blocks from every message. Text
 // upstreams that do not support thinking mode reject requests that carry thinking
 // blocks but omit the required pass-back, so they are dropped before forwarding.
+//
+// The `thinking` parameter is also flipped to `disabled` when blocks are stripped.
+// Leaving it `enabled`/`adaptive` while the history contains no thinking blocks makes
+// the upstream stream a thinking response whose shape (thinking_delta with no
+// thinking text) can end up written back to the client as a broken `{type, signature}`
+// block, which Claude Code later crashes on (`.thinking.length` on undefined).
 // Returns the modified body and whether anything changed.
 func stripThinking(body []byte) ([]byte, bool) {
 	var req map[string]interface{}
@@ -327,6 +436,9 @@ func stripThinking(body []byte) ([]byte, bool) {
 	}
 	if !changed {
 		return body, false
+	}
+	if t, ok := req["thinking"].(map[string]interface{}); ok {
+		t["type"] = "disabled"
 	}
 	out, err := json.Marshal(req)
 	if err != nil {
