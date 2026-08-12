@@ -31,7 +31,8 @@ Claude Code 默认只认 Anthropic 官方模型名（`sonnet` / `opus` / `haiku`
 | 描述缓存（20MB） | 同一图片只描述一次，历史重复出现时命中缓存复用，避免每轮重复调 VLM |
 | 描述失败回退 | VLM 描述调用失败时整请求路由到 VLM，图片不丢失 |
 | 图像数据 URL 转换 | OpenAI 风格 `image_url` 的 `data:` URL 转成 Anthropic image 块再送 VLM |
-| SSE 透传 | `io.Copy` + `flushWriter` 零解析转发流式响应 |
+| SSE 透传 | 流式响应透传，同时规范化损坏的 thinking 块，防 Claude Code 崩溃 |
+| thinking 参数联动 | stripThinking 剥离 thinking 块时同步禁用 `thinking` 参数，防止上游回传 thinking 响应 |
 | message_stop 安全网 | 仅对 SSE 流补发缺失的 `message_stop`，防 Claude Code 卡死 |
 | 空响应检测 | 上游 0 字节响应 → 发 `error` SSE 事件，触发 Claude Code 重试 |
 | 压缩禁用 | `DisableCompression: true`，避免 gzip 破坏 SSE 缓冲 |
@@ -125,7 +126,7 @@ export ANTHROPIC_AUTH_TOKEN="<任意值，代理会替换为真实上游密钥>"
 go test ./...
 ```
 
-覆盖：文本/图像/`image_url` 路由、图像经 VLM 描述后插入文本并路由到文本模型、嵌套 `tool_result` 图片替换、多图逐一描述、VLM 描述失败回退到 VLM、描述缓存（同图跨请求命中、异图不混淆、超限淘汰、不可缓存 URL）、haiku 显式路由与缺省回退、非流式 JSON 原样透传、SSE 安全网补帧与去重、环境变量覆盖配置路径与密钥。
+覆盖：文本/图像/`image_url` 路由、图像经 VLM 描述后插入文本并路由到文本模型、嵌套 `tool_result` 图片替换、多图逐一描述、VLM 描述失败回退到 VLM、描述缓存（同图跨请求命中、异图不混淆、超限淘汰、不可缓存 URL）、haiku 显式路由与缺省回退、非流式 JSON 原样透传、SSE 安全网补帧与去重、stripThinking 剥离时禁用 thinking 参数、损坏 thinking 块规范化（缺失的 `thinking` 字段补空串且不改动其余块）、环境变量覆盖配置路径与密钥。
 
 ## 日志
 
