@@ -258,7 +258,8 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		// `.thinking.length`. Rewriting the field to an empty string keeps the block
 		// valid without altering its content.
 		var buf bytes.Buffer
-		totalBytes, _ := io.Copy(io.MultiWriter(fw, &buf), newThinkingNormalizingReader(resp.Body))
+		leak := newLeakRewriter(req)
+		totalBytes, _ := io.Copy(io.MultiWriter(fw, &buf), newResponseRewriter(resp.Body, leak))
 		if !strings.Contains(buf.String(), "message_stop") {
 			log.Printf("[STREAM_END] + safety_stop bytes=%d\n", totalBytes)
 			fmt.Fprintf(fw, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
@@ -292,6 +293,10 @@ func routeModel(model string) string {
 // Code persists such a block verbatim and later crashes reading `.thinking.length`.
 // Normalizing at the proxy keeps the block structurally valid without altering text.
 func newThinkingNormalizingReader(r io.Reader) io.Reader {
+	return newResponseRewriter(r, nil)
+}
+
+func newResponseRewriter(r io.Reader, lr *leakRewriter) io.Reader {
 	pr, pw := io.Pipe()
 	go func() {
 		sc := bufio.NewScanner(r)
@@ -302,7 +307,7 @@ func newThinkingNormalizingReader(r io.Reader) io.Reader {
 			line := sc.Text()
 			if line == "" {
 				// End of a SSE event block: emit the (possibly normalized) event.
-				emitEvent(pw, event, data.String())
+				emitEvent(pw, event, data.String(), lr)
 				event = ""
 				data.Reset()
 				continue
@@ -326,7 +331,7 @@ func newThinkingNormalizingReader(r io.Reader) io.Reader {
 			}
 		}
 		if event != "" || data.Len() > 0 {
-			emitEvent(pw, event, data.String())
+			emitEvent(pw, event, data.String(), lr)
 		}
 		pw.CloseWithError(sc.Err())
 	}()
@@ -336,7 +341,7 @@ func newThinkingNormalizingReader(r io.Reader) io.Reader {
 // emitEvent writes one normalized SSE event block to pw. It rewrites the JSON payload
 // of `content_block_start` events whose content_block is a thinking block missing a
 // string `thinking` field.
-func emitEvent(pw *io.PipeWriter, event, data string) {
+func emitEvent(pw *io.PipeWriter, event, data string, lr *leakRewriter) {
 	out := data
 	if event == "content_block_start" && data != "" {
 		var ev struct {
@@ -348,6 +353,10 @@ func emitEvent(pw *io.PipeWriter, event, data string) {
 				out = string(normalized)
 			}
 		}
+	}
+	if lr != nil {
+		lr.process(pw, event, out)
+		return
 	}
 	fmt.Fprintf(pw, "event: %s\ndata: %s\n\n", event, out)
 }
