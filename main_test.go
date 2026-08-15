@@ -808,6 +808,52 @@ func TestStripThinkingDisablesAdaptiveParam(t *testing.T) {
 	}
 }
 
+// First-request (fresh conversation) case: Claude Code sends thinking adaptive but
+// there are no thinking blocks in history yet, so nothing is stripped. Leaving the
+// param enabled makes the text upstream stream a thinking block, whose reasoning the
+// text model emits with an empty signature, and Claude Code renders the thinking
+// deltas as body text / spills them into tool calls. The proxy must clamp the param
+// to disabled even when no block is stripped.
+func TestStripThinkingDisablesParamWithoutAnyThinkingBlocks(t *testing.T) {
+	body := `{"model":"sonnet","thinking":{"type":"adaptive","budget_tokens":1024},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
+	got, changed := stripThinking([]byte(body))
+	if !changed {
+		t.Fatal("stripThinking should report changed=true when the thinking param is clamped")
+	}
+	var req map[string]interface{}
+	if err := json.Unmarshal(got, &req); err != nil {
+		t.Fatalf("stripped body must be valid JSON: %v", err)
+	}
+	thinking, ok := req["thinking"].(map[string]interface{})
+	if !ok {
+		t.Fatal("thinking param must remain present")
+	}
+	if thinking["type"] != "disabled" {
+		t.Fatalf("thinking.type must be disabled even without thinking blocks in history, got %q", thinking["type"])
+	}
+	// The text message must survive untouched.
+	messages := req["messages"].([]interface{})
+	content := messages[0].(map[string]interface{})["content"].([]interface{})
+	if len(content) != 1 {
+		t.Fatalf("no blocks should be stripped, got %d content blocks", len(content))
+	}
+	if content[0].(map[string]interface{})["type"] != "text" {
+		t.Fatalf("text block must be preserved, got %#v", content[0])
+	}
+}
+
+// A request that already disables thinking must be left untouched (no re-marshal).
+func TestStripThinkingLeavesDisabledParamAlone(t *testing.T) {
+	body := `{"model":"sonnet","thinking":{"type":"disabled"},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
+	got, changed := stripThinking([]byte(body))
+	if changed {
+		t.Fatal("stripThinking must not re-marshal an already-disabled request")
+	}
+	if string(got) != body {
+		t.Fatalf("body must pass through unchanged, got: %s", got)
+	}
+}
+
 // A thinking block whose `thinking` field is missing must be pinned to an empty
 // string so Claude Code does not crash on `.thinking.length`.
 func TestNormalizeThinkingBlockMissingThinkingField(t *testing.T) {

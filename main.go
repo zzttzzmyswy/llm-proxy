@@ -404,15 +404,14 @@ func doUpstreamRequest(body []byte, r *http.Request) (*http.Response, error) {
 	return httpClient().Do(proxyReq)
 }
 
-// stripThinking removes `thinking` content blocks from every message. Text
-// upstreams that do not support thinking mode reject requests that carry thinking
-// blocks but omit the required pass-back, so they are dropped before forwarding.
-//
-// The `thinking` parameter is also flipped to `disabled` when blocks are stripped.
-// Leaving it `enabled`/`adaptive` while the history contains no thinking blocks makes
-// the upstream stream a thinking response whose shape (thinking_delta with no
-// thinking text) can end up written back to the client as a broken `{type, signature}`
-// block, which Claude Code later crashes on (`.thinking.length` on undefined).
+// stripThinking removes `thinking` content blocks from every message and clamps the
+// `thinking` parameter to `disabled`. Text upstreams (DeepSeek family) reject thinking
+// mode when the prior turn's `content[].thinking` is not passed back verbatim, and if
+// it is left enabled they stream a thinking block whose reasoning the model emits with
+// an empty signature — Claude Code then renders the thinking_delta content as body text
+// and can spill it into tool calls. Clamping the param is done even when no thinking
+// block is present in the history (e.g. the first request of a fresh conversation), so
+// the upstream never generates a thinking response at all.
 // Returns the modified body and whether anything changed.
 func stripThinking(body []byte) ([]byte, bool) {
 	var req map[string]interface{}
@@ -444,11 +443,17 @@ func stripThinking(body []byte) ([]byte, bool) {
 		}
 		msg["content"] = filtered
 	}
-	if !changed {
-		return body, false
-	}
+	// Clamp the thinking param even when no block was stripped (first-turn requests)
+	// so the text model cannot stream a thinking response.
+	clamped := false
 	if t, ok := req["thinking"].(map[string]interface{}); ok {
-		t["type"] = "disabled"
+		if typ, _ := t["type"].(string); typ != "disabled" {
+			t["type"] = "disabled"
+			clamped = true
+		}
+	}
+	if !changed && !clamped {
+		return body, false
 	}
 	out, err := json.Marshal(req)
 	if err != nil {
