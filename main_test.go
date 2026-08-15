@@ -843,7 +843,9 @@ func TestNormalizeThinkingBlockNonThinking(t *testing.T) {
 }
 
 // The SSE normalizing reader must rewrite a broken thinking content_block_start and
-// leave the rest of the stream intact.
+// leave the rest of the stream intact. The normalized event must preserve its full
+// envelope (`type`, `index` and the nested content_block), or Claude Code fails to
+// recognize the start of a thinking block and renders its `thinking_delta` as body text.
 func TestThinkingNormalizingReaderRewritesBrokenThinkingStart(t *testing.T) {
 	stream := "event: message_start\ndata: {\"type\":\"message_start\"}\n\n" +
 		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"signature\":\"sig123\"}}\n\n" +
@@ -852,13 +854,68 @@ func TestThinkingNormalizingReaderRewritesBrokenThinkingStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if !strings.Contains(string(out), `"thinking":""`) {
-		t.Fatalf("thinking field should be normalized to empty string, got: %s", out)
+	raw := string(out)
+	if !strings.Contains(raw, `"thinking":""`) {
+		t.Fatalf("thinking field should be normalized to empty string, got: %s", raw)
 	}
-	if !strings.Contains(string(out), `"signature":"sig123"`) {
-		t.Fatalf("signature must be preserved, got: %s", out)
+	if !strings.Contains(string(raw), `"signature":"sig123"`) {
+		t.Fatalf("signature must be preserved, got: %s", raw)
 	}
-	if !strings.Contains(string(out), "event: message_stop") {
-		t.Fatalf("stream tail must be preserved, got: %s", out)
+	if !strings.Contains(string(raw), "event: message_stop") {
+		t.Fatalf("stream tail must be preserved, got: %s", raw)
 	}
+	// The rewritten content_block_start must keep its event payload envelope — a
+	// `type` of `content_block_start` and its `index` — or Claude Code drops the
+	// block as unparseable and leaks the thinking deltas into the body text.
+	var ev struct {
+		Type         string `json:"type"`
+		Index        int    `json:"index"`
+		ContentBlock struct {
+			Type     string `json:"type"`
+			Thinking string `json:"thinking"`
+		} `json:"content_block"`
+	}
+	if err := json.Unmarshal([]byte(ssePayload(raw, "content_block_start")), &ev); err != nil {
+		t.Fatalf("content_block_start event should remain valid JSON, got: %s", raw)
+	}
+	if ev.Type != "content_block_start" {
+		t.Fatalf("event payload type must stay content_block_start, got %q", ev.Type)
+	}
+	if ev.Index != 0 {
+		t.Fatalf("event payload index must be preserved, got %d", ev.Index)
+	}
+	if ev.ContentBlock.Type != "thinking" {
+		t.Fatalf("content_block.type must stay thinking, got %q", ev.ContentBlock.Type)
+	}
+	if ev.ContentBlock.Thinking != "" {
+		t.Fatalf("content_block.thinking must be normalized to empty string, got %q", ev.ContentBlock.Thinking)
+	}
+}
+
+// ssePayload extracts the data: JSON of the first event whose `event:` label matches.
+func ssePayload(stream, wantEvent string) string {
+	var curEvent, curData string
+	for _, line := range strings.Split(stream, "\n") {
+		if line == "" {
+			if curEvent == wantEvent {
+				return curData
+			}
+			curEvent, curData = "", ""
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			curEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+		}
+		if strings.HasPrefix(line, "data:") {
+			d := strings.TrimPrefix(line, "data:")
+			if strings.HasPrefix(d, " ") {
+				d = d[1:]
+			}
+			curData = d
+		}
+	}
+	if curEvent == wantEvent {
+		return curData
+	}
+	return ""
 }

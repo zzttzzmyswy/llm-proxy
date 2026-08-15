@@ -335,7 +335,10 @@ func newThinkingNormalizingReader(r io.Reader) io.Reader {
 
 // emitEvent writes one normalized SSE event block to pw. It rewrites the JSON payload
 // of `content_block_start` events whose content_block is a thinking block missing a
-// string `thinking` field.
+// string `thinking` field. The rewritten payload keeps its full envelope (`type`,
+// `index`, ...) with only the nested content_block changed — replacing the whole
+// payload with just the content_block would leave the event unparseable to Claude
+// Code, which then renders the thinking_delta content as body text.
 func emitEvent(pw *io.PipeWriter, event, data string) {
 	out := data
 	if event == "content_block_start" && data != "" {
@@ -345,7 +348,14 @@ func emitEvent(pw *io.PipeWriter, event, data string) {
 		}
 		if json.Unmarshal([]byte(data), &ev) == nil && ev.Type == "content_block_start" {
 			if normalized, ok := normalizeThinkingBlock(ev.ContentBlock); ok {
-				out = string(normalized)
+				var full map[string]interface{}
+				var cb map[string]interface{}
+				if json.Unmarshal([]byte(data), &full) == nil && json.Unmarshal(normalized, &cb) == nil {
+					full["content_block"] = cb
+					if rebuilt, err := json.Marshal(full); err == nil {
+						out = string(rebuilt)
+					}
+				}
 			}
 		}
 	}
