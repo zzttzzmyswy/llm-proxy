@@ -809,12 +809,18 @@ func TestNormalizeThinkingBlockMissingThinkingField(t *testing.T) {
 	if block["thinking"] != "" {
 		t.Fatalf("thinking field should be empty string, got %#v", block["thinking"])
 	}
-	if block["signature"] != "sig123" {
-		t.Fatalf("signature must be preserved, got %#v", block["signature"])
+	// The block's signature cannot be kept: DeepSeek puts a fake (non-Anthropic) signature
+	// here, and Claude Code cryptographically verifies it. An empty `thinking` next to an
+	// unverifiable signature fails validation ("Invalid signature in thinking block"), so
+	// the signature must be cleared together with `thinking` — yielding the canonical
+	// thinking-block-start shape that Claude Code accepts without any validation error.
+	if block["signature"] != "" {
+		t.Fatalf("signature must be cleared to empty string so Claude Code skips validation, got %#v", block["signature"])
 	}
 }
 
-// A valid thinking block with a string thinking field must pass through unchanged.
+// A valid thinking block with a string thinking field must pass through unchanged —
+// including its signature, since Claude Code only validates the malformed shape.
 func TestNormalizeThinkingBlockValidPassesThrough(t *testing.T) {
 	raw := json.RawMessage(`{"type":"thinking","thinking":"hello","signature":"sig123"}`)
 	if _, ok := normalizeThinkingBlock(raw); ok {
@@ -846,8 +852,8 @@ func TestThinkingNormalizingReaderRewritesBrokenThinkingStart(t *testing.T) {
 	if !strings.Contains(raw, `"thinking":""`) {
 		t.Fatalf("thinking field should be normalized to empty string, got: %s", raw)
 	}
-	if !strings.Contains(string(raw), `"signature":"sig123"`) {
-		t.Fatalf("signature must be preserved, got: %s", raw)
+	if strings.Contains(string(raw), `"signature":"sig123"`) {
+		t.Fatalf("the malformed block's fake signature must be cleared (Claude Code verifies signatures and errors on a mismatch), got: %s", raw)
 	}
 	if !strings.Contains(string(raw), "event: message_stop") {
 		t.Fatalf("stream tail must be preserved, got: %s", raw)
@@ -859,8 +865,9 @@ func TestThinkingNormalizingReaderRewritesBrokenThinkingStart(t *testing.T) {
 		Type         string `json:"type"`
 		Index        int    `json:"index"`
 		ContentBlock struct {
-			Type     string `json:"type"`
-			Thinking string `json:"thinking"`
+			Type      string `json:"type"`
+			Thinking  string `json:"thinking"`
+			Signature string `json:"signature"`
 		} `json:"content_block"`
 	}
 	if err := json.Unmarshal([]byte(ssePayload(raw, "content_block_start")), &ev); err != nil {
@@ -877,6 +884,9 @@ func TestThinkingNormalizingReaderRewritesBrokenThinkingStart(t *testing.T) {
 	}
 	if ev.ContentBlock.Thinking != "" {
 		t.Fatalf("content_block.thinking must be normalized to empty string, got %q", ev.ContentBlock.Thinking)
+	}
+	if ev.ContentBlock.Signature != "" {
+		t.Fatalf("content_block.signature must be cleared, got %q", ev.ContentBlock.Signature)
 	}
 }
 

@@ -357,9 +357,18 @@ func emitEvent(pw *io.PipeWriter, event, data string) {
 	fmt.Fprintf(pw, "event: %s\ndata: %s\n\n", event, out)
 }
 
-// normalizeThinkingBlock returns a rewritten content_block JSON with a guaranteed
-// string `thinking` field when the block is a thinking block missing one. ok is
-// false when no rewrite is needed.
+// normalizeThinkingBlock returns a rewritten content_block JSON with guaranteed
+// string `thinking` and `signature` fields when the block is a thinking block whose
+// `thinking` field is missing (or not a string). ok is false when no rewrite is needed.
+//
+// Pinning ONLY `thinking` to "" is not enough: Claude Code validates the thinking
+// block's signature cryptographically (anti-tamper). DeepSeek's malformed blocks carry
+// a fake non-Anthropic signature, so an empty `thinking` next to that signature fails
+// verification and surfaces as "Invalid signature in thinking block" / "thinking blocks
+// cannot be modified". Clearing BOTH fields yields the canonical thinking-block-start
+// shape (`{thinking:"", signature:""}`) that every legitimate stream begins with, which
+// Claude Code accepts without validation errors; nothing is stripped and no content is
+// lost (the malformed block carried no thinking text anyway).
 func normalizeThinkingBlock(raw json.RawMessage) ([]byte, bool) {
 	var block map[string]interface{}
 	if json.Unmarshal(raw, &block) != nil {
@@ -372,8 +381,9 @@ func normalizeThinkingBlock(raw json.RawMessage) ([]byte, bool) {
 		_ = s
 		return nil, false
 	}
-	// thinking field missing, null, or a non-string value → pin to empty string.
+	// thinking field missing, null, or a non-string value → pin both fields to empty.
 	block["thinking"] = ""
+	block["signature"] = ""
 	out, err := json.Marshal(block)
 	if err != nil {
 		return nil, false
