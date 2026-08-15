@@ -182,15 +182,10 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		body, _ = json.Marshal(req)
 	}
 
-	// Text models reject thinking mode: they require content[].thinking from the
-	// prior turn to be passed back verbatim, which Claude Code omits → 400
-	// "content[].thinking in the thinking mode must be passed back to the API".
-	// Strip thinking blocks so the request is acceptable to the text upstream.
-	if stripped, changed := stripThinking(body); changed {
-		json.Unmarshal(stripped, &req)
-		body = stripped
-		log.Printf("[THINKING] stripped thinking blocks\n")
-	}
+	// Thinking is passed through transparently: the client's `thinking` param and any
+	// thinking blocks in history stay verbatim so DeepSeek keeps its reasoning, and the
+	// response is returned with thinking blocks intact (envelope-normalized below).
+	// Stripping or disabling thinking would silently drop the model's chain of thought.
 
 	log.Printf("[%s] %s -> %s len=%d\n", time.Now().Format("15:04:05"), model, newModel, len(body))
 
@@ -402,64 +397,6 @@ func doUpstreamRequest(body []byte, r *http.Request) (*http.Response, error) {
 		proxyReq.Header.Set("anthropic-beta", beta)
 	}
 	return httpClient().Do(proxyReq)
-}
-
-// stripThinking removes `thinking` content blocks from every message and clamps the
-// `thinking` parameter to `disabled`. Text upstreams (DeepSeek family) reject thinking
-// mode when the prior turn's `content[].thinking` is not passed back verbatim, and if
-// it is left enabled they stream a thinking block whose reasoning the model emits with
-// an empty signature — Claude Code then renders the thinking_delta content as body text
-// and can spill it into tool calls. Clamping the param is done even when no thinking
-// block is present in the history (e.g. the first request of a fresh conversation), so
-// the upstream never generates a thinking response at all.
-// Returns the modified body and whether anything changed.
-func stripThinking(body []byte) ([]byte, bool) {
-	var req map[string]interface{}
-	if err := json.Unmarshal(body, &req); err != nil {
-		return body, false
-	}
-	messages, ok := req["messages"].([]interface{})
-	if !ok {
-		return body, false
-	}
-	changed := false
-	for _, m := range messages {
-		msg, ok := m.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		content, ok := msg["content"].([]interface{})
-		if !ok {
-			continue
-		}
-		filtered := content[:0]
-		for _, block := range content {
-			b, ok := block.(map[string]interface{})
-			if ok && b["type"] == "thinking" {
-				changed = true
-				continue
-			}
-			filtered = append(filtered, block)
-		}
-		msg["content"] = filtered
-	}
-	// Clamp the thinking param even when no block was stripped (first-turn requests)
-	// so the text model cannot stream a thinking response.
-	clamped := false
-	if t, ok := req["thinking"].(map[string]interface{}); ok {
-		if typ, _ := t["type"].(string); typ != "disabled" {
-			t["type"] = "disabled"
-			clamped = true
-		}
-	}
-	if !changed && !clamped {
-		return body, false
-	}
-	out, err := json.Marshal(req)
-	if err != nil {
-		return body, false
-	}
-	return out, true
 }
 
 // containsImage reports whether any message in the request carries an image block

@@ -627,40 +627,64 @@ func TestContainsImageNested(t *testing.T) {
 	}
 }
 
-// stripThinking removes thinking blocks from the outgoing request. DeepSeek-family
-// text models reject the thinking mode: they require `content[].thinking` from the
-// prior turn to be passed back verbatim, which Claude Code omits → 400
-// "content[].thinking in the thinking mode must be passed back to the API".
-func TestStripThinkingRemovesUserThinkingBlocks(t *testing.T) {
-	body := `{"model":"sonnet","messages":[{"role":"user","content":[{"type":"thinking","thinking":"secret chain"},{"type":"text","text":"hi"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"x"},{"type":"text","text":"done"}]}]}`
-	got, changed := stripThinking([]byte(body))
-	if !changed {
-		t.Fatal("stripThinking should report changed=true when thinking blocks are removed")
+// Thinking must pass through untouched. The proxy is a transparent passthrough for
+// the client's `thinking` param and thinking blocks in history — it never strips or
+// disables them, so DeepSeek keeps its chain-of-thought and Claude Code keeps control
+// of how thinking is displayed.
+func TestThinkingPassesThroughRequestUntouched(t *testing.T) {
+	body := `{"model":"sonnet","thinking":{"type":"adaptive","budget_tokens":1024},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"secret chain","signature":"sig"},{"type":"text","text":"done"}]}]}`
+	req, err := http.NewRequest("POST", "/v1/messages", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(string(got), `"type":"thinking"`) {
-		t.Fatalf("thinking blocks must be removed, got: %s", got)
-	}
-	if !strings.Contains(string(got), `"type":"text"`) {
-		t.Fatalf("text blocks must be preserved, got: %s", got)
-	}
-}
+	w := httptest.NewRecorder()
 
-func TestStripThinkingLeavesPlainRequestUntouched(t *testing.T) {
-	body := `{"model":"sonnet","messages":[{"role":"user","content":"hi"}]}`
-	got, changed := stripThinking([]byte(body))
-	if changed {
-		t.Fatal("stripThinking should report changed=false when no thinking blocks exist")
-	}
-	if string(got) != body {
-		t.Fatalf("stripThinking must not alter requests without thinking blocks, got: %s", got)
-	}
-}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var got map[string]interface{}
+		if json.Unmarshal(b, &got) != nil {
+			w.WriteHeader(500)
+			return
+		}
+		// The upstream must still see thinking enabled and the thinking block intact.
+		th, _ := got["thinking"].(map[string]interface{})
+		if th["type"] != "adaptive" {
+			w.WriteHeader(500)
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"thinking param changed"}]}`)
+			return
+		}
+		msgs := got["messages"].([]interface{})
+		asm := msgs[1].(map[string]interface{})
+		content := asm["content"].([]interface{})
+		if len(content) != 2 {
+			w.WriteHeader(500)
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"thinking block was stripped"}]}`)
+			return
+		}
+		cb := content[0].(map[string]interface{})
+		if cb["type"] != "thinking" || cb["thinking"] != "secret chain" {
+			w.WriteHeader(500)
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"thinking block altered"}]}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer upstream.Close()
+	old := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	defer func() { cfg.Upstream.AnthropicURL = old }()
 
-func TestStripThinkingNoThinkingContent(t *testing.T) {
-	body := `{"model":"sonnet","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
-	_, changed := stripThinking([]byte(body))
-	if changed {
-		t.Fatal("stripThinking should report changed=false when content has no thinking blocks")
+	handleMessages(w, req)
+	res := w.Result()
+	respBody, _ := io.ReadAll(res.Body)
+	if res.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d: %s", res.StatusCode, respBody)
+	}
+	if strings.Contains(string(respBody), "thinking param changed") ||
+		strings.Contains(string(respBody), "stripped") ||
+		strings.Contains(string(respBody), "altered") {
+		t.Fatalf("proxy must not strip/disable/alter thinking, got: %s", respBody)
 	}
 }
 
@@ -769,88 +793,6 @@ func TestImage400WithoutVLMConfigPassesThrough(t *testing.T) {
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
 	if calls != 1 {
 		t.Fatalf("without VLM config there must be no retry, got %d upstream calls", calls)
-	}
-}
-
-// stripThinking must flip the `thinking` parameter to disabled when it strips
-// thinking blocks, so the upstream does not stream a thinking response back.
-func TestStripThinkingDisablesThinkingParam(t *testing.T) {
-	body := `{"model":"sonnet","thinking":{"type":"enabled","budget_tokens":1024},"messages":[{"role":"user","content":[{"type":"thinking","thinking":"secret"},{"type":"text","text":"hi"}]}]}`
-	got, changed := stripThinking([]byte(body))
-	if !changed {
-		t.Fatal("stripThinking should report changed=true when thinking blocks are removed")
-	}
-	var req map[string]interface{}
-	if err := json.Unmarshal(got, &req); err != nil {
-		t.Fatalf("stripped body must be valid JSON: %v", err)
-	}
-	thinking, ok := req["thinking"].(map[string]interface{})
-	if !ok {
-		t.Fatal("thinking param must remain present")
-	}
-	if thinking["type"] != "disabled" {
-		t.Fatalf("thinking.type should be disabled after stripping, got %q", thinking["type"])
-	}
-}
-
-// stripThinking with an adaptive thinking param must also disable it.
-func TestStripThinkingDisablesAdaptiveParam(t *testing.T) {
-	body := `{"model":"sonnet","thinking":{"type":"adaptive"},"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"x"},{"type":"text","text":"done"}]}]}`
-	got, changed := stripThinking([]byte(body))
-	if !changed {
-		t.Fatal("stripThinking should report changed=true")
-	}
-	var req map[string]interface{}
-	json.Unmarshal(got, &req)
-	thinking := req["thinking"].(map[string]interface{})
-	if thinking["type"] != "disabled" {
-		t.Fatalf("thinking.type should be disabled, got %q", thinking["type"])
-	}
-}
-
-// First-request (fresh conversation) case: Claude Code sends thinking adaptive but
-// there are no thinking blocks in history yet, so nothing is stripped. Leaving the
-// param enabled makes the text upstream stream a thinking block, whose reasoning the
-// text model emits with an empty signature, and Claude Code renders the thinking
-// deltas as body text / spills them into tool calls. The proxy must clamp the param
-// to disabled even when no block is stripped.
-func TestStripThinkingDisablesParamWithoutAnyThinkingBlocks(t *testing.T) {
-	body := `{"model":"sonnet","thinking":{"type":"adaptive","budget_tokens":1024},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
-	got, changed := stripThinking([]byte(body))
-	if !changed {
-		t.Fatal("stripThinking should report changed=true when the thinking param is clamped")
-	}
-	var req map[string]interface{}
-	if err := json.Unmarshal(got, &req); err != nil {
-		t.Fatalf("stripped body must be valid JSON: %v", err)
-	}
-	thinking, ok := req["thinking"].(map[string]interface{})
-	if !ok {
-		t.Fatal("thinking param must remain present")
-	}
-	if thinking["type"] != "disabled" {
-		t.Fatalf("thinking.type must be disabled even without thinking blocks in history, got %q", thinking["type"])
-	}
-	// The text message must survive untouched.
-	messages := req["messages"].([]interface{})
-	content := messages[0].(map[string]interface{})["content"].([]interface{})
-	if len(content) != 1 {
-		t.Fatalf("no blocks should be stripped, got %d content blocks", len(content))
-	}
-	if content[0].(map[string]interface{})["type"] != "text" {
-		t.Fatalf("text block must be preserved, got %#v", content[0])
-	}
-}
-
-// A request that already disables thinking must be left untouched (no re-marshal).
-func TestStripThinkingLeavesDisabledParamAlone(t *testing.T) {
-	body := `{"model":"sonnet","thinking":{"type":"disabled"},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
-	got, changed := stripThinking([]byte(body))
-	if changed {
-		t.Fatal("stripThinking must not re-marshal an already-disabled request")
-	}
-	if string(got) != body {
-		t.Fatalf("body must pass through unchanged, got: %s", got)
 	}
 }
 
