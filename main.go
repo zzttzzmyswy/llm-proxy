@@ -182,10 +182,18 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		body, _ = json.Marshal(req)
 	}
 
-	// Thinking is passed through transparently: the client's `thinking` param and any
-	// thinking blocks in history stay verbatim so DeepSeek keeps its reasoning, and the
-	// response is returned with thinking blocks intact (envelope-normalized below).
-	// Stripping or disabling thinking would silently drop the model's chain of thought.
+	// Strip thinking blocks from the request history before forwarding. The client's
+	// `thinking` param stays untouched so the upstream still emits a thinking block in
+	// its reply (CoT kept for display), but history thinking blocks are dropped: the
+	// text upstream rejects requests that carry them with 400 "content[].thinking in
+	// the thinking mode must be passed back" once the history grows long (observed
+	// repeatedly in real 1M-context sessions). With no thinking blocks in the request
+	// there is nothing for the upstream's pass-back check to reject.
+	strippedThinking := stripThinkingBlocks(req)
+	if strippedThinking {
+		body, _ = json.Marshal(req)
+		log.Printf("[THINKING] stripped thinking blocks\n")
+	}
 
 	log.Printf("[%s] %s -> %s len=%d\n", time.Now().Format("15:04:05"), model, newModel, len(body))
 
@@ -211,6 +219,33 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[RESP] retry error: %v\n", err)
 				http.Error(w, "upstream error", 502)
 				return
+			}
+		} else {
+			resp.Body = io.NopCloser(bytes.NewReader(respBody))
+		}
+	}
+
+	// Fallback: a thinking pass-back 400 that the block strip could not prevent (e.g.
+	// the upstream rejects carrying the `thinking` param without history blocks) is
+	// retried once with the `thinking` param removed, fully leaving thinking mode.
+	// Never retries when the param is already gone — an unchanged request 400ing
+	// again would otherwise loop forever, so it passes through to the client.
+	if resp.StatusCode == 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if strings.Contains(string(respBody), "must be passed back") {
+			if _, has := req["thinking"]; has {
+				log.Printf("[RETRY] thinking 400 -> disable thinking param, retrying\n")
+				delete(req, "thinking")
+				body, _ = json.Marshal(req)
+				resp, err = doUpstreamRequest(body, r)
+				if err != nil {
+					log.Printf("[RESP] retry error: %v\n", err)
+					http.Error(w, "upstream error", 502)
+					return
+				}
+			} else {
+				resp.Body = io.NopCloser(bytes.NewReader(respBody))
 			}
 		} else {
 			resp.Body = io.NopCloser(bytes.NewReader(respBody))
@@ -277,6 +312,62 @@ func routeModel(model string) string {
 		return cfg.Routing.Sonnet
 	}
 	return ""
+}
+
+// stripThinkingBlocks removes every `type:thinking` content block from the
+// request's message history, recursing into nested content (tool_result etc.).
+// It reports whether anything was removed. The `thinking` parameter of the request
+// is left untouched so the upstream still produces thinking in its reply.
+func stripThinkingBlocks(req map[string]interface{}) bool {
+	messages, ok := req["messages"].([]interface{})
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, m := range messages {
+		msg, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		nc, ch := stripThinkingFromContent(msg["content"])
+		if ch {
+			msg["content"] = nc
+			changed = true
+		}
+	}
+	return changed
+}
+
+// stripThinkingFromContent returns the content value with every thinking block
+// removed (recursing into nested content arrays) and whether anything changed.
+// A fresh slice is built and returned rather than mutating in place — a
+// re-sliced `c[:0]` would only shorten the copy's header, leaving the caller's
+// slice at its original length with a clobbered first element.
+func stripThinkingFromContent(v interface{}) (interface{}, bool) {
+	switch c := v.(type) {
+	case []interface{}:
+		changed := false
+		kept := make([]interface{}, 0, len(c))
+		for _, item := range c {
+			b, isMap := item.(map[string]interface{})
+			if isMap && b["type"] == "thinking" {
+				changed = true
+				continue
+			}
+			if isMap {
+				nc, ch := stripThinkingFromContent(b["content"])
+				if ch {
+					b["content"] = nc
+					changed = true
+				}
+			}
+			kept = append(kept, item)
+		}
+		return kept, changed
+	case map[string]interface{}:
+		return stripThinkingFromContent(c["content"])
+	}
+	return v, false
 }
 
 // newThinkingNormalizingReader wraps an SSE stream and rewrites malformed thinking

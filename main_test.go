@@ -627,11 +627,14 @@ func TestContainsImageNested(t *testing.T) {
 	}
 }
 
-// Thinking must pass through untouched. The proxy is a transparent passthrough for
-// the client's `thinking` param and thinking blocks in history — it never strips or
-// disables them, so DeepSeek keeps its chain-of-thought and Claude Code keeps control
-// of how thinking is displayed.
-func TestThinkingPassesThroughRequestUntouched(t *testing.T) {
+// Thinking blocks must be stripped from the request before forwarding: the text
+// upstream (DeepSeek family via sophnet) rejects requests that carry thinking
+// blocks in history with 400 "content[].thinking in the thinking mode must be
+// passed back" once the conversation grows long. The client's `thinking` param
+// stays untouched so the upstream still produces a thinking block in its reply
+// (CoT kept for display), while the history blocks — which the upstream cannot
+// verify — are dropped so it never has anything to reject.
+func TestThinkingStrippedBeforeForwarding(t *testing.T) {
 	body := `{"model":"sonnet","thinking":{"type":"adaptive","budget_tokens":1024},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"secret chain","signature":"sig"},{"type":"text","text":"done"}]}]}`
 	req, err := http.NewRequest("POST", "/v1/messages", strings.NewReader(body))
 	if err != nil {
@@ -646,7 +649,8 @@ func TestThinkingPassesThroughRequestUntouched(t *testing.T) {
 			w.WriteHeader(500)
 			return
 		}
-		// The upstream must still see thinking enabled and the thinking block intact.
+		// The upstream must still see thinking enabled, but the history thinking
+		// block must be gone while the text block survives.
 		th, _ := got["thinking"].(map[string]interface{})
 		if th["type"] != "adaptive" {
 			w.WriteHeader(500)
@@ -656,15 +660,15 @@ func TestThinkingPassesThroughRequestUntouched(t *testing.T) {
 		msgs := got["messages"].([]interface{})
 		asm := msgs[1].(map[string]interface{})
 		content := asm["content"].([]interface{})
-		if len(content) != 2 {
+		if len(content) != 1 {
 			w.WriteHeader(500)
-			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"thinking block was stripped"}]}`)
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"unexpected block count"}]}`)
 			return
 		}
 		cb := content[0].(map[string]interface{})
-		if cb["type"] != "thinking" || cb["thinking"] != "secret chain" {
+		if cb["type"] != "text" || cb["text"] != "done" {
 			w.WriteHeader(500)
-			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"thinking block altered"}]}`)
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"thinking block not stripped"}]}`)
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -682,9 +686,132 @@ func TestThinkingPassesThroughRequestUntouched(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", res.StatusCode, respBody)
 	}
 	if strings.Contains(string(respBody), "thinking param changed") ||
-		strings.Contains(string(respBody), "stripped") ||
-		strings.Contains(string(respBody), "altered") {
-		t.Fatalf("proxy must not strip/disable/alter thinking, got: %s", respBody)
+		strings.Contains(string(respBody), "not stripped") ||
+		strings.Contains(string(respBody), "unexpected block count") {
+		t.Fatalf("proxy must strip history thinking blocks but keep text, got: %s", respBody)
+	}
+}
+
+// A thinking block nested inside a tool_result (Claude Code routinely stores the
+// assistant turn that produced the tool call with its thinking inside tool result
+// histories) must also be stripped so the upstream never sees a thinking block.
+func TestThinkingNestedInToolResultStripped(t *testing.T) {
+	body := `{"model":"sonnet","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"thinking","thinking":"inner","signature":""},{"type":"text","text":"out"}]}]}]}`
+	var capture []byte
+	withUpstreamCapture(t, "text/event-stream", "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", func(r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		capture = b
+	})
+	callHandleMessages(t, body)
+	var got map[string]interface{}
+	json.Unmarshal(capture, &got)
+	msgs := got["messages"].([]interface{})
+	content := msgs[0].(map[string]interface{})["content"].([]interface{})
+	tr := content[0].(map[string]interface{})
+	inner := tr["content"].([]interface{})
+	if len(inner) != 1 {
+		t.Fatalf("nested thinking block not stripped, got %d blocks", len(inner))
+	}
+	if b := inner[0].(map[string]interface{}); b["type"] != "text" {
+		t.Fatalf("expected only text block after stripping, got %v", b)
+	}
+}
+
+// A request without thinking blocks must leave the body byte-for-byte identical
+// (no re-serialization) so the latency/risk of touching untouched requests is 0.
+func TestNoThinkingBlocksBodyUnchanged(t *testing.T) {
+	body := `{"model":"sonnet","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
+	var capture []byte
+	withUpstreamCapture(t, "text/event-stream", "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", func(r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		capture = b
+	})
+	callHandleMessages(t, body)
+	if string(capture) != body {
+		t.Fatalf("no-thinking request must pass through untouched, got: %s", capture)
+	}
+}
+
+// A thinking pass-back 400 that survives the block strip (e.g. upstream rejects
+// carrying the `thinking` param without history blocks) must trigger one retry
+// with the `thinking` param removed, fully leaving thinking mode; the successful
+// reply is returned to the client.
+func TestThinking400RetriesParamStripped(t *testing.T) {
+	body := `{"model":"sonnet","thinking":{"type":"adaptive","budget_tokens":1024},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]},{"role":"assistant","content":[{"type":"thinking","thinking":"chain","signature":""},{"type":"text","text":"done"}]}]}`
+	calls := 0
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		json.Unmarshal(b, &m)
+		mu.Lock()
+		calls++
+		seen := calls
+		mu.Unlock()
+		if seen == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(400)
+			io.WriteString(w, `{"error":{"message":"The request is invalid: The `+"`content[].thinking`"+` in the thinking mode must be passed back to the API.","reqid":"test-1","type":"invalid_request_error"},"type":"error"}`)
+			return
+		}
+		// Second call must have no thinking param and no thinking blocks.
+		if _, has := m["thinking"]; has {
+			w.WriteHeader(500)
+			io.WriteString(w, "retry still carries thinking param")
+			return
+		}
+		msgs := m["messages"].([]interface{})
+		asm := msgs[1].(map[string]interface{})
+		content := asm["content"].([]interface{})
+		if len(content) != 1 {
+			w.WriteHeader(500)
+			io.WriteString(w, "retry still carries thinking blocks")
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	resp := callHandleMessages(t, body)
+	if !strings.Contains(resp, "message_stop") {
+		t.Fatalf("expected successful retry reply, got: %s", resp)
+	}
+	var got int
+	mu.Lock()
+	got = calls
+	mu.Unlock()
+	if got != 2 {
+		t.Fatalf("expected 2 upstream calls, got %d", got)
+	}
+}
+
+// A thinking-pass-back 400 with nothing left to strip (request already carried no
+// thinking blocks) must pass through to the client unchanged — never an infinite
+// retry loop.
+func TestThinking400WithNothingToStripPassesThrough(t *testing.T) {
+	body := `{"model":"sonnet","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		io.WriteString(w, `{"error":{"message":"The `+"`content[].thinking`"+` in the thinking mode must be passed back to the API.","reqid":"test-2","type":"invalid_request_error"},"type":"error"}`)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	resp := callHandleMessages(t, body)
+	if !strings.Contains(resp, "must be passed back") {
+		t.Fatalf("400 must pass through when nothing to strip, got: %s", resp)
+	}
+	if calls != 1 {
+		t.Fatalf("must not retry when nothing to strip, upstream called %d times", calls)
 	}
 }
 

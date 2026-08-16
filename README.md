@@ -32,7 +32,8 @@ Claude Code 默认只认 Anthropic 官方模型名（`sonnet` / `opus` / `haiku`
 | 描述失败回退 | VLM 描述调用失败时整请求路由到 VLM，图片不丢失 |
 | 图像数据 URL 转换 | OpenAI 风格 `image_url` 的 `data:` URL 转成 Anthropic image 块再送 VLM |
 | SSE 透传 | 流式响应透传，同时规范化损坏的 thinking 块，防 Claude Code 崩溃 |
-| thinking 参数联动 | stripThinking 剥离 thinking 块时同步禁用 `thinking` 参数，防止上游回传 thinking 响应 |
+| thinking 剥离 | 转发前剥离历史 thinking 块（含嵌套 tool_result），保留文本与 `thinking` 参数，杜绝上游 "must be passed back" 400 |
+| thinking 400 兜底 | 剥离后仍遇 thinking 400 时自动重试一次（禁用 `thinking` 参数退出思考模式），参数已无则不重试 |
 | message_stop 安全网 | 仅对 SSE 流补发缺失的 `message_stop`，防 Claude Code 卡死 |
 | 空响应检测 | 上游 0 字节响应 → 发 `error` SSE 事件，触发 Claude Code 重试 |
 | 压缩禁用 | `DisableCompression: true`，避免 gzip 破坏 SSE 缓冲 |
