@@ -182,18 +182,12 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		body, _ = json.Marshal(req)
 	}
 
-	// Strip thinking blocks from the request history before forwarding. The client's
-	// `thinking` param stays untouched so the upstream still emits a thinking block in
-	// its reply (CoT kept for display), but history thinking blocks are dropped: the
-	// text upstream rejects requests that carry them with 400 "content[].thinking in
-	// the thinking mode must be passed back" once the history grows long (observed
-	// repeatedly in real 1M-context sessions). With no thinking blocks in the request
-	// there is nothing for the upstream's pass-back check to reject.
-	strippedThinking := stripThinkingBlocks(req)
-	if strippedThinking {
-		body, _ = json.Marshal(req)
-		log.Printf("[THINKING] stripped thinking blocks\n")
-	}
+	// Thinking is passed through transparently: the client's `thinking` param and
+	// thinking blocks in history stay verbatim on the first attempt, preserving the
+	// upstream's chain-of-thought context as the DeepSeek docs advise. Only when the
+	// upstream rejects the request with 400 "content[].thinking must be passed back"
+	// do we fall back stepwise (strip thinking blocks, then disable thinking), see
+	// the retry chain below.
 
 	log.Printf("[%s] %s -> %s len=%d\n", time.Now().Format("15:04:05"), model, newModel, len(body))
 
@@ -225,25 +219,23 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Fallback: a thinking pass-back 400 that the block strip could not prevent (e.g.
-	// the upstream rejects carrying the `thinking` param without history blocks) is
-	// retried once with the `thinking` param removed, fully leaving thinking mode.
-	// Never retries when the param is already gone — an unchanged request 400ing
-	// again would otherwise loop forever, so it passes through to the client.
+	// Stepwise fallback for the thinking pass-back 400. The first attempt forwards
+	// verbatim (thinking blocks + param untouched, preserving CoT context). On 400
+	// "must be passed back", retry once with thinking blocks stripped (param kept);
+	// if that still 400s and a `thinking` param is present, retry once more with it
+	// removed. Each step only fires if it would change the request, so a request
+	// with nothing left to strip/disable passes through untouched and never loops.
 	if resp.StatusCode == 400 {
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if strings.Contains(string(respBody), "must be passed back") {
-			if _, has := req["thinking"]; has {
-				log.Printf("[RETRY] thinking 400 -> disable thinking param, retrying\n")
-				delete(req, "thinking")
-				body, _ = json.Marshal(req)
-				resp, err = doUpstreamRequest(body, r)
-				if err != nil {
-					log.Printf("[RESP] retry error: %v\n", err)
-					http.Error(w, "upstream error", 502)
-					return
-				}
+		if isThinkingPassBackErr(respBody) {
+			returned, err := retryThinkingWith(req, w, r)
+			if err != nil {
+				http.Error(w, "upstream error", 502)
+				return
+			}
+			if returned != nil {
+				resp = returned
 			} else {
 				resp.Body = io.NopCloser(bytes.NewReader(respBody))
 			}
@@ -299,6 +291,58 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.Copy(fw, resp.Body)
 		log.Printf("[STREAM_END] ok bytes=non-stream\n")
 	}
+}
+
+// isThinkingPassBackErr reports whether a 400 response body is the upstream's
+// "content[].thinking must be passed back" rejection.
+func isThinkingPassBackErr(body []byte) bool {
+	return strings.Contains(string(body), "must be passed back")
+}
+
+// retryThinkingWith runs the stepwise fallback for a thinking pass-back 400. The
+// first retry strips thinking blocks from the history (the `thinking` param kept);
+// if the upstream rejects that too with the same error and a `thinking` param is
+// present, a second retry also removes the param. Each step only fires when it
+// would change the request, so a request with nothing left to strip/disable
+// returns the original 400 untouched and cannot loop. Returns the final response.
+func retryThinkingWith(req map[string]interface{}, w http.ResponseWriter, r *http.Request) (*http.Response, error) {
+	try := func(name string) (*http.Response, error) {
+		log.Printf("[RETRY] thinking 400 -> %s\n", name)
+		body, _ := json.Marshal(req)
+		return doUpstreamRequest(body, r)
+	}
+
+	// Level 1: strip thinking blocks, keep the `thinking` param.
+	if !stripThinkingBlocks(req) {
+		// Nothing to strip, nothing further we can change; the 400 passes through.
+		log.Printf("[RETRY] thinking 400 -> nothing to strip, passing through\n")
+		return nil, nil
+	}
+	resp, err := try("strip thinking blocks")
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 400 {
+		return resp, nil
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if !isThinkingPassBackErr(respBody) {
+		resp.Body = io.NopCloser(bytes.NewReader(respBody))
+		return resp, nil
+	}
+
+	// Level 2: also remove the `thinking` param.
+	if _, has := req["thinking"]; !has {
+		resp.Body = io.NopCloser(bytes.NewReader(respBody))
+		return resp, nil
+	}
+	delete(req, "thinking")
+	resp, err = try("disable thinking param")
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 func routeModel(model string) string {
