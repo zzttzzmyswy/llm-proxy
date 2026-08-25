@@ -471,35 +471,182 @@ func TestImageDescCacheEvictionEnforcesCap(t *testing.T) {
 	}
 }
 
-// imageCacheKey must return a stable key for the same image and miss for remote URLs.
+// imageCacheKey must return a stable key for the same image+context and miss for
+// remote URLs. Different contexts on the same image must not share a key.
 func TestImageCacheKey(t *testing.T) {
 	resetImageDescCacheForTests()
 
 	var blk map[string]interface{}
 	json.Unmarshal([]byte(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"ABCD"}}`), &blk)
-	k1, ok := imageCacheKey(blk)
+	k1, ok := imageCacheKey(blk, "ctx-A")
 	if !ok || k1 == "" {
 		t.Fatalf("base64 image must produce a cache key, got %q ok=%v", k1, ok)
 	}
-	// Same data → same key.
+	// Same data + same context → same key.
 	var blk2 map[string]interface{}
 	json.Unmarshal([]byte(`{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"ABCD"}}`), &blk2)
-	k2, _ := imageCacheKey(blk2)
+	k2, _ := imageCacheKey(blk2, "ctx-A")
 	if k2 != k1 {
-		t.Fatalf("same image bytes must produce the same key, got %q vs %q", k1, k2)
+		t.Fatalf("same image bytes and context must produce the same key, got %q vs %q", k1, k2)
+	}
+	// Same image + different context → different key (descriptions are context-aware).
+	k3, _ := imageCacheKey(blk2, "ctx-B")
+	if k3 == k1 {
+		t.Fatalf("same image bytes in a different context must produce a different key, got %q", k1)
 	}
 	// Different data → different key.
 	var blk3 map[string]interface{}
 	json.Unmarshal([]byte(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"ABCE"}}`), &blk3)
-	k3, _ := imageCacheKey(blk3)
-	if k3 == k1 {
+	k4, _ := imageCacheKey(blk3, "ctx-A")
+	if k4 == k1 {
 		t.Fatalf("different image bytes must produce different keys, got %q", k1)
 	}
 	// Remote image_url (no payload) → no key.
 	var blk4 map[string]interface{}
 	json.Unmarshal([]byte(`{"type":"image_url","image_url":{"url":"https://example.com/x.png"}}`), &blk4)
-	if k, ok := imageCacheKey(blk4); ok {
+	if k, ok := imageCacheKey(blk4, "ctx-A"); ok {
 		t.Fatalf("remote image_url must not be cacheable, got key %q", k)
+	}
+}
+
+// The VLM describe call must carry the context of the message that holds the
+// image (role + sibling text), so the description tracks what the user is asking.
+func TestVLMDescribeRequestCarriesMessageContext(t *testing.T) {
+	resetImageDescCacheForTests()
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+		cfg.Routing.Sonnet = ""
+	})
+
+	var describeBody string
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		json.Unmarshal(b, &m)
+		mu.Lock()
+		defer mu.Unlock()
+		model, _ := m["model"].(string)
+		if model == "MiniMax-M3" {
+			describeBody = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"描述"}],"model":"MiniMax-M3","id":"vlm-1","usage":{"input_tokens":5,"output_tokens":5}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, nonStreamJSONBody)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"请分析这个编译报错"}]}]}`)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(describeBody, "请分析这个编译报错") {
+		t.Fatalf("VLM describe request must carry the image message's text context, got: %s", describeBody)
+	}
+	if !strings.Contains(describeBody, "角色：user") {
+		t.Fatalf("VLM describe request must carry the image message's role, got: %s", describeBody)
+	}
+}
+
+// Same image bytes in a different message context must be described again: the
+// description depends on the context, so the cache must not conflate contexts.
+func TestSameImageDifferentContextNotCached(t *testing.T) {
+	resetImageDescCacheForTests()
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+		cfg.Routing.Sonnet = ""
+	})
+
+	var describeCalls int
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		json.Unmarshal(b, &m)
+		mu.Lock()
+		defer mu.Unlock()
+		model, _ := m["model"].(string)
+		if model == "MiniMax-M3" {
+			describeCalls++
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"描述"}],"model":"MiniMax-M3","id":"vlm-1","usage":{"input_tokens":5,"output_tokens":5}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, nonStreamJSONBody)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	// Same image bytes "AAAA", different sibling text → different context.
+	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"看这个报错A"}]}]}`)
+	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"看这个报错B"}]}]}`)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if describeCalls != 2 {
+		t.Fatalf("same image in different contexts must be described twice, got %d VLM calls", describeCalls)
+	}
+}
+
+// An image inside a tool_result must be described with the resolved tool context
+// (tool name + input) from the matching assistant tool_use.
+func TestToolResultContextIncludesToolInfo(t *testing.T) {
+	resetImageDescCacheForTests()
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+		cfg.Routing.Sonnet = ""
+	})
+
+	var describeBody string
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		json.Unmarshal(b, &m)
+		mu.Lock()
+		defer mu.Unlock()
+		model, _ := m["model"].(string)
+		if model == "MiniMax-M3" {
+			describeBody = string(b)
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"截图描述"}],"model":"MiniMax-M3","id":"vlm-1","usage":{"input_tokens":5,"output_tokens":5}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, nonStreamJSONBody)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	reqBody := `{"model":"sonnet","max_tokens":10,"messages":[
+		{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"bash","input":{"command":"ls -la"}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}
+	]}`
+	callHandleMessages(t, reqBody)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(describeBody, "bash") {
+		t.Fatalf("VLM describe request must carry the resolved tool name, got: %s", describeBody)
+	}
+	if !strings.Contains(describeBody, "ls -la") {
+		t.Fatalf("VLM describe request must carry the tool input, got: %s", describeBody)
 	}
 }
 

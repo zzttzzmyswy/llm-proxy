@@ -579,40 +579,43 @@ func contentHasImage(v interface{}) bool {
 	return false
 }
 
-// describeImages replaces every image block in the request with a text block that
-// carries the VLM's description of that image ("这里有一个 image，其内容如下：xxx").
-// The image itself is decoded to base64 and sent to the VLM. Returns false when the
-// describe pass fails (e.g. upstream unavailable), in which case the caller falls
-// back to routing the unmodified request to the VLM model.
+// describeImages replaces every image in the request with a VLM description. Each
+// image is described with the local context of the message carrying it (role,
+// sibling text, tool call that produced it), so the description tracks what the
+// conversation is asking instead of being a generic caption. Returns false when
+// the describe pass fails (e.g. upstream unavailable), in which case the caller
+// falls back to routing the unmodified request to the VLM model.
 func describeImages(req map[string]interface{}) bool {
 	messages, hasMessages := req["messages"].([]interface{})
 	if !hasMessages {
 		return true
 	}
+	toolUses := indexToolUses(messages)
 	ok := true
 	for _, m := range messages {
 		msg, isMap := m.(map[string]interface{})
 		if !isMap {
 			continue
 		}
-		if !describeContent(msg["content"]) {
+		ctx := messageContext(msg, toolUses)
+		if !describeContent(msg["content"], ctx) {
 			ok = false
 		}
 	}
 	return ok
 }
 
-func describeContent(v interface{}) bool {
+func describeContent(v interface{}, ctx string) bool {
 	switch c := v.(type) {
 	case string:
 		return true
 	case []interface{}:
 		for i, item := range c {
-			if !describeBlock(item) {
+			if !describeBlock(item, ctx) {
 				return false
 			}
 			if b, isMap := item.(map[string]interface{}); isMap && isImageBlock(b) {
-				block, ok := imageDescriptionBlock(b)
+				block, ok := imageDescriptionBlock(b, ctx)
 				if !ok {
 					return false
 				}
@@ -624,17 +627,128 @@ func describeContent(v interface{}) bool {
 	return true
 }
 
-func describeBlock(v interface{}) bool {
+func describeBlock(v interface{}, ctx string) bool {
 	switch b := v.(type) {
 	case map[string]interface{}:
 		if isImageBlock(b) {
 			return true
 		}
-		return describeContent(b["content"])
+		return describeContent(b["content"], ctx)
 	case []interface{}:
-		return describeContent(b)
+		return describeContent(b, ctx)
 	}
 	return true
+}
+
+// toolUseInfo holds the identifying fields of an assistant tool_use block so an
+// image inside the matching tool_result can be described with the tool context.
+type toolUseInfo struct {
+	name  string
+	input string
+}
+
+// indexToolUses scans all messages for assistant tool_use blocks and maps each
+// tool_use_id to its name and input, so tool_result images are described with
+// the tool that produced them.
+func indexToolUses(messages []interface{}) map[string]toolUseInfo {
+	idx := make(map[string]toolUseInfo)
+	for _, m := range messages {
+		msg, ok := m.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		collectToolUses(msg["content"], idx)
+	}
+	return idx
+}
+
+func collectToolUses(v interface{}, idx map[string]toolUseInfo) {
+	switch c := v.(type) {
+	case map[string]interface{}:
+		if c["type"] == "tool_use" {
+			if id, ok := c["id"].(string); ok && id != "" {
+				name, _ := c["name"].(string)
+				idx[id] = toolUseInfo{name: name, input: jsonString(c["input"])}
+			}
+		}
+		collectToolUses(c["content"], idx)
+	case []interface{}:
+		for _, item := range c {
+			collectToolUses(item, idx)
+		}
+	}
+}
+
+// maxImageCtxLen bounds how much message context is embedded in the VLM prompt.
+// The description cache key still covers the full (untruncated) context, so the
+// truncation only caps prompt size, never cache correctness.
+const maxImageCtxLen = 2000
+
+// messageContext builds the local context of the message carrying an image: the
+// role, sibling text blocks, tool_use calls, and tool_result text (with the
+// resolved tool name/input). The full string is used for the cache key; the VLM
+// prompt receives a truncated copy.
+func messageContext(msg map[string]interface{}, toolUses map[string]toolUseInfo) string {
+	parts := make([]string, 0, 4)
+	if role, ok := msg["role"].(string); ok && role != "" {
+		parts = append(parts, "角色："+role)
+	}
+	collectMessageParts(msg["content"], toolUses, &parts)
+	return strings.Join(parts, "\n")
+}
+
+func collectMessageParts(v interface{}, toolUses map[string]toolUseInfo, parts *[]string) {
+	switch c := v.(type) {
+	case map[string]interface{}:
+		switch c["type"] {
+		case "text":
+			if s, ok := c["text"].(string); ok && s != "" {
+				*parts = append(*parts, "文本："+truncate(s, 1000))
+			}
+		case "tool_use":
+			name, _ := c["name"].(string)
+			if name != "" {
+				*parts = append(*parts, "工具调用 "+name+"："+jsonString(c["input"]))
+			}
+		case "tool_result":
+			var sb strings.Builder
+			sb.WriteString("工具结果")
+			if id, ok := c["tool_use_id"].(string); ok && id != "" {
+				sb.WriteString("(" + id + ")")
+				if info, ok := toolUses[id]; ok {
+					sb.WriteString("[工具 " + info.name + "：" + info.input + "]")
+				}
+			}
+			var inner []string
+			collectMessageParts(c["content"], toolUses, &inner)
+			if len(inner) > 0 {
+				sb.WriteString("：")
+				sb.WriteString(strings.Join(inner, "；"))
+			}
+			*parts = append(*parts, sb.String())
+		}
+	case []interface{}:
+		for _, item := range c {
+			collectMessageParts(item, toolUses, parts)
+		}
+	case string:
+		if c != "" {
+			*parts = append(*parts, "文本："+truncate(c, 1000))
+		}
+	}
+}
+
+// jsonString renders a tool_use input as compact JSON, truncated to bound the
+// context sent to the VLM.
+func jsonString(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return truncate(string(b), 500)
 }
 
 func isImageBlock(b map[string]interface{}) bool {
@@ -645,11 +759,12 @@ func isImageBlock(b map[string]interface{}) bool {
 	return false
 }
 
-// imageDescriptionBlock asks the VLM to describe the image and returns a text block
-// carrying that description. ok is false when the describe call failed, signalling
-// the caller to fall back to VLM routing instead of losing the image.
-func imageDescriptionBlock(b map[string]interface{}) (block map[string]interface{}, ok bool) {
-	desc, ok := describeImageWithVLM(b)
+// imageDescriptionBlock asks the VLM to describe the image (with the message
+// context) and returns a text block carrying that description. ok is false when
+// the describe call failed, signalling the caller to fall back to VLM routing
+// instead of losing the image.
+func imageDescriptionBlock(b map[string]interface{}, ctx string) (block map[string]interface{}, ok bool) {
+	desc, ok := describeImageWithVLM(b, ctx)
 	if !ok {
 		return nil, false
 	}
@@ -853,10 +968,12 @@ func (c *imageDescCache) len() int {
 	return len(c.entries)
 }
 
-// imageCacheKey returns a stable cache key for an image block: the sha256 of the
-// encoded image payload. Remote image_urls (non-data URLs) have no payload to hash,
-// so they always miss and go to the VLM.
-func imageCacheKey(block map[string]interface{}) (string, bool) {
+// imageCacheKey returns a stable cache key for an image block plus its message
+// context: the sha256 of the encoded image payload and the context. Descriptions
+// depend on the surrounding context, so two uses of the same image in different
+// contexts must not share a description. Remote image_urls (non-data URLs) have
+// no payload to hash, so they always miss and go to the VLM.
+func imageCacheKey(block map[string]interface{}, ctx string) (string, bool) {
 	img := block
 	if b, ok := block["type"].(string); ok && b == "image_url" {
 		if u, ok := block["image_url"].(map[string]interface{}); ok {
@@ -882,14 +999,15 @@ func imageCacheKey(block map[string]interface{}) (string, bool) {
 	if !ok || data == "" {
 		return "", false
 	}
-	h := sha256.Sum256([]byte(data))
+	h := sha256.Sum256([]byte(data + "\x00" + ctx))
 	return hex.EncodeToString(h[:]), true
 }
 
-// describeImageWithVLM calls the VLM model with the single image block and returns
-// the model's description. The result is memoized by image content hash so repeated
-// turns that resend the same image reuse the description instead of re-calling VLM.
-func describeImageWithVLM(block map[string]interface{}) (string, bool) {
+// describeImageWithVLM calls the VLM model with the single image block plus the
+// message context and returns the model's description. The result is memoized by
+// image content hash AND context so repeated turns that resend the same image with
+// the same context reuse the description instead of re-calling VLM.
+func describeImageWithVLM(block map[string]interface{}, ctx string) (string, bool) {
 	img := block
 	// OpenAI-style image_url with a data URL must be converted to an Anthropic
 	// image block, or the upstream rejects it. Non-data image_urls (remote URLs)
@@ -904,12 +1022,18 @@ func describeImageWithVLM(block map[string]interface{}) (string, bool) {
 		}
 	}
 
-	// Cache lookup before any network call.
-	if key, ok := imageCacheKey(block); ok {
+	// Cache lookup before any network call. The key covers image bytes + context,
+	// so the same image in a different context never reuses a stale description.
+	if key, ok := imageCacheKey(block, ctx); ok {
 		if desc := descCache.get(key); desc != "" {
 			log.Printf("[VLM] cached image description hit len=%d\n", len(desc))
 			return desc, true
 		}
+	}
+
+	prompt := "请详细描述这张图片的内容。"
+	if ctx != "" {
+		prompt = fmt.Sprintf("请结合以下消息上下文，详细描述这张图片的内容，重点关注与上下文相关的细节。\n\n消息上下文：\n%s", truncate(ctx, maxImageCtxLen))
 	}
 
 	req := map[string]interface{}{
@@ -920,7 +1044,7 @@ func describeImageWithVLM(block map[string]interface{}) (string, bool) {
 				"role": "user",
 				"content": []interface{}{
 					img,
-					map[string]interface{}{"type": "text", "text": "请详细描述这张图片的内容。"},
+					map[string]interface{}{"type": "text", "text": prompt},
 				},
 			},
 		},
@@ -957,10 +1081,11 @@ func describeImageWithVLM(block map[string]interface{}) (string, bool) {
 		log.Printf("[VLM] describe returned empty text\n")
 		return "", false
 	}
-	// Memoize the description so the same image in a later turn does not re-call VLM.
-	if key, ok := imageCacheKey(block); ok {
-		// Entry size: hashed payload length + description length.
-		entrySize := len(key) + len(desc)
+	// Memoize the description so the same image in the same context in a later
+	// turn does not re-call VLM.
+	if key, ok := imageCacheKey(block, ctx); ok {
+		// Entry size: hashed payload + context length + description length.
+		entrySize := len(key) + len(ctx) + len(desc)
 		descCache.put(key, desc, entrySize)
 		log.Printf("[VLM] described image: %s\n", truncate(desc, 200))
 	} else {
