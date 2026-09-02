@@ -117,9 +117,6 @@ flash = { model = "glm-5.3-flash", upstream = "openai" }
 	if e := routeTargets["haiku"]; e.Model != routeTargets["sonnet"].Model {
 		t.Fatalf("haiku must default to sonnet target, got %+v", e)
 	}
-	if cfg.Routing.Sonnet != "DeepSeek-V4-Flash-0731" || cfg.Routing.Opus != "GLM-5.3" {
-		t.Fatalf("legacy string fields must stay populated, sonnet=%q opus=%q", cfg.Routing.Sonnet, cfg.Routing.Opus)
-	}
 }
 
 // A malformed routing entry must not abort config loading: it is skipped with a
@@ -152,14 +149,9 @@ flash = 42
 // via the config table (exact match wins), and composed sonnet/opus/haiku names
 // via substring matching like before.
 func TestRouteTargetResolution(t *testing.T) {
-	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
-	cfg.Routing.Opus = "GLM-5.3"
-	cfg.Routing.Haiku = "DeepSeek-V4-Flash-0731"
-	t.Cleanup(func() {
-		cfg.Routing.Sonnet = ""
-		cfg.Routing.Opus = ""
-		cfg.Routing.Haiku = ""
-	})
+	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
+	setRoute(t, "opus", "GLM-5.3", "")
+	setRoute(t, "haiku", "DeepSeek-V4-Flash-0731", "")
 	setRoute(t, "flash", "glm-5.3-flash", "openai")
 	setRoute(t, "main", "GLM-5.3", "")
 
@@ -177,6 +169,38 @@ func TestRouteTargetResolution(t *testing.T) {
 	}
 	if tr := routeTarget("unknown-model"); tr.Model != "" || tr.Upstream != "" {
 		t.Fatalf("unknown model must passthrough untouched, got %+v", tr)
+	}
+}
+
+// The builtin aliases (sonnet/opus/haiku) must accept table form exactly like
+// custom aliases: `sonnet = { model = "glm-5.3-flash", upstream = "openai" }`
+// routes the default Claude model to the OpenAI gateway. haiku (unset) inherits
+// sonnet's full target including its upstream.
+func TestLoadConfigParsesBuiltinAliasTableRoute(t *testing.T) {
+	oldCfg := cfg
+	oldRoutes := routeTargets
+	t.Cleanup(func() { cfg = oldCfg; routeTargets = oldRoutes })
+
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := `[routing]
+sonnet = { model = "glm-5.3-flash", upstream = "openai" }
+opus = "GLM-5.3"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LLM_PROXY_CONFIG", path)
+	if err := loadConfig(); err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if tr := routeTarget("sonnet"); tr.Model != "glm-5.3-flash" || tr.Upstream != "openai" {
+		t.Fatalf("table-form sonnet must route to the openai gateway, got %+v", tr)
+	}
+	if tr := routeTarget("haiku"); tr.Model != "glm-5.3-flash" || tr.Upstream != "openai" {
+		t.Fatalf("haiku must inherit sonnet's target including upstream, got %+v", tr)
+	}
+	if tr := routeTarget("opus"); tr.Model != "GLM-5.3" || tr.Upstream != "" {
+		t.Fatalf("string-form opus must stay on the anthropic gateway, got %+v", tr)
 	}
 }
 
@@ -699,8 +723,7 @@ func TestE2EOpenAIErrorPassthrough(t *testing.T) {
 // the openai branch only fires for routes marked upstream=openai.
 func TestSonnetRouteStillUsesAnthropicGateway(t *testing.T) {
 	setRoute(t, "flash", "glm-5.3-flash", "openai")
-	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
-	t.Cleanup(func() { cfg.Routing.Sonnet = "" })
+	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 
 	got := modelSentToUpstream(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
 	if got != "DeepSeek-V4-Flash-0731" {

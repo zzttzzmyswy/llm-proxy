@@ -21,10 +21,10 @@ import (
 
 // Config represents /etc/llm-proxy/config.toml
 type Config struct {
-	Proxy    ProxyConfig    `toml:"proxy"`
-	Upstream UpstreamConfig `toml:"upstream"`
-	Keys     KeysConfig     `toml:"keys"`
-	Routing  RoutingConfig  `toml:"routing"`
+	Proxy    ProxyConfig               `toml:"proxy"`
+	Upstream UpstreamConfig            `toml:"upstream"`
+	Keys     KeysConfig                `toml:"keys"`
+	Routing  map[string]toml.Primitive `toml:"routing"`
 }
 
 type ProxyConfig struct {
@@ -42,12 +42,6 @@ type KeysConfig struct {
 	Sophnet string `toml:"sophnet"`
 }
 
-type RoutingConfig struct {
-	Sonnet string `toml:"sonnet"`
-	Opus   string `toml:"opus"`
-	Haiku  string `toml:"haiku"`
-}
-
 // RouteEntry is one resolved [routing] target: the upstream model name and the
 // gateway it is served through. Upstream is "" (the default Anthropic gateway)
 // or "openai" (request translated to OpenAI protocol and forwarded to
@@ -58,11 +52,10 @@ type RouteEntry struct {
 	Upstream string
 }
 
-// routeTargets holds the [routing] aliases declared as tables or plain strings.
-// The three builtin aliases (sonnet/opus/haiku) keep their dedicated struct
-// fields — routeTarget reads those first, exactly like the pre-table behavior —
-// while every other key (including table-form entries with an "openai" upstream)
-// resolves by exact alias name here.
+// routeTargets is the single source of truth for [routing]: every key — the
+// builtin aliases (sonnet/opus/haiku) and custom aliases alike — may be a plain
+// model string (Anthropic gateway) or a table `{ model, upstream }`. haiku
+// defaults to sonnet's full target (including its upstream) when unset.
 var routeTargets map[string]RouteEntry
 
 var cfg Config
@@ -112,52 +105,26 @@ func loadConfig() error {
 	if cfg.Upstream.OpenAIURL == "" {
 		cfg.Upstream.OpenAIURL = "https://www.sophnet.com/api/open-apis/openai"
 	}
-	if cfg.Routing.Sonnet == "" {
-		cfg.Routing.Sonnet = "DeepSeek-V4-Pro"
-	}
-	if cfg.Routing.Opus == "" {
-		cfg.Routing.Opus = "GLM-5.2"
-	}
-	if cfg.Routing.Haiku == "" {
-		cfg.Routing.Haiku = cfg.Routing.Sonnet
-	}
 
-	buildRouteTargets(data)
-
-	// Mirror the string-field defaults into the route table so custom-route
-	// lookups see the same sonnet/opus/haiku targets as the legacy path.
-	for _, alias := range []string{"sonnet", "opus", "haiku"} {
-		if _, ok := routeTargets[alias]; !ok {
-			switch alias {
-			case "sonnet":
-				routeTargets[alias] = RouteEntry{Model: cfg.Routing.Sonnet}
-			case "opus":
-				routeTargets[alias] = RouteEntry{Model: cfg.Routing.Opus}
-			case "haiku":
-				routeTargets[alias] = RouteEntry{Model: cfg.Routing.Haiku}
-			}
-		}
+	if err := buildRouteTargets(cfg.Routing); err != nil {
+		log.Printf("config: parse routing table: %v\n", err)
+	}
+	ensureRoute("sonnet", "DeepSeek-V4-Pro")
+	ensureRoute("opus", "GLM-5.2")
+	if _, ok := routeTargets["haiku"]; !ok {
+		routeTargets["haiku"] = routeTargets["sonnet"]
 	}
 
 	return nil
 }
 
-// buildRouteTargets decodes the full [routing] table into routeTargets. Each key
-// may be a plain model-name string (legacy form) or a table
-// `{ model = "...", upstream = "anthropic"|"openai" }`. sonnet/opus/haiku appear
-// here too, but routeTarget resolves those through their struct fields; custom
-// aliases resolve exclusively through this table. A malformed entry is skipped
-// with a warning rather than aborting the whole proxy.
-func buildRouteTargets(data []byte) {
-	var raw struct {
-		Routing map[string]toml.Primitive `toml:"routing"`
-	}
-	if err := toml.Unmarshal(data, &raw); err != nil {
-		log.Printf("config: parse routing table: %v\n", err)
-		return
-	}
-	routes := make(map[string]RouteEntry, len(raw.Routing)+3)
-	for alias, prim := range raw.Routing {
+// buildRouteTargets decodes the [routing] table into routeTargets. Each key may
+// be a plain model-name string (Anthropic gateway) or a table
+// `{ model = "...", upstream = "anthropic"|"openai" }`. A malformed entry is
+// skipped with a warning rather than aborting the whole proxy.
+func buildRouteTargets(routing map[string]toml.Primitive) error {
+	routes := make(map[string]RouteEntry, len(routing)+3)
+	for alias, prim := range routing {
 		e, err := decodeRouteEntry(prim)
 		if err != nil {
 			log.Printf("config: invalid routing entry %q: %v (skipped)\n", alias, err)
@@ -166,6 +133,15 @@ func buildRouteTargets(data []byte) {
 		routes[alias] = e
 	}
 	routeTargets = routes
+	return nil
+}
+
+// ensureRoute fills the default target for a builtin alias when it was not
+// declared in the config.
+func ensureRoute(alias, defaultModel string) {
+	if _, ok := routeTargets[alias]; !ok {
+		routeTargets[alias] = RouteEntry{Model: defaultModel}
+	}
 }
 
 // decodeRouteEntry turns one [routing] value into a RouteEntry. A plain string is
@@ -217,7 +193,7 @@ func main() {
 	http.HandleFunc("/v1/chat/completions", handleChatCompletions)
 
 	log.Printf("proxy-go :%d | sonnet->%s opus->%s haiku->%s vlm=%s\n",
-		cfg.Proxy.Port, cfg.Routing.Sonnet, cfg.Routing.Opus, cfg.Routing.Haiku, cfg.Proxy.VLMModel)
+		cfg.Proxy.Port, routeModelName("sonnet"), routeModelName("opus"), routeModelName("haiku"), cfg.Proxy.VLMModel)
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", cfg.Proxy.Port), nil))
 }
 
@@ -432,32 +408,32 @@ func retryThinkingWith(req map[string]interface{}, w http.ResponseWriter, r *htt
 	return resp, nil
 }
 
-// routeTarget resolves the routing target for a client model name. The three
-// builtin aliases resolve through their struct fields (exact match, like before);
-// custom config aliases (e.g. `flash = { model = ..., upstream = "openai" }`)
-// resolve by exact name through routeTargets; composed names (claude-sonnet-4,
-// opus-2, ...) fall back to substring matching.
+// routeTarget resolves the routing target for a client model name. Exact names
+// (builtin aliases and custom config aliases alike) resolve through
+// routeTargets; composed names (claude-sonnet-4, opus-2, ...) fall back to
+// substring matching against the builtin targets.
 func routeTarget(model string) RouteEntry {
-	switch model {
-	case "sonnet":
-		return RouteEntry{Model: cfg.Routing.Sonnet}
-	case "opus":
-		return RouteEntry{Model: cfg.Routing.Opus}
-	case "haiku":
-		return RouteEntry{Model: cfg.Routing.Haiku}
-	}
 	if e, ok := routeTargets[model]; ok {
 		return e
 	}
 	switch {
 	case strings.Contains(model, "opus"):
-		return RouteEntry{Model: cfg.Routing.Opus}
+		return routeTargets["opus"]
 	case strings.Contains(model, "haiku"):
-		return RouteEntry{Model: cfg.Routing.Haiku}
+		return routeTargets["haiku"]
 	case strings.Contains(model, "sonnet"):
-		return RouteEntry{Model: cfg.Routing.Sonnet}
+		return routeTargets["sonnet"]
 	}
 	return RouteEntry{}
+}
+
+// routeModelName returns the configured upstream model for a builtin alias
+// (used for the startup log).
+func routeModelName(alias string) string {
+	if e, ok := routeTargets[alias]; ok {
+		return e.Model
+	}
+	return ""
 }
 
 // stripThinkingBlocks removes every `type:thinking` content block from the

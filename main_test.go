@@ -62,15 +62,14 @@ func callHandleMessages(t *testing.T, reqBody string) string {
 func TestImageRequestDescribedThenRoutedToText(t *testing.T) {
 	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
-	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
 		cfg.Proxy.VLMModel = ""
-		cfg.Routing.Sonnet = ""
 	})
 
 	got := modelSentToUpstream(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"describe"}]}]}`)
 
-	if got != cfg.Routing.Sonnet {
+	if got != "DeepSeek-V4-Flash-0731" {
 		t.Fatalf("image request should route to text model after describe, upstream received %q", got)
 	}
 }
@@ -80,10 +79,9 @@ func TestImageRequestDescribedThenRoutedToText(t *testing.T) {
 func TestImageReplacedWithVLMDescription(t *testing.T) {
 	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
-	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
 		cfg.Proxy.VLMModel = ""
-		cfg.Routing.Sonnet = ""
 	})
 
 	var describeCalls int
@@ -140,10 +138,9 @@ func TestImageReplacedWithVLMDescription(t *testing.T) {
 func TestImageDescribeFailFallsBackToVLM(t *testing.T) {
 	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
-	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
 		cfg.Proxy.VLMModel = ""
-		cfg.Routing.Sonnet = ""
 	})
 
 	var calls int
@@ -198,10 +195,9 @@ func TestImageDescribeFailFallsBackToVLM(t *testing.T) {
 func TestImageURLDataDescribedThenRoutedToText(t *testing.T) {
 	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
-	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
 		cfg.Proxy.VLMModel = ""
-		cfg.Routing.Sonnet = ""
 	})
 
 	var describeBody string
@@ -249,10 +245,9 @@ func TestImageURLDataDescribedThenRoutedToText(t *testing.T) {
 func TestNestedToolResultImageDescribed(t *testing.T) {
 	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
-	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
 		cfg.Proxy.VLMModel = ""
-		cfg.Routing.Sonnet = ""
 	})
 
 	var finalBody string
@@ -295,10 +290,9 @@ func TestNestedToolResultImageDescribed(t *testing.T) {
 func TestMultipleImagesAllDescribed(t *testing.T) {
 	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
-	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
 		cfg.Proxy.VLMModel = ""
-		cfg.Routing.Sonnet = ""
 	})
 
 	var describeCount int
@@ -344,10 +338,9 @@ func TestMultipleImagesAllDescribed(t *testing.T) {
 func TestImageDescriptionCachedAcrossRequests(t *testing.T) {
 	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
-	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
 		cfg.Proxy.VLMModel = ""
-		cfg.Routing.Sonnet = ""
 	})
 
 	var describeCalls int
@@ -398,10 +391,9 @@ func TestImageDescriptionCachedAcrossRequests(t *testing.T) {
 func TestDistinctImagesBothDescribed(t *testing.T) {
 	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
-	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
 		cfg.Proxy.VLMModel = ""
-		cfg.Routing.Sonnet = ""
 	})
 
 	var describeCalls int
@@ -514,10 +506,9 @@ func TestImageCacheKey(t *testing.T) {
 func TestVLMDescribeRequestCarriesMessageContext(t *testing.T) {
 	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
-	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
 		cfg.Proxy.VLMModel = ""
-		cfg.Routing.Sonnet = ""
 	})
 
 	var describeBody string
@@ -560,10 +551,9 @@ func TestVLMDescribeRequestCarriesMessageContext(t *testing.T) {
 func TestSameImageDifferentContextNotCached(t *testing.T) {
 	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
-	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
 		cfg.Proxy.VLMModel = ""
-		cfg.Routing.Sonnet = ""
 	})
 
 	var describeCalls int
@@ -605,10 +595,9 @@ func TestSameImageDifferentContextNotCached(t *testing.T) {
 func TestToolResultContextIncludesToolInfo(t *testing.T) {
 	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
-	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
 		cfg.Proxy.VLMModel = ""
-		cfg.Routing.Sonnet = ""
 	})
 
 	var describeBody string
@@ -652,8 +641,7 @@ func TestToolResultContextIncludesToolInfo(t *testing.T) {
 
 // A request named "haiku" must be routed to the haiku target when configured.
 func TestHaikuExplicitRouting(t *testing.T) {
-	cfg.Routing.Haiku = "GLM-5.2"
-	t.Cleanup(func() { cfg.Routing.Haiku = "" })
+	setRoute(t, "haiku", "GLM-5.2", "")
 
 	got := modelSentToUpstream(t, `{"model":"haiku","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
 
@@ -664,17 +652,22 @@ func TestHaikuExplicitRouting(t *testing.T) {
 
 // When the config declares no haiku, loadConfig must fall back to the sonnet target.
 func TestHaikuFallsBackToSonnetWhenUnconfigured(t *testing.T) {
-	before := cfg
-	defer func() { cfg = before }()
+	oldCfg := cfg
+	oldRoutes := routeTargets
+	t.Cleanup(func() {
+		cfg = oldCfg
+		routeTargets = oldRoutes
+	})
 
 	if err := loadConfig(); err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if cfg.Routing.Haiku == "" {
+	haiku := routeTargets["haiku"]
+	if haiku.Model == "" {
 		t.Fatal("haiku must fall back to a non-empty target")
 	}
-	if cfg.Routing.Haiku != cfg.Routing.Sonnet {
-		t.Fatalf("unconfigured haiku must fall back to sonnet target, got haiku=%q sonnet=%q", cfg.Routing.Haiku, cfg.Routing.Sonnet)
+	if haiku != routeTargets["sonnet"] {
+		t.Fatalf("unconfigured haiku must fall back to sonnet target, got %+v", haiku)
 	}
 }
 
@@ -990,10 +983,9 @@ func TestThinking400WithNothingToStripPassesThrough(t *testing.T) {
 func TestImageRejectRetriesWithVLM(t *testing.T) {
 	resetImageDescCacheForTests()
 	cfg.Proxy.VLMModel = "MiniMax-M3"
-	cfg.Routing.Sonnet = "DeepSeek-V4-Flash-0731"
+	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
 		cfg.Proxy.VLMModel = ""
-		cfg.Routing.Sonnet = ""
 	})
 
 	var mu sync.Mutex

@@ -29,7 +29,7 @@ Claude Code 默认只认 Anthropic 官方模型名（`sonnet` / `opus` / `haiku`
 
 | 特性 | 说明 |
 |------|------|
-| 模型路由 | `sonnet` / `opus` / `haiku` 按配置映射到上游模型名 |
+| 模型路由 | 任意别名映射到上游模型:字符串默认走 Anthropic 网关,表值 `{ model = "...", upstream = "openai" }` 走 OpenAI 网关(协议自动翻译) |
 | OpenAI 网关路由 | 任意别名可配置 `{ model = "x", upstream = "openai" }`，请求自动翻译为 OpenAI 格式走 OpenAI 网关，回复翻译回 Anthropic（含流式 SSE）；`sonnet/opus/haiku` 等字符串形式仍走 Anthropic 网关 |
 | haiku 缺省 | 配置未声明 `haiku` 时自动沿用 `sonnet` 的目标 |
 | 图片先描述后路由 | 带图请求先经 VLM 描述，把说明文本插入原图位置，再发给文本模型 |
@@ -123,10 +123,10 @@ export ANTHROPIC_AUTH_TOKEN="<任意值，代理会替换为真实上游密钥>"
 | `upstream.anthropic_url` | `https://www.sophnet.com/api/open-apis/anthropic` | Anthropic 风格上游 |
 | `upstream.openai_url` | `https://www.sophnet.com/api/open-apis/openai` | OpenAI 风格上游 |
 | `keys.sophnet` | — | 上游密钥（可用 `SOPHNET_API_KEY` 覆盖） |
-| `routing.sonnet` | `DeepSeek-V4-Pro` | `sonnet` 映射目标（字符串 = Anthropic 网关） |
+| `routing.sonnet` | `DeepSeek-V4-Pro` | `sonnet` 映射目标(字符串 = Anthropic 网关,或表值选网关) |
 | `routing.opus` | `GLM-5.2` | `opus` 映射目标 |
 | `routing.haiku` | 沿用 `sonnet` | `haiku` 映射目标 |
-| `routing.<别名>` | — | 自定义别名：字符串形式（Anthropic 网关）或表值 `{ model = "...", upstream = "anthropic"\|"openai" }` 显式选择网关 |
+| `routing.<别名>` | — | 任意别名(含 sonnet/opus/haiku):字符串走 Anthropic 网关,表值 `{ model = "...", upstream = "anthropic"\|"openai" }` 显式选网关 |
 
 > **OpenAI 网关路由示例**：`flash = { model = "glm-5.3-flash", upstream = "openai" }`
 > 之后 Claude Code 以模型名 `flash` 发请求即可，代理把请求翻译为 OpenAI 格式转发到 `upstream.openai_url`，并把回复（含流式）翻译回 Anthropic 格式。请求翻译会剥离 thinking 块、把图片转 `image_url`、`tool_use/tool_result` 转 `tool_calls`/`role=tool`；响应侧 `finish_reason→stop_reason`、`usage` 映射，流式 SSE 输出标准 Anthropic 事件序列。
