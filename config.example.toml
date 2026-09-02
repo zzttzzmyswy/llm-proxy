@@ -23,3 +23,12 @@ sonnet = "DeepSeek-V4-Flash-0731"
 opus = "DeepSeek-V4-Flash-0731"
 # haiku defaults to sonnet when omitted
 # haiku = "DeepSeek-V4-Flash-0731"
+
+# 任意别名可配置为表值并指定网关：
+#   flash = { model = "glm-5.3-flash", upstream = "openai" }
+# - model：转发给上游的模型名
+# - upstream：缺省 ""/anthropic 走 Anthropic 网关（默认）；"openai" 将请求翻译为
+#   OpenAI 协议转发到 upstream.openai_url，再把回复翻译回 Anthropic 格式。
+#   适合只在 OpenAI 网关注册、Anthropic 网关不支持的模型（如 glm-5.3-flash）。
+# plain-string 形式（如上面的 sonnet）等价于 upstream 缺省。
+# flash = { model = "glm-5.3-flash", upstream = "openai" }
