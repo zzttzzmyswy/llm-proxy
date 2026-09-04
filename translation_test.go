@@ -730,3 +730,171 @@ func TestSonnetRouteStillUsesAnthropicGateway(t *testing.T) {
 		t.Fatalf("sonnet must still route through the anthropic gateway, upstream received %q", got)
 	}
 }
+
+// Regression (MYS-915): an image-carrying request whose route targets the OpenAI
+// gateway must first have its images VLM-described, then the now-text-only body
+// translated to OpenAI and sent to the text model. Before the fix the openai
+// branch returned early and skipped the describe pass, so the raw image was
+// translated to an image_url that text models reject with 400
+// "model ... do not support image params".
+func TestOpenAIRouteImageRequestVLMDescribed(t *testing.T) {
+	resetImageDescCacheForTests()
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	setRoute(t, "flash", "DeepSeek-V4-Flash-0731", "openai")
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+	})
+
+	var describeCalls int
+	var openAIBody string
+	var anthropicBody string
+	var mu sync.Mutex
+	// The VLM describe call goes to the configured anthropic upstream; the
+	// translated text-only request goes to the openai upstream.
+	anthropicUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		if json.Unmarshal(b, &m) != nil {
+			return
+		}
+		mu.Lock()
+		model, _ := m["model"].(string)
+		mu.Unlock()
+		if model == "MiniMax-M3" {
+			mu.Lock()
+			describeCalls++
+			anthropicBody = string(b)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"这是 VLM 对图片的描述。"}],"model":"MiniMax-M3","id":"vlm-1","usage":{"input_tokens":5,"output_tokens":5}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, nonStreamJSONBody)
+	}))
+	t.Cleanup(anthropicUp.Close)
+	oldAnthropic := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = anthropicUp.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldAnthropic })
+
+	openAIUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		openAIBody = string(b)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"c1","model":"DeepSeek-V4-Flash-0731","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	t.Cleanup(openAIUp.Close)
+	oldOpenAI := cfg.Upstream.OpenAIURL
+	cfg.Upstream.OpenAIURL = openAIUp.URL
+	t.Cleanup(func() { cfg.Upstream.OpenAIURL = oldOpenAI })
+
+	reqBody := `{"model":"flash","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
+	resp := callHandleMessages(t, reqBody)
+
+	if strings.Contains(resp, "API Error") || strings.Contains(resp, "do not support image") {
+		t.Fatalf("image-carrying openai-route request must not surface a text-model image error, got: %s", resp)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if describeCalls != 1 {
+		t.Fatalf("expected exactly 1 VLM describe call, got %d", describeCalls)
+	}
+	if !strings.Contains(anthropicBody, `"type":"image"`) {
+		t.Fatalf("the VLM describe request must carry the raw image block, got: %s", anthropicBody)
+	}
+	var sent map[string]interface{}
+	if err := json.Unmarshal([]byte(openAIBody), &sent); err != nil {
+		t.Fatalf("openai upstream must receive valid JSON: %v", err)
+	}
+	if sent["model"] != "DeepSeek-V4-Flash-0731" {
+		t.Fatalf("the translated request must target the openai text model, got %v", sent["model"])
+	}
+	if !strings.Contains(openAIBody, "这里有一个 image") {
+		t.Fatalf("the translated openai request must carry the VLM description in place of the image, got: %s", openAIBody)
+	}
+	if strings.Contains(openAIBody, "image_url") || strings.Contains(openAIBody, `"type":"image"`) {
+		t.Fatalf("the translated openai request must not carry the raw image, got: %s", openAIBody)
+	}
+}
+
+// Regression (MYS-915): when the VLM describe pass fails on an openai-route image
+// request, the request must fall back to the VLM model (via the anthropic
+// gateway) so the image is still handled — mirroring the anthropic-route
+// fallback. Before the fix the openai branch skipped the describe pass entirely,
+// so an image-carrying request went straight to the text model and failed.
+func TestOpenAIRouteImageDescribeFailFallsBackToVLM(t *testing.T) {
+	resetImageDescCacheForTests()
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	setRoute(t, "flash", "DeepSeek-V4-Flash-0731", "openai")
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+	})
+
+	var anthropicCalls int
+	var openAICalls int
+	var mu sync.Mutex
+	// The VLM describe call (model == MiniMax-M3) fails; the fallback then sends
+	// the original image-carrying request to the VLM model, which succeeds.
+	anthropicUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		if json.Unmarshal(b, &m) != nil {
+			return
+		}
+		mu.Lock()
+		anthropicCalls++
+		model, _ := m["model"].(string)
+		mu.Unlock()
+		if model == "MiniMax-M3" {
+			// First call is the describe pass (fail it), the second is the
+			// VLM fallback (succeed).
+			mu.Lock()
+			n := anthropicCalls
+			mu.Unlock()
+			if n == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(500)
+				io.WriteString(w, `{"error":{"message":"vlm down"}}`)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"vlm fallback ok"}],"model":"MiniMax-M3","id":"vlm-2","usage":{"input_tokens":5,"output_tokens":5}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, nonStreamJSONBody)
+	}))
+	t.Cleanup(anthropicUp.Close)
+	oldAnthropic := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = anthropicUp.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldAnthropic })
+
+	openAIUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		mu.Lock()
+		openAICalls++
+		mu.Unlock()
+		w.WriteHeader(500)
+	}))
+	t.Cleanup(openAIUp.Close)
+	oldOpenAI := cfg.Upstream.OpenAIURL
+	cfg.Upstream.OpenAIURL = openAIUp.URL
+	t.Cleanup(func() { cfg.Upstream.OpenAIURL = oldOpenAI })
+
+	reqBody := `{"model":"flash","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
+	resp := callHandleMessages(t, reqBody)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if anthropicCalls != 2 {
+		t.Fatalf("expected 2 anthropic calls (describe fail + VLM fallback), got %d", anthropicCalls)
+	}
+	if openAICalls != 0 {
+		t.Fatalf("describe failure must not forward to the openai gateway, got %d openai calls", openAICalls)
+	}
+	if !strings.Contains(resp, "vlm fallback ok") {
+		t.Fatalf("expected the VLM fallback reply, got: %q", resp)
+	}
+}
