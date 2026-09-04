@@ -223,13 +223,18 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	// A route marked upstream="openai" (e.g. models only reachable through the
 	// OpenAI gateway) leaves this Anthropic pipeline entirely: the request is
 	// translated to OpenAI format, forwarded to cfg.Upstream.OpenAIURL, and the
-	// reply is translated back into Anthropic framing for the client.
+	// reply is translated back into Anthropic framing for the client. The image
+	// describe pass runs BEFORE the openai branch so image-carrying requests are
+	// reduced to text first — a raw image translated to image_url is rejected by
+	// text-only openai models ("model ... do not support image params").
 	target := routeTarget(model)
-	if target.Upstream == "openai" {
-		handleOpenAIRequest(w, r, req, target.Model)
-		return
-	}
 	newModel := target.Model
+	// vlmFallback is set when the describe pass failed: the original (still
+	// image-carrying) request must be routed to the VLM model via the anthropic
+	// gateway. An openai-route request in this state must NOT be translated to
+	// the openai text model, or the raw image fails again with
+	// "model ... do not support image params".
+	vlmFallback := false
 	if containsImage(req) && cfg.Proxy.VLMModel != "" {
 		if describeImages(req) {
 			body, _ = json.Marshal(req)
@@ -238,11 +243,16 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 			// original request and route the whole thing to the VLM so no image is lost.
 			json.Unmarshal(body, &req)
 			newModel = cfg.Proxy.VLMModel
+			vlmFallback = true
 		}
 	}
 	if newModel != "" {
 		req["model"] = newModel
 		body, _ = json.Marshal(req)
+	}
+	if target.Upstream == "openai" && !vlmFallback {
+		handleOpenAIRequest(w, r, req, target.Model)
+		return
 	}
 
 	// Thinking is passed through transparently: the client's `thinking` param and
