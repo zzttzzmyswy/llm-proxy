@@ -36,6 +36,10 @@ type ProxyConfig struct {
 type UpstreamConfig struct {
 	AnthropicURL string `toml:"anthropic_url"`
 	OpenAIURL    string `toml:"openai_url"`
+	// DefaultUpstream picks the gateway for routing entries that do not name one
+	// explicitly: "" or "claude"/"anthropic" → the Anthropic (claude-format)
+	// gateway, "openai" → the OpenAI gateway.
+	DefaultUpstream string `toml:"default_upstream"`
 }
 
 type KeysConfig struct {
@@ -47,9 +51,13 @@ type KeysConfig struct {
 // or "openai" (request translated to OpenAI protocol and forwarded to
 // cfg.Upstream.OpenAIURL). Only models exposed on the OpenAI-only gateway (e.g.
 // glm-5.3-flash, which the Anthropic gateway rejects) need upstream="openai".
+// SupportsImage declares that the upstream model natively handles image input,
+// so image-carrying requests bound for this route skip the builtin VLM describe
+// pass and go to the model straight.
 type RouteEntry struct {
-	Model    string
-	Upstream string
+	Model         string
+	Upstream      string
+	SupportsImage bool
 }
 
 // routeTargets is the single source of truth for [routing]: every key — the
@@ -114,8 +122,26 @@ func loadConfig() error {
 	if _, ok := routeTargets["haiku"]; !ok {
 		routeTargets["haiku"] = routeTargets["sonnet"]
 	}
+	applyDefaultUpstream()
 
 	return nil
+}
+
+// applyDefaultUpstream fills the configured default gateway into every routing
+// entry that did not declare an upstream explicitly. ""/"claude"/"anthropic"
+// keep the default anthropic (claude-format) gateway; "openai" routes all
+// upstream-less entries (including the builtin fallback targets) through the
+// OpenAI gateway. Explicit per-entry upstream values are left untouched.
+func applyDefaultUpstream() {
+	switch strings.ToLower(cfg.Upstream.DefaultUpstream) {
+	case "openai":
+		for alias, e := range routeTargets {
+			if e.Upstream == "" {
+				e.Upstream = "openai"
+				routeTargets[alias] = e
+			}
+		}
+	}
 }
 
 // buildRouteTargets decodes the [routing] table into routeTargets. Each key may
@@ -152,11 +178,12 @@ func decodeRouteEntry(p toml.Primitive) (RouteEntry, error) {
 		return RouteEntry{Model: s}, nil
 	}
 	var t struct {
-		Model    string `toml:"model"`
-		Upstream string `toml:"upstream"`
+		Model         string `toml:"model"`
+		Upstream      string `toml:"upstream"`
+		SupportsImage bool   `toml:"supports_image"`
 	}
 	if err := toml.PrimitiveDecode(p, &t); err == nil && t.Model != "" {
-		return RouteEntry{Model: t.Model, Upstream: t.Upstream}, nil
+		return RouteEntry{Model: t.Model, Upstream: t.Upstream, SupportsImage: t.SupportsImage}, nil
 	}
 	return RouteEntry{}, fmt.Errorf("must be a model string or { model = \"...\", upstream = \"...\" }")
 }
@@ -223,14 +250,23 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	// A route marked upstream="openai" (e.g. models only reachable through the
 	// OpenAI gateway) leaves this Anthropic pipeline entirely: the request is
 	// translated to OpenAI format, forwarded to cfg.Upstream.OpenAIURL, and the
-	// reply is translated back into Anthropic framing for the client.
+	// reply is translated back into Anthropic framing for the client. The image
+	// describe pass runs BEFORE the openai branch so image-carrying requests are
+	// reduced to text first — a raw image translated to image_url is rejected by
+	// text-only openai models ("model ... do not support image params").
 	target := routeTarget(model)
-	if target.Upstream == "openai" {
-		handleOpenAIRequest(w, r, req, target.Model)
-		return
-	}
 	newModel := target.Model
-	if containsImage(req) && cfg.Proxy.VLMModel != "" {
+	// vlmFallback is set when the describe pass failed: the original (still
+	// image-carrying) request must be routed to the VLM model via the anthropic
+	// gateway. An openai-route request in this state must NOT be translated to
+	// the openai text model, or the raw image fails again with
+	// "model ... do not support image params".
+	vlmFallback := false
+	// A route with SupportsImage=true (the upstream model natively handles image
+	// input) skips the builtin VLM describe pass: the image-carrying request is
+	// forwarded to the model as-is (image blocks intact; openai routes translate
+	// them to image_url parts).
+	if containsImage(req) && cfg.Proxy.VLMModel != "" && !target.SupportsImage {
 		if describeImages(req) {
 			body, _ = json.Marshal(req)
 		} else {
@@ -238,11 +274,16 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 			// original request and route the whole thing to the VLM so no image is lost.
 			json.Unmarshal(body, &req)
 			newModel = cfg.Proxy.VLMModel
+			vlmFallback = true
 		}
 	}
 	if newModel != "" {
 		req["model"] = newModel
 		body, _ = json.Marshal(req)
+	}
+	if target.Upstream == "openai" && !vlmFallback {
+		handleOpenAIRequest(w, r, req, target.Model)
+		return
 	}
 
 	// Thinking is passed through transparently: the client's `thinking` param and
@@ -263,8 +304,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	// Fallback: if the text upstream rejects an image-carrying request that static
 	// detection missed (400 "Model do not support image input"), retry once with the
-	// VLM model. A non-image 400 passes through unchanged.
-	if resp.StatusCode == 400 && cfg.Proxy.VLMModel != "" && newModel != cfg.Proxy.VLMModel {
+	// VLM model. A route marked supports_image=true skips this too — the model is
+	// declared image-capable, so a rejection is a config error worth surfacing.
+	if resp.StatusCode == 400 && cfg.Proxy.VLMModel != "" && newModel != cfg.Proxy.VLMModel && !target.SupportsImage {
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if strings.Contains(string(respBody), "do not support image") {

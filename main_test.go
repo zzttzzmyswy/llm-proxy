@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -651,6 +653,8 @@ func TestHaikuExplicitRouting(t *testing.T) {
 }
 
 // When the config declares no haiku, loadConfig must fall back to the sonnet target.
+// The test writes its own config file (the host's /etc/llm-proxy/config.toml may
+// declare a haiku route, which would make the assertion meaningless).
 func TestHaikuFallsBackToSonnetWhenUnconfigured(t *testing.T) {
 	oldCfg := cfg
 	oldRoutes := routeTargets
@@ -658,6 +662,15 @@ func TestHaikuFallsBackToSonnetWhenUnconfigured(t *testing.T) {
 		cfg = oldCfg
 		routeTargets = oldRoutes
 	})
+
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := `[routing]
+sonnet = "DeepSeek-V4-Flash-0731"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("LLM_PROXY_CONFIG", path)
 
 	if err := loadConfig(); err != nil {
 		t.Fatalf("loadConfig: %v", err)
