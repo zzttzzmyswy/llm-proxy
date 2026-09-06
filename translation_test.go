@@ -898,3 +898,296 @@ func TestOpenAIRouteImageDescribeFailFallsBackToVLM(t *testing.T) {
 		t.Fatalf("expected the VLM fallback reply, got: %q", resp)
 	}
 }
+
+// ---- MYS-940: supports_image 与 default_upstream ----
+
+// setRouteFull pins a routing entry including the supports_image flag and
+// restores the previous table on cleanup.
+func setRouteFull(t *testing.T, alias, model, upstream string, supportsImage bool) {
+	t.Helper()
+	setRoute(t, alias, model, upstream)
+	routeTargets[alias] = RouteEntry{Model: model, Upstream: upstream, SupportsImage: supportsImage}
+}
+
+// [routing] table values must carry an optional supports_image flag. A route with
+// supports_image=true declares that the upstream model already understands images,
+// so the proxy must NOT run its builtin VLM describe pass for that model.
+func TestLoadConfigParsesSupportsImageFlag(t *testing.T) {
+	oldCfg := cfg
+	oldRoutes := routeTargets
+	t.Cleanup(func() { cfg = oldCfg; routeTargets = oldRoutes })
+
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := `[routing]
+sonnet = { model = "DeepSeek-V4-Flash-0731", supports_image = true }
+opus = { model = "GLM-5.2", supports_image = false }
+haiku = { model = "glm-5.3-flash", upstream = "openai", supports_image = true }
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LLM_PROXY_CONFIG", path)
+	if err := loadConfig(); err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if tr := routeTargets["sonnet"]; !tr.SupportsImage || tr.Upstream != "" {
+		t.Fatalf("sonnet must decode supports_image=true on the anthropic gateway, got %+v", tr)
+	}
+	if tr := routeTargets["opus"]; tr.SupportsImage {
+		t.Fatalf("opus must decode supports_image=false, got %+v", tr)
+	}
+	if tr := routeTargets["haiku"]; !tr.SupportsImage || tr.Upstream != "openai" {
+		t.Fatalf("haiku must combine supports_image with upstream=openai, got %+v", tr)
+	}
+}
+
+// A route with supports_image=true must forward image-carrying requests straight
+// to the target model with the image block intact — the builtin VLM describe pass
+// is skipped entirely.
+func TestImageRequestSkipsVLMWhenRouteSupportsImage(t *testing.T) {
+	resetImageDescCacheForTests()
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	setRouteFull(t, "vision", "GLM-5.3", "", true)
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+	})
+
+	var vlmCalls int
+	var forwarded string
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		if json.Unmarshal(b, &m) != nil {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		model, _ := m["model"].(string)
+		if model == "MiniMax-M3" {
+			vlmCalls++
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"vlm"}],"model":"MiniMax-M3","id":"vlm","usage":{"input_tokens":1,"output_tokens":1}}`)
+			return
+		}
+		forwarded = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, nonStreamJSONBody)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	reqBody := `{"model":"vision","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
+	callHandleMessages(t, reqBody)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if vlmCalls != 0 {
+		t.Fatalf("supports_image=true route must skip the VLM describe pass, got %d VLM calls", vlmCalls)
+	}
+	if !strings.Contains(forwarded, `"type":"image"`) {
+		t.Fatalf("image block must be forwarded intact to the text model, got: %s", forwarded)
+	}
+	if !strings.Contains(forwarded, `"model":"GLM-5.3"`) {
+		t.Fatalf("supports_image=true request must reach the target model, got: %s", forwarded)
+	}
+}
+
+// supports_image=true on an openai-route model: the image is translated to an
+// image_url payload (no VLM pass), so the openai text model receives it directly.
+func TestImageRequestSkipsVLMWhenSupportsImageOpenAIRoute(t *testing.T) {
+	resetImageDescCacheForTests()
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	setRouteFull(t, "vision", "glm-5.3-flash", "openai", true)
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+	})
+
+	oldAnthropic := cfg.Upstream.AnthropicURL
+	switchAnthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"unexpected anthropic call"}],"model":"x","id":"x","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	cfg.Upstream.AnthropicURL = switchAnthropic.URL
+	t.Cleanup(func() {
+		switchAnthropic.Close()
+		cfg.Upstream.AnthropicURL = oldAnthropic
+	})
+
+	var openAIBody string
+	openAIUp := withOpenAIUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		openAIBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"c1","model":"glm-5.3-flash","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	})
+	t.Cleanup(openAIUp.Close)
+
+	reqBody := `{"model":"vision","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
+	resp := callHandleMessages(t, reqBody)
+
+	if !strings.Contains(resp, `"ok"`) {
+		t.Fatalf("openai reply must pass through, got: %q", resp)
+	}
+	if !strings.Contains(openAIBody, `"image_url"`) {
+		t.Fatalf("image must be translated to image_url for the openai gateway, got: %s", openAIBody)
+	}
+	if strings.Contains(openAIBody, `"type":"image"`) {
+		t.Fatalf("anthropic image block must not leak into the openai body, got: %s", openAIBody)
+	}
+}
+
+// A supports_image=true route whose model still returns 400 "do not support image"
+// must pass the error through rather than retry with the VLM — the operator declared
+// the model image-capable, so a rejection is a config error worth surfacing.
+func TestSupportsImageImage400PassesThroughNoRetry(t *testing.T) {
+	resetImageDescCacheForTests()
+	cfg.Proxy.VLMModel = "MiniMax-M3"
+	setRouteFull(t, "vision", "GLM-5.3", "", true)
+	t.Cleanup(func() {
+		cfg.Proxy.VLMModel = ""
+	})
+
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		io.WriteString(w, `{"error":{"message":"Model do not support image input"}}`)
+	}))
+	t.Cleanup(upstream.Close)
+	oldURL := cfg.Upstream.AnthropicURL
+	cfg.Upstream.AnthropicURL = upstream.URL
+	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+
+	reqBody := `{"model":"vision","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
+	resp := callHandleMessages(t, reqBody)
+	if calls != 1 {
+		t.Fatalf("supports_image=true 400 must not retry to the VLM, got %d upstream calls", calls)
+	}
+	if !strings.Contains(resp, "do not support image") {
+		t.Fatalf("the 400 must pass through unchanged, got: %q", resp)
+	}
+}
+
+// [upstream] default_upstream chooses the gateway for routing entries that do not
+// name one explicitly: "openai" backfills those entries, "claude"/"anthropic" or
+// unset keeps the anthropic gateway.
+func TestLoadConfigDefaultUpstreamOpenAI(t *testing.T) {
+	oldCfg := cfg
+	oldRoutes := routeTargets
+	t.Cleanup(func() { cfg = oldCfg; routeTargets = oldRoutes })
+
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := `[upstream]
+anthropic_url = "https://www.sophnet.com/api/open-apis/anthropic"
+openai_url = "https://www.sophnet.com/api/open-apis/openai"
+default_upstream = "openai"
+
+[routing]
+sonnet = "DeepSeek-V4-Flash-0731"
+opus = { model = "GLM-5.2" }
+flash = { model = "glm-5.3-flash", upstream = "anthropic" }
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LLM_PROXY_CONFIG", path)
+	if err := loadConfig(); err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if tr := routeTargets["sonnet"]; tr.Upstream != "openai" {
+		t.Fatalf("default_upstream=openai must backfill the plain-string sonnet route, got %+v", tr)
+	}
+	if tr := routeTargets["opus"]; tr.Upstream != "openai" {
+		t.Fatalf("default_upstream=openai must backfill the upstream-less table route, got %+v", tr)
+	}
+	if tr := routeTargets["flash"]; tr.Upstream == "openai" {
+		t.Fatalf("an explicit upstream=anthropic entry must not be overridden, got %+v", tr)
+	}
+}
+
+// With no default_upstream (or "claude"/"anthropic"), routing entries default to
+// the claude-format anthropic gateway.
+func TestLoadConfigDefaultUpstreamDefaultsToClaude(t *testing.T) {
+	oldCfg := cfg
+	oldRoutes := routeTargets
+	t.Cleanup(func() { cfg = oldCfg; routeTargets = oldRoutes })
+
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := `[routing]
+sonnet = "DeepSeek-V4-Flash-0731"
+flash = { model = "glm-5.3-flash" }
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LLM_PROXY_CONFIG", path)
+	if err := loadConfig(); err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if tr := routeTargets["sonnet"]; tr.Upstream != "" {
+		t.Fatalf("unset default_upstream must keep the anthropic gateway, got %+v", tr)
+	}
+	if tr := routeTargets["flash"]; tr.Upstream != "" {
+		t.Fatalf("upstream-less table route must default to anthropic, got %+v", tr)
+	}
+}
+
+// default_upstream=openai must actually route requests through the OpenAI gateway,
+// not just fill the routing table: a plain-string sonnet entry (no explicit
+// upstream) with the openai default sends the translated request to openai_url and
+// never touches the anthropic upstream.
+func TestDefaultUpstreamOpenAIRoutesThroughOpenAIGateway(t *testing.T) {
+	resetImageDescCacheForTests()
+	oldCfg := cfg
+	oldRoutes := routeTargets
+	t.Cleanup(func() { cfg = oldCfg; routeTargets = oldRoutes })
+
+	var anthropicCalls int
+	anthroUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		anthropicCalls++
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"anthropic"}],"model":"x","id":"x","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	t.Cleanup(anthroUp.Close)
+
+	var openAIBody string
+	openAIUp := withOpenAIUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		openAIBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"c1","model":"DeepSeek-V4-Flash-0731","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	})
+	t.Cleanup(openAIUp.Close)
+
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := `[upstream]
+anthropic_url = "` + anthroUp.URL + `"
+openai_url = "` + openAIUp.URL + `"
+default_upstream = "openai"
+
+[routing]
+sonnet = "DeepSeek-V4-Flash-0731"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LLM_PROXY_CONFIG", path)
+	if err := loadConfig(); err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+
+	resp := callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
+	if !strings.Contains(resp, `"ok"`) {
+		t.Fatalf("expected the openai gateway reply, got: %q", resp)
+	}
+	if anthropicCalls != 0 {
+		t.Fatalf("default_upstream=openai must not hit the anthropic upstream, got %d calls", anthropicCalls)
+	}
+	if !strings.Contains(openAIBody, `"role":"user"`) {
+		t.Fatalf("the translated openai request must carry the message, got: %s", openAIBody)
+	}
+}

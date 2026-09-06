@@ -18,6 +18,8 @@ Claude Code 默认只认 Anthropic 官方模型名（`sonnet` / `opus` / `haiku`
 文字请求 ──→ 路由到文本模型（sonnet/opus/haiku 按配置映射）
 带图请求 ──→ 逐张送 VLM 描述 ──→ 用文本块替换 image 块（"这里有一个 image，其内容如下：xxx"）
              │   ↑ 描述时携带该图所在消息的上下文（角色、同消息文本、产出该图的工具调用）
+             │   │
+             │   └─ 路由标记 supports_image = true（上游模型原生支持图片）时 ▾ 跳过整个描述流程
              └─ 描述失败时回退：整请求原样路由到 VLM，保证图片不丢失
 ```
 
@@ -29,8 +31,10 @@ Claude Code 默认只认 Anthropic 官方模型名（`sonnet` / `opus` / `haiku`
 
 | 特性 | 说明 |
 |------|------|
-| 模型路由 | 任意别名映射到上游模型:字符串默认走 Anthropic 网关,表值 `{ model = "...", upstream = "openai" }` 走 OpenAI 网关(协议自动翻译) |
-| OpenAI 网关路由 | 任意别名可配置 `{ model = "x", upstream = "openai" }`，请求自动翻译为 OpenAI 格式走 OpenAI 网关，回复翻译回 Anthropic（含流式 SSE）；`sonnet/opus/haiku` 等字符串形式仍走 Anthropic 网关 |
+| 模型路由 | 任意别名映射到上游模型:字符串默认走 `[upstream] default_upstream` 指定的网关,表值 `{ model = "...", upstream = "openai" }` 走 OpenAI 网关(协议自动翻译) |
+| OpenAI 网关路由 | 任意别名可配置 `{ model = "x", upstream = "openai" }`，请求自动翻译为 OpenAI 格式走 OpenAI 网关，回复翻译回 Anthropic（含流式 SSE）；`sonnet/opus/haiku` 等字符串形式默认走 Anthropic 网关 |
+| 默认网关 | `[upstream] default_upstream`：`""`/`"claude"`/`"anthropic"`（默认）→ Anthropic 网关，`"openai"` → OpenAI 网关；未显式声明 `upstream` 的 routing 条目（含内置兜底目标）被回填 |
+| image 能力声明 | `supports_image = true` 表示上游模型原生支持图片输入，带图请求跳过内置 VLM 描述直接发给该模型（含 image 400 重试一并跳过）；缺省 `false` 走 VLM 描述 |
 | haiku 缺省 | 配置未声明 `haiku` 时自动沿用 `sonnet` 的目标 |
 | 图片先描述后路由 | 带图请求先经 VLM 描述，把说明文本插入原图位置，再发给文本模型 |
 | 上下文感知描述 | 描述带图消息时携带局部上下文（角色、同消息文本、工具名/入参），描述贴合对话意图 |
@@ -122,14 +126,17 @@ export ANTHROPIC_AUTH_TOKEN="<任意值，代理会替换为真实上游密钥>"
 | `proxy.vlm_max_tokens` | `8000` | 图片描述请求的最大输出 token 数 |
 | `upstream.anthropic_url` | `https://www.sophnet.com/api/open-apis/anthropic` | Anthropic 风格上游 |
 | `upstream.openai_url` | `https://www.sophnet.com/api/open-apis/openai` | OpenAI 风格上游 |
+| `upstream.default_upstream` | `""`(claude/anthropic) | 未显式声明 `upstream` 的 routing 条目的默认网关:`""`/`"claude"`/`"anthropic"` → Anthropic 网关,`"openai"` → OpenAI 网关 |
 | `keys.sophnet` | — | 上游密钥（可用 `SOPHNET_API_KEY` 覆盖） |
-| `routing.sonnet` | `DeepSeek-V4-Pro` | `sonnet` 映射目标(字符串 = Anthropic 网关,或表值选网关) |
+| `routing.sonnet` | `DeepSeek-V4-Pro` | `sonnet` 映射目标(字符串 = 默认网关,或表值选网关) |
 | `routing.opus` | `GLM-5.2` | `opus` 映射目标 |
 | `routing.haiku` | 沿用 `sonnet` | `haiku` 映射目标 |
-| `routing.<别名>` | — | 任意别名(含 sonnet/opus/haiku):字符串走 Anthropic 网关,表值 `{ model = "...", upstream = "anthropic"\|"openai" }` 显式选网关 |
+| `routing.<别名>` | — | 任意别名(含 sonnet/opus/haiku):字符串走默认网关,表值 `{ model = "...", upstream = "anthropic"\|"openai", supports_image = true\|false }` 显式选网关与 image 能力 |
 
 > **OpenAI 网关路由示例**：`flash = { model = "glm-5.3-flash", upstream = "openai" }`
 > 之后 Claude Code 以模型名 `flash` 发请求即可，代理把请求翻译为 OpenAI 格式转发到 `upstream.openai_url`，并把回复（含流式）翻译回 Anthropic 格式。请求翻译会剥离 thinking 块、把图片转 `image_url`、`tool_use/tool_result` 转 `tool_calls`/`role=tool`；响应侧 `finish_reason→stop_reason`、`usage` 映射，流式 SSE 输出标准 Anthropic 事件序列。
+>
+> **image 能力声明示例**：`vision = { model = "gpt-4o", supports_image = true }`（anthropic 网关直发图片）或 `vision = { model = "glm-5.3-flash", upstream = "openai", supports_image = true }`（openai 网关图片翻译为 `image_url`）。这类路由带图请求不再进 VLM 描述、不再做 image 400 重试。
 
 ## 测试
 
@@ -137,7 +144,7 @@ export ANTHROPIC_AUTH_TOKEN="<任意值，代理会替换为真实上游密钥>"
 go test ./...
 ```
 
-覆盖：文本/图像/`image_url` 路由、图像经 VLM 描述后插入文本并路由到文本模型、VLM 描述请求携带带图消息的上下文（角色/同消息文本）、`tool_result` 内图片带出工具名与入参、嵌套 `tool_result` 图片替换、多图逐一描述、同图不同上下文不共用缓存描述、VLM 描述失败回退到 VLM、描述缓存（同图同上下文跨请求命中、异图不混淆、超限淘汰、不可缓存 URL）、haiku 显式路由与缺省回退、非流式 JSON 原样透传、SSE 安全网补帧与去重、stripThinking 剥离时禁用 thinking 参数、损坏 thinking 块规范化（缺失的 `thinking` 字段补空串且不改动其余块）、OpenAI 网关路由（`[routing]` 表值解析、Anthropic→OpenAI 请求翻译的纯文本/图片/工具调用/thinking 剥离、OpenAI→Anthropic 非流式回复与错误透传、流式 SSE 文本与工具调用事件序列、`openai_url` 全端点去重）、环境变量覆盖配置路径与密钥。
+覆盖：文本/图像/`image_url` 路由、图像经 VLM 描述后插入文本并路由到文本模型、VLM 描述请求携带带图消息的上下文（角色/同消息文本）、`tool_result` 内图片带出工具名与入参、嵌套 `tool_result` 图片替换、多图逐一描述、同图不同上下文不共用缓存描述、VLM 描述失败回退到 VLM、描述缓存（同图同上下文跨请求命中、异图不混淆、超限淘汰、不可缓存 URL）、haiku 显式路由与缺省回退、非流式 JSON 原样透传、SSE 安全网补帧与去重、stripThinking 剥离时禁用 thinking 参数、损坏 thinking 块规范化（缺失的 `thinking` 字段补空串且不改动其余块）、OpenAI 网关路由（`[routing]` 表值解析、Anthropic→OpenAI 请求翻译的纯文本/图片/工具调用/thinking 剥离、OpenAI→Anthropic 非流式回复与错误透传、流式 SSE 文本与工具调用事件序列、`openai_url` 全端点去重）、image 能力声明（表值 `supports_image` 解析、带图请求跳过 VLM 直发目标/翻译为 `image_url`、image 400 透传不重试）、默认网关（`default_upstream = "openai"` 回填所有未显式声明 upstream 的条目且请求实际走 OpenAI 网关、显式 `upstream = "anthropic"` 不被覆盖、缺省保持 claude/anthropic 网关）、环境变量覆盖配置路径与密钥。
 
 ## 日志
 
