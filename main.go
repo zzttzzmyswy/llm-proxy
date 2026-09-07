@@ -3,13 +3,16 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -40,6 +43,18 @@ type UpstreamConfig struct {
 	// explicitly: "" or "claude"/"anthropic" → the Anthropic (claude-format)
 	// gateway, "openai" → the OpenAI gateway.
 	DefaultUpstream string `toml:"default_upstream"`
+	// HeaderTimeoutSeconds bounds how long the proxy waits per attempt for the
+	// upstream to send response headers before treating the request as timed
+	// out. Default 120.
+	HeaderTimeoutSeconds int `toml:"header_timeout_seconds"`
+	// BodyIdleSeconds bounds how long the proxy waits without receiving a single
+	// byte from an upstream response body before declaring the stream stalled and
+	// terminating it with an error. Default 90.
+	BodyIdleSeconds int `toml:"body_idle_seconds"`
+	// MaxRetries is the number of extra attempts the proxy makes after a transient
+	// upstream network error or retryable status (429/5xx) before giving up and
+	// reporting the failure to the client. Default 2.
+	MaxRetries int `toml:"max_retries"`
 }
 
 type KeysConfig struct {
@@ -112,6 +127,15 @@ func loadConfig() error {
 	}
 	if cfg.Upstream.OpenAIURL == "" {
 		cfg.Upstream.OpenAIURL = "https://www.sophnet.com/api/open-apis/openai"
+	}
+	if cfg.Upstream.HeaderTimeoutSeconds == 0 {
+		cfg.Upstream.HeaderTimeoutSeconds = 120
+	}
+	if cfg.Upstream.BodyIdleSeconds == 0 {
+		cfg.Upstream.BodyIdleSeconds = 90
+	}
+	if cfg.Upstream.MaxRetries == 0 {
+		cfg.Upstream.MaxRetries = 2
 	}
 
 	if err := buildRouteTargets(cfg.Routing); err != nil {
@@ -201,14 +225,198 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// headerTimeout returns the per-attempt response-header timeout, honoring the
+// config value when present.
+func headerTimeout() time.Duration {
+	if cfg.Upstream.HeaderTimeoutSeconds > 0 {
+		return time.Duration(cfg.Upstream.HeaderTimeoutSeconds) * time.Second
+	}
+	return 120 * time.Second
+}
+
+// bodyIdle returns the maximum silence allowed while reading an upstream
+// response body before the stream is declared stalled.
+func bodyIdle() time.Duration {
+	if cfg.Upstream.BodyIdleSeconds > 0 {
+		return time.Duration(cfg.Upstream.BodyIdleSeconds) * time.Second
+	}
+	return 90 * time.Second
+}
+
+// maxRetries returns how many extra attempts the proxy makes on transient
+// upstream failures before giving up.
+func maxRetries() int {
+	if cfg.Upstream.MaxRetries > 0 {
+		return cfg.Upstream.MaxRetries
+	}
+	return 2
+}
+
 func httpClient() *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
 			DisableCompression:    true,
-			ResponseHeaderTimeout: 180 * time.Second,
+			ResponseHeaderTimeout: headerTimeout(),
 		},
 		Timeout: 0,
 	}
+}
+
+// retryBackoffs is the sleep between retry attempts.
+var retryBackoffs = []time.Duration{500 * time.Millisecond, 1 * time.Second, 2 * time.Second}
+
+func retryBackoff(attempt int) time.Duration {
+	if attempt < len(retryBackoffs) {
+		return retryBackoffs[attempt]
+	}
+	return retryBackoffs[len(retryBackoffs)-1]
+}
+
+// isRetryableError reports whether a failed upstream request is worth a fresh
+// attempt: transient network failures (timeouts, resets, EOF) for which a
+// retry is likely to succeed. Whether the client itself gave up is judged in
+// postUpstream via ctx.Err(), not here — the upstream's own response-header
+// timeout can surface as a deadline error that is exactly what should be
+// retried.
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	for _, frag := range []string{
+		"timeout awaiting response headers",
+		"connection reset by peer",
+		"unexpected EOF",
+		"EOF",
+		"connection refused",
+		"broken pipe",
+		"TLS handshake timeout",
+		"server closed idle connection",
+	} {
+		if strings.Contains(err.Error(), frag) {
+			return true
+		}
+	}
+	return false
+}
+
+// isRetryableStatus reports whether an upstream HTTP status warrants a retry.
+// The sophnet gateway itself answers transient failures with 503
+// ("Connection error, please retry"), so 5xx (and 429) are retried.
+func isRetryableStatus(code int) bool {
+	switch code {
+	case 429, 500, 502, 503, 504:
+		return true
+	}
+	return false
+}
+
+// doPostAttempt issues a single POST, honoring the client context so a
+// disconnected client aborts the upstream call.
+func doPostAttempt(ctx context.Context, url string, body []byte, headers map[string]string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	return httpClient().Do(req)
+}
+
+// postUpstream issues an HTTP POST, retrying transient network errors and
+// retryable statuses up to maxRetries() times. The last response (even a
+// retryable status) is returned once retries are exhausted; the caller owns
+// closing its body.
+func postUpstream(ctx context.Context, url string, body []byte, headers map[string]string) (*http.Response, error) {
+	max := maxRetries()
+	for attempt := 0; ; attempt++ {
+		resp, err := doPostAttempt(ctx, url, body, headers)
+		if err == nil && !(attempt < max && isRetryableStatus(resp.StatusCode)) {
+			return resp, nil
+		}
+		if err != nil {
+			// A client that gave up (canceled or past its own deadline) is not
+			// worth retrying for: the re-sent result would have no receiver.
+			if attempt >= max || ctx.Err() != nil || !isRetryableError(err) {
+				return nil, err
+			}
+			log.Printf("[RETRY] attempt=%d err=%v\n", attempt+1, err)
+		} else {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			log.Printf("[RETRY] attempt=%d status=%d\n", attempt+1, resp.StatusCode)
+		}
+		time.Sleep(retryBackoff(attempt))
+	}
+}
+
+// errBodyIdle is returned by idleReader when no data arrived within the idle
+// window.
+var errBodyIdle = errors.New("upstream body idle timeout")
+
+// idleReader bounds the silence while reading an upstream response body. Read
+// returns errBodyIdle if no data arrives within idle. The underlying blocked
+// read is unwound when the caller closes the response body (transport abort),
+// so the per-read goroutine is short-lived.
+type idleReader struct {
+	r    io.Reader
+	idle time.Duration
+}
+
+func (t *idleReader) Read(p []byte) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, err := t.r.Read(p)
+		ch <- result{n, err}
+	}()
+	timer := time.NewTimer(t.idle)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.n, r.err
+	case <-timer.C:
+		return 0, errBodyIdle
+	}
+}
+
+// newIdleReader wraps r with an idle timeout. A zero or negative idle returns r
+// unchanged (no timeout).
+func newIdleReader(r io.Reader, idle time.Duration) io.Reader {
+	if idle <= 0 {
+		return r
+	}
+	return &idleReader{r: r, idle: idle}
+}
+
+// anthropicErrorEnvelope renders an error body in the Anthropic error shape so
+// clients parse it cleanly instead of receiving an opaque text body.
+func anthropicErrorEnvelope(errType, message string) []byte {
+	payload, err := json.Marshal(map[string]interface{}{
+		"type": "error",
+		"error": map[string]interface{}{
+			"type":    errType,
+			"message": message,
+		},
+	})
+	if err != nil {
+		return []byte(`{"type":"error","error":{"type":"api_error","message":"upstream error"}}`)
+	}
+	return payload
+}
+
+// sseErrorFrame returns a terminal Anthropic error SSE event block. Claude Code
+// treats an `error` event as the end of the stream, so a stalled stream that is
+// cut off this way surfaces as an error instead of hanging.
+func sseErrorFrame(errType, message string) string {
+	return "event: error\ndata: " + string(anthropicErrorEnvelope(errType, message)) + "\n\n"
 }
 
 func main() {
@@ -298,7 +506,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	resp, err := doUpstreamRequest(body, r)
 	if err != nil {
 		log.Printf("[RESP] error: %v\n", err)
-		http.Error(w, "upstream error", 502)
+		respondUpstreamError(w, err)
 		return
 	}
 
@@ -316,7 +524,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 			resp, err = doUpstreamRequest(body, r)
 			if err != nil {
 				log.Printf("[RESP] retry error: %v\n", err)
-				http.Error(w, "upstream error", 502)
+				respondUpstreamError(w, err)
 				return
 			}
 		} else {
@@ -336,7 +544,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		if isThinkingPassBackErr(respBody) {
 			returned, err := retryThinkingWith(req, w, r)
 			if err != nil {
-				http.Error(w, "upstream error", 502)
+				respondUpstreamError(w, err)
 				return
 			}
 			if returned != nil {
@@ -377,6 +585,11 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	// Non-streaming JSON replies must pass through untouched, or the appended SSE
 	// footer corrupts the body into invalid JSON ("API Error: Failed to parse JSON").
 	isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
+	// Body reads are bounded: an upstream that accepts a request and then goes
+	// silent would otherwise leave the client waiting forever. On a stall the
+	// stream is terminated with an SSE error event (or the connection cut for
+	// non-stream), never left hanging.
+	respBody := newIdleReader(resp.Body, bodyIdle())
 	if isSSE {
 		// Streaming response: normalize malformed thinking blocks while proxying.
 		// If the upstream emits a `content_block_start` for a thinking block without a
@@ -385,7 +598,12 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		// `.thinking.length`. Rewriting the field to an empty string keeps the block
 		// valid without altering its content.
 		var buf bytes.Buffer
-		totalBytes, _ := io.Copy(io.MultiWriter(fw, &buf), newThinkingNormalizingReader(resp.Body))
+		totalBytes, err := io.Copy(io.MultiWriter(fw, &buf), newThinkingNormalizingReader(respBody))
+		if err != nil {
+			log.Printf("[STREAM_END] error: %v\n", err)
+			fmt.Fprintf(fw, "%s", sseErrorFrame("api_error", truncate(err.Error(), 300)))
+			return
+		}
 		if !strings.Contains(buf.String(), "message_stop") {
 			log.Printf("[STREAM_END] + safety_stop bytes=%d\n", totalBytes)
 			fmt.Fprintf(fw, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
@@ -393,9 +611,23 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[STREAM_END] ok bytes=%d\n", totalBytes)
 		}
 	} else {
-		_, _ = io.Copy(fw, resp.Body)
+		if _, err := io.Copy(fw, respBody); err != nil {
+			// Headers already committed; aborting the connection is the only option,
+			// which still unblocks the client instead of leaving it hanging.
+			log.Printf("[STREAM_END] error: %v\n", err)
+			return
+		}
 		log.Printf("[STREAM_END] ok bytes=non-stream\n")
 	}
+}
+
+// respondUpstreamError writes a 502 derived from an upstream failure in the
+// Anthropic error shape, so clients surface a parseable error instead of an
+// opaque text body.
+func respondUpstreamError(w http.ResponseWriter, err error) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(502)
+	w.Write(anthropicErrorEnvelope("api_error", truncate(err.Error(), 300)))
 }
 
 // isThinkingPassBackErr reports whether a 400 response body is the upstream's
@@ -647,21 +879,19 @@ func normalizeThinkingBlock(raw json.RawMessage) ([]byte, bool) {
 }
 
 // doUpstreamRequest forwards the (already model-routed) body to the Anthropic
-// upstream and returns the response. Reused for the initial attempt and the VLM
-// image-fallback retry.
+// upstream and returns the response, retrying transient failures. Reused for
+// the initial attempt and the VLM image-fallback retry.
 func doUpstreamRequest(body []byte, r *http.Request) (*http.Response, error) {
-	proxyReq, err := http.NewRequest("POST", cfg.Upstream.AnthropicURL+"/v1/messages", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
+	headers := map[string]string{
+		"Content-Type":      "application/json",
+		"x-api-key":         apiKey(),
+		"anthropic-version": "2023-06-01",
+		"Accept":            "application/json",
 	}
-	proxyReq.Header.Set("Content-Type", "application/json")
-	proxyReq.Header.Set("x-api-key", apiKey())
-	proxyReq.Header.Set("anthropic-version", "2023-06-01")
-	proxyReq.Header.Set("Accept", "application/json")
 	if beta := r.Header.Get("anthropic-beta"); beta != "" {
-		proxyReq.Header.Set("anthropic-beta", beta)
+		headers["anthropic-beta"] = beta
 	}
-	return httpClient().Do(proxyReq)
+	return postUpstream(r.Context(), cfg.Upstream.AnthropicURL+"/v1/messages", body, headers)
 }
 
 // containsImage reports whether any message in the request carries an image block
@@ -1740,7 +1970,9 @@ type anthroTool struct {
 // translateOpenAIStream consumes an OpenAI streaming SSE response and writes the
 // equivalent Anthropic event stream (message_start / content_block_* /
 // message_delta / message_stop) so Claude Code can consume it unchanged.
-func translateOpenAIStream(stream io.Reader, w io.Writer, model string) {
+// A non-nil return value means the upstream stream was cut abnormally (read
+// error / idle timeout); an Anthropic `error` event has already been emitted.
+func translateOpenAIStream(stream io.Reader, w io.Writer, model string) error {
 	c := &anthroSSE{w: w, model: model, tools: map[int]*anthroTool{}}
 	c.start()
 
@@ -1760,9 +1992,22 @@ func translateOpenAIStream(stream io.Reader, w io.Writer, model string) {
 		}
 		c.handleChunk([]byte(d))
 	}
+	if sc.Err() != nil {
+		// The upstream connection died or went silent mid-stream. Emit a terminal
+		// error event so the client fails fast instead of waiting forever for the
+		// missing message_stop.
+		if !c.finished {
+			c.emit("error", map[string]interface{}{
+				"type":  "error",
+				"error": map[string]interface{}{"type": "api_error", "message": truncate(sc.Err().Error(), 300)},
+			})
+		}
+		return sc.Err()
+	}
 	if !c.finished {
 		c.finish("")
 	}
+	return nil
 }
 
 func (c *anthroSSE) start() {
@@ -1985,21 +2230,18 @@ func handleOpenAIRequest(w http.ResponseWriter, r *http.Request, req map[string]
 	model, _ := req["model"].(string)
 	log.Printf("[%s] %s -> %s (openai) len=%d stream=%v\n", time.Now().Format("15:04:05"), model, openAIModel, len(body), stream)
 
-	proxyReq, err := http.NewRequest("POST", openAICompletionsURL(), bytes.NewReader(body))
-	if err != nil {
-		http.Error(w, "upstream error", 502)
-		return
+	headers := map[string]string{
+		"Content-Type":  "application/json",
+		"Authorization": "Bearer " + apiKey(),
+		"Accept":        "application/json",
 	}
-	proxyReq.Header.Set("Content-Type", "application/json")
-	proxyReq.Header.Set("Authorization", "Bearer "+apiKey())
-	proxyReq.Header.Set("Accept", "application/json")
 	if stream {
-		proxyReq.Header.Set("Accept", "text/event-stream")
+		headers["Accept"] = "text/event-stream"
 	}
-	resp, err := httpClient().Do(proxyReq)
+	resp, err := postUpstream(r.Context(), openAICompletionsURL(), body, headers)
 	if err != nil {
 		log.Printf("[RESP] openai error: %v\n", err)
-		http.Error(w, "upstream error", 502)
+		respondUpstreamError(w, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -2020,14 +2262,21 @@ func handleOpenAIRequest(w http.ResponseWriter, r *http.Request, req map[string]
 		w.WriteHeader(200)
 		flusher, _ := w.(http.Flusher)
 		fw := &flushWriter{w: w, f: flusher}
-		translateOpenAIStream(resp.Body, fw, openAIModel)
-		log.Printf("[STREAM_END] openai stream ok\n")
+		// The upstream body is bounded by bodyIdle: a stream that stops emitting
+		// (stalled model, dead connection) is cut with an Anthropic error event
+		// instead of leaving the client hanging.
+		if err := translateOpenAIStream(newIdleReader(resp.Body, bodyIdle()), fw, openAIModel); err != nil {
+			log.Printf("[STREAM_END] openai stream error: %v\n", err)
+		} else {
+			log.Printf("[STREAM_END] openai stream ok\n")
+		}
 		return
 	}
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(newIdleReader(resp.Body, bodyIdle()))
 	if err != nil {
-		http.Error(w, "upstream error", 502)
+		log.Printf("[RESP] openai read error: %v\n", err)
+		respondUpstreamError(w, err)
 		return
 	}
 	if len(bytes.TrimSpace(respBody)) == 0 {
@@ -2042,7 +2291,7 @@ func handleOpenAIRequest(w http.ResponseWriter, r *http.Request, req map[string]
 	translated, terr := openAIResponseToAnthropic(respBody)
 	if terr != nil {
 		log.Printf("[RESP] openai translate error: %v\n", terr)
-		http.Error(w, "upstream error", 502)
+		respondUpstreamError(w, terr)
 		return
 	}
 	log.Printf("[RESP] openai status=%d\n", resp.StatusCode)
@@ -2059,7 +2308,8 @@ func handleOpenAIRequest(w http.ResponseWriter, r *http.Request, req map[string]
 	// the SSE events Claude Code expects.
 	sse, sseErr := anthropicMessageToSSE(translated, openAIModel)
 	if sseErr != nil {
-		http.Error(w, "upstream error", 502)
+		log.Printf("[RESP] openai sse translate error: %v\n", sseErr)
+		respondUpstreamError(w, sseErr)
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -2148,13 +2398,15 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	proxyReq, _ := http.NewRequest("POST", cfg.Upstream.OpenAIURL+"/v1/chat/completions", bytes.NewReader(body))
-	proxyReq.Header.Set("Content-Type", "application/json")
-	proxyReq.Header.Set("Authorization", "Bearer "+apiKey())
-
-	resp, err := httpClient().Do(proxyReq)
+	resp, err := postUpstream(r.Context(), cfg.Upstream.OpenAIURL+"/v1/chat/completions", body, map[string]string{
+		"Content-Type":  "application/json",
+		"Authorization": "Bearer " + apiKey(),
+	})
 	if err != nil {
-		http.Error(w, "upstream error", 502)
+		log.Printf("[RESP] chat error: %v\n", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(502)
+		w.Write([]byte(`{"error":{"message":"upstream error","type":"api_error"}}`))
 		return
 	}
 	defer resp.Body.Close()
@@ -2165,5 +2417,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	if _, err := io.Copy(w, newIdleReader(resp.Body, bodyIdle())); err != nil {
+		// Headers already committed; cut the connection so the client unblocks.
+		log.Printf("[RESP] chat body error: %v\n", err)
+	}
 }
