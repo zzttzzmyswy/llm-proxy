@@ -47,7 +47,10 @@ Claude Code 默认只认 Anthropic 官方模型名（`sonnet` / `opus` / `haiku`
 | message_stop 安全网 | 仅对 SSE 流补发缺失的 `message_stop`，防 Claude Code 卡死 |
 | 空响应检测 | 上游 0 字节响应 → 发 `error` SSE 事件，触发 Claude Code 重试 |
 | 压缩禁用 | `DisableCompression: true`，避免 gzip 破坏 SSE 缓冲 |
-| 超时保护 | `ResponseHeaderTimeout: 180s`，上游不响应头时快速失败 |
+| 超时保护 | `header_timeout_seconds: 120s`，上游不响应头时按瞬态错误**自动重试**（`max_retries` 次）后向下游报错 |
+| 流停滞保护 | `body_idle_seconds: 90s`，流式上游中途静默（模型挂起/连接假死）时向客户端发 SSE `error` 事件终止，杜绝 Claude Code 永久等待 |
+| 瞬态重试 | 上游网络错误（超时/连接重置/EOF）或 429/5xx 自动重试（默认 2 次，退避 0.5s/1s/2s），重试耗尽可能的 5xx 原样返回 |
+| 错误帧格式 | 上游失败时非流返回 Anthropic error JSON envelope、流式返回 SSE `error` 事件，客户端可解析而不会悬置 |
 | 密钥安全 | 支持 `SOPHNET_API_KEY` 环境变量，无需明文落盘 |
 
 ## 架构
@@ -127,6 +130,9 @@ export ANTHROPIC_AUTH_TOKEN="<任意值，代理会替换为真实上游密钥>"
 | `upstream.anthropic_url` | `https://www.sophnet.com/api/open-apis/anthropic` | Anthropic 风格上游 |
 | `upstream.openai_url` | `https://www.sophnet.com/api/open-apis/openai` | OpenAI 风格上游 |
 | `upstream.default_upstream` | `""`(claude/anthropic) | 未显式声明 `upstream` 的 routing 条目的默认网关:`""`/`"claude"`/`"anthropic"` → Anthropic 网关,`"openai"` → OpenAI 网关 |
+| `upstream.header_timeout_seconds` | `120` | 每次尝试等待上游响应头的最长时间(秒)。超时按瞬态错误自动重试,重试耗尽后向客户端报 502(不会无限等) |
+| `upstream.body_idle_seconds` | `90` | 读取上游响应体允许的最长静默时间(秒)。流式上游中途停住时向客户端发 SSE `error` 事件终止,避免 Claude Code 永久等待 |
+| `upstream.max_retries` | `2` | 瞬态网络错误(超时/连接重置/EOF)或 429/5xx 时的额外重试次数(总尝试 = `max_retries` + 1,退避 0.5s/1s/2s) |
 | `keys.sophnet` | — | 上游密钥（可用 `SOPHNET_API_KEY` 覆盖） |
 | `routing.sonnet` | `DeepSeek-V4-Pro` | `sonnet` 映射目标(字符串 = 默认网关,或表值选网关) |
 | `routing.opus` | `GLM-5.2` | `opus` 映射目标 |
@@ -144,7 +150,7 @@ export ANTHROPIC_AUTH_TOKEN="<任意值，代理会替换为真实上游密钥>"
 go test ./...
 ```
 
-覆盖：文本/图像/`image_url` 路由、图像经 VLM 描述后插入文本并路由到文本模型、VLM 描述请求携带带图消息的上下文（角色/同消息文本）、`tool_result` 内图片带出工具名与入参、嵌套 `tool_result` 图片替换、多图逐一描述、同图不同上下文不共用缓存描述、VLM 描述失败回退到 VLM、描述缓存（同图同上下文跨请求命中、异图不混淆、超限淘汰、不可缓存 URL）、haiku 显式路由与缺省回退、非流式 JSON 原样透传、SSE 安全网补帧与去重、stripThinking 剥离时禁用 thinking 参数、损坏 thinking 块规范化（缺失的 `thinking` 字段补空串且不改动其余块）、OpenAI 网关路由（`[routing]` 表值解析、Anthropic→OpenAI 请求翻译的纯文本/图片/工具调用/thinking 剥离、OpenAI→Anthropic 非流式回复与错误透传、流式 SSE 文本与工具调用事件序列、`openai_url` 全端点去重）、image 能力声明（表值 `supports_image` 解析、带图请求跳过 VLM 直发目标/翻译为 `image_url`、image 400 透传不重试）、默认网关（`default_upstream = "openai"` 回填所有未显式声明 upstream 的条目且请求实际走 OpenAI 网关、显式 `upstream = "anthropic"` 不被覆盖、缺省保持 claude/anthropic 网关）、环境变量覆盖配置路径与密钥。
+覆盖：文本/图像/`image_url` 路由、图像经 VLM 描述后插入文本并路由到文本模型、VLM 描述请求携带带图消息的上下文（角色/同消息文本）、`tool_result` 内图片带出工具名与入参、嵌套 `tool_result` 图片替换、多图逐一描述、同图不同上下文不共用缓存描述、VLM 描述失败回退到 VLM、描述缓存（同图同上下文跨请求命中、异图不混淆、超限淘汰、不可缓存 URL）、haiku 显式路由与缺省回退、非流式 JSON 原样透传、SSE 安全网补帧与去重、stripThinking 剥离时禁用 thinking 参数、损坏 thinking 块规范化（缺失的 `thinking` 字段补空串且不改动其余块）、OpenAI 网关路由（`[routing]` 表值解析、Anthropic→OpenAI 请求翻译的纯文本/图片/工具调用/thinking 剥离、OpenAI→Anthropic 非流式回复与错误透传、流式 SSE 文本与工具调用事件序列、`openai_url` 全端点去重）、image 能力声明（表值 `supports_image` 解析、带图请求跳过 VLM 直发目标/翻译为 `image_url`、image 400 透传不重试）、默认网关（`default_upstream = "openai"` 回填所有未显式声明 upstream 的条目且请求实际走 OpenAI 网关、显式 `upstream = "anthropic"` 不被覆盖、缺省保持 claude/anthropic 网关）、超时与重试（上游 header 超时自动重试成功后客户端拿到正常回复、重试耗尽返回 502 + Anthropic error JSON envelope、流式上游中途停滞发 SSE `error` 事件终止、`/v1/chat/completions` 透传对 503 重试、超时配置默认值、`isRetryableError`/`isRetryableStatus` 分类）、环境变量覆盖配置路径与密钥。
 
 ## 日志
 

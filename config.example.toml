@@ -14,6 +14,17 @@ vlm_max_tokens = 8000
 [upstream]
 anthropic_url = "https://www.sophnet.com/api/open-apis/anthropic"
 openai_url = "https://www.sophnet.com/api/open-apis/openai"
+# 上游请求超时与重试（以下均有安全默认值，可省略）：
+#   header_timeout_seconds：每次尝试等待上游响应头（首包）的最长时间，超时按瞬态
+#     错误自动重试，重试耗尽后向下游报错而不是卡住。默认 120。
+#   body_idle_seconds：读取上游响应体时允许的最长静默时间。流式场景下上游若中途
+#     停住（模型挂起/连接假死），超过该值会向客户端发 SSE error 事件终止，而不是
+#     让 Claude Code 永久等待。默认 90。
+#   max_retries：遇到瞬态网络错误（超时/连接重置/EOF）或 429/5xx 状态码时的额外
+#     重试次数（总尝试 = max_retries + 1）。默认 2。
+# header_timeout_seconds = 120
+# body_idle_seconds = 90
+# max_retries = 2
 # 默认网关：routing 条目没有显式声明 upstream 时走哪个。
 #   "" / "claude" / "anthropic" → Anthropic（claude 格式）网关（默认）
 #   "openai"                     → OpenAI 网关（请求翻译为 OpenAI 协议转发）
