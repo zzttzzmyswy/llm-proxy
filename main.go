@@ -495,11 +495,11 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Thinking is passed through transparently: the client's `thinking` param and
-	// thinking blocks in history stay verbatim on the first attempt, preserving the
-	// upstream's chain-of-thought context as the DeepSeek docs advise. Only when the
-	// upstream rejects the request with 400 "content[].thinking must be passed back"
-	// do we fall back stepwise (strip thinking blocks, then disable thinking), see
-	// the retry chain below.
+	// thinking blocks in history stay verbatim, preserving the upstream's
+	// chain-of-thought context. The one exception is the pass-back contract below.
+	if ensureThinkingPassBack(req) {
+		body, _ = json.Marshal(req)
+	}
 
 	log.Printf("[%s] %s -> %s len=%d\n", time.Now().Format("15:04:05"), model, newModel, len(body))
 
@@ -532,30 +532,10 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Stepwise fallback for the thinking pass-back 400. The first attempt forwards
-	// verbatim (thinking blocks + param untouched, preserving CoT context). On 400
-	// "must be passed back", retry once with thinking blocks stripped (param kept);
-	// if that still 400s and a `thinking` param is present, retry once more with it
-	// removed. Each step only fires if it would change the request, so a request
-	// with nothing left to strip/disable passes through untouched and never loops.
-	if resp.StatusCode == 400 {
-		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if isThinkingPassBackErr(respBody) {
-			returned, err := retryThinkingWith(req, w, r)
-			if err != nil {
-				respondUpstreamError(w, err)
-				return
-			}
-			if returned != nil {
-				resp = returned
-			} else {
-				resp.Body = io.NopCloser(bytes.NewReader(respBody))
-			}
-		} else {
-			resp.Body = io.NopCloser(bytes.NewReader(respBody))
-		}
-	}
+	// A thinking pass-back 400 that the pre-flight patch could not prevent is passed
+	// through to the client unchanged. Retrying cannot help: the upstream's thinking
+	// mode is a property of the model, not of the client's `thinking` param, so
+	// stripping blocks or dropping the param leaves the rejection in place.
 	defer resp.Body.Close()
 
 	log.Printf("[RESP] status=%d\n", resp.StatusCode)
@@ -630,56 +610,72 @@ func respondUpstreamError(w http.ResponseWriter, err error) {
 	w.Write(anthropicErrorEnvelope("api_error", truncate(err.Error(), 300)))
 }
 
-// isThinkingPassBackErr reports whether a 400 response body is the upstream's
-// "content[].thinking must be passed back" rejection.
-func isThinkingPassBackErr(body []byte) bool {
-	return strings.Contains(string(body), "must be passed back")
+// ensureThinkingPassBack makes the request satisfy the upstream's pass-back
+// contract on the Anthropic gateway. The upstream runs thinking mode at the model
+// level — the client's `thinking` param does not switch it off — and rejects a
+// history whose assistant tool_use turns carry no thinking block:
+//
+//	The `content[].thinking` in the thinking mode must be passed back to the API.
+//
+// Claude Code holds no thinking block for a turn the upstream answered without
+// one, so it has none to replay. The upstream emits such turns itself — calling it
+// directly, a tool-forcing request whose reply is a tool_use block came back
+// without a thinking block 2 times in 6 — so a correct client cannot satisfy the
+// contract by passing back what it received. Injecting the empty placeholder the
+// upstream accepts replaces the rejection with a normal reply.
+//
+// Measured against the live gateway, replayed verbatim, a history whose assistant
+// turns all lack a thinking block is rejected 25-30% of the time, while one
+// carrying a thinking block on ANY turn passes every time — which turn holds it
+// does not matter. Every bare tool_use turn is patched rather than only the last
+// one because that satisfies the contract under either reading of the upstream's
+// check (anywhere in the history, or per turn) at no observed cost. Reports
+// whether the request was modified.
+func ensureThinkingPassBack(req map[string]interface{}) bool {
+	msgs, ok := req["messages"].([]interface{})
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, raw := range msgs {
+		msg, ok := raw.(map[string]interface{})
+		if !ok || msg["role"] != "assistant" {
+			continue
+		}
+		content, ok := msg["content"].([]interface{})
+		if !ok || hasContentBlockOfType(content, "thinking") || !hasContentBlockOfType(content, "tool_use") {
+			continue
+		}
+		msg["content"] = append([]interface{}{map[string]interface{}{
+			"type":      "thinking",
+			"thinking":  "",
+			"signature": "",
+		}}, content...)
+		changed = true
+	}
+	return changed
 }
 
-// retryThinkingWith runs the stepwise fallback for a thinking pass-back 400. The
-// first retry strips thinking blocks from the history (the `thinking` param kept);
-// if the upstream rejects that too with the same error and a `thinking` param is
-// present, a second retry also removes the param. Each step only fires when it
-// would change the request, so a request with nothing left to strip/disable
-// returns the original 400 untouched and cannot loop. Returns the final response.
-func retryThinkingWith(req map[string]interface{}, w http.ResponseWriter, r *http.Request) (*http.Response, error) {
-	try := func(name string) (*http.Response, error) {
-		log.Printf("[RETRY] thinking 400 -> %s\n", name)
-		body, _ := json.Marshal(req)
-		return doUpstreamRequest(body, r)
+// lastAssistantIndex returns the index of the last assistant message in an
+// Anthropic (or OpenAI) message list, or -1 when there is none.
+func lastAssistantIndex(msgs []interface{}) int {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if m, ok := msgs[i].(map[string]interface{}); ok && m["role"] == "assistant" {
+			return i
+		}
 	}
+	return -1
+}
 
-	// Level 1: strip thinking blocks, keep the `thinking` param.
-	if !stripThinkingBlocks(req) {
-		// Nothing to strip, nothing further we can change; the 400 passes through.
-		log.Printf("[RETRY] thinking 400 -> nothing to strip, passing through\n")
-		return nil, nil
+// hasContentBlockOfType reports whether an Anthropic content block array holds a
+// block of the given type.
+func hasContentBlockOfType(content []interface{}, want string) bool {
+	for _, raw := range content {
+		if b, ok := raw.(map[string]interface{}); ok && b["type"] == want {
+			return true
+		}
 	}
-	resp, err := try("strip thinking blocks")
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != 400 {
-		return resp, nil
-	}
-	respBody, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if !isThinkingPassBackErr(respBody) {
-		resp.Body = io.NopCloser(bytes.NewReader(respBody))
-		return resp, nil
-	}
-
-	// Level 2: also remove the `thinking` param.
-	if _, has := req["thinking"]; !has {
-		resp.Body = io.NopCloser(bytes.NewReader(respBody))
-		return resp, nil
-	}
-	delete(req, "thinking")
-	resp, err = try("disable thinking param")
-	if err != nil {
-		return nil, err
-	}
-	return resp, nil
+	return false
 }
 
 // routeTarget resolves the routing target for a client model name. Exact names
@@ -708,62 +704,6 @@ func routeModelName(alias string) string {
 		return e.Model
 	}
 	return ""
-}
-
-// stripThinkingBlocks removes every `type:thinking` content block from the
-// request's message history, recursing into nested content (tool_result etc.).
-// It reports whether anything was removed. The `thinking` parameter of the request
-// is left untouched so the upstream still produces thinking in its reply.
-func stripThinkingBlocks(req map[string]interface{}) bool {
-	messages, ok := req["messages"].([]interface{})
-	if !ok {
-		return false
-	}
-	changed := false
-	for _, m := range messages {
-		msg, ok := m.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		nc, ch := stripThinkingFromContent(msg["content"])
-		if ch {
-			msg["content"] = nc
-			changed = true
-		}
-	}
-	return changed
-}
-
-// stripThinkingFromContent returns the content value with every thinking block
-// removed (recursing into nested content arrays) and whether anything changed.
-// A fresh slice is built and returned rather than mutating in place — a
-// re-sliced `c[:0]` would only shorten the copy's header, leaving the caller's
-// slice at its original length with a clobbered first element.
-func stripThinkingFromContent(v interface{}) (interface{}, bool) {
-	switch c := v.(type) {
-	case []interface{}:
-		changed := false
-		kept := make([]interface{}, 0, len(c))
-		for _, item := range c {
-			b, isMap := item.(map[string]interface{})
-			if isMap && b["type"] == "thinking" {
-				changed = true
-				continue
-			}
-			if isMap {
-				nc, ch := stripThinkingFromContent(b["content"])
-				if ch {
-					b["content"] = nc
-					changed = true
-				}
-			}
-			kept = append(kept, item)
-		}
-		return kept, changed
-	case map[string]interface{}:
-		return stripThinkingFromContent(c["content"])
-	}
-	return v, false
 }
 
 // newThinkingNormalizingReader wraps an SSE stream and rewrites malformed thinking
@@ -1478,6 +1418,7 @@ func anthropicToOpenAIRequest(req map[string]interface{}, openAIModel string) ma
 			messages = append(messages, convertAnthropicMessage(m)...)
 		}
 	}
+	ensureReasoningPassBack(messages)
 	out["messages"] = messages
 
 	for _, k := range []string{"max_tokens", "temperature", "top_p", "stream", "user", "metadata"} {
@@ -1497,6 +1438,33 @@ func anthropicToOpenAIRequest(req map[string]interface{}, openAIModel string) ma
 		}
 	}
 	return out
+}
+
+// ensureReasoningPassBack mirrors ensureThinkingPassBack on the OpenAI gateway,
+// where the field is named reasoning_content:
+//
+//	The `reasoning_content` in the thinking mode must be passed back to the API.
+//
+// The upstream inspects only the last assistant message and rejects it when it
+// carries tool_calls without reasoning_content. The Anthropic history being
+// translated holds no OpenAI reasoning to replay (thinking blocks are not portable
+// to this gateway, and the gateway's own streamed reasoning is not translated back
+// into a thinking block), so the empty placeholder the upstream accepts is
+// supplied here. Reports whether the request was modified.
+func ensureReasoningPassBack(messages []interface{}) bool {
+	idx := lastAssistantIndex(messages)
+	if idx < 0 {
+		return false
+	}
+	msg := messages[idx].(map[string]interface{})
+	if _, has := msg["tool_calls"]; !has {
+		return false
+	}
+	if _, has := msg["reasoning_content"]; has {
+		return false
+	}
+	msg["reasoning_content"] = ""
+	return true
 }
 
 // anthropicTextFromBlocks concatenates the text of an Anthropic content block
