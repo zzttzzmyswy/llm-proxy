@@ -7,6 +7,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -25,20 +26,47 @@ const (
 	unknownModelKey = "(unknown)"
 	// recentErrorLimit is how many failure details are kept per model.
 	recentErrorLimit = 50
+	// maxTrackedAliases bounds the per-model alias map. On the passthrough
+	// endpoint the alias is the client-supplied model name, so without a cap the
+	// (other) bucket would still retain one entry per distinct name.
+	maxTrackedAliases = 64
+	// maxLabelLen bounds a retained model or alias name, which is also
+	// client-supplied on the passthrough endpoint.
+	maxLabelLen = 128
 )
+
+// truncateLabel bounds a client-supplied model or alias name, trimming to a rune
+// boundary so the retained label stays valid UTF-8.
+func truncateLabel(s string) string {
+	if len(s) <= maxLabelLen {
+		return s
+	}
+	cut := maxLabelLen
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
 
 // Failure categories surfaced by the admin page.
 const (
-	catUpstream5xx       = "upstream_5xx"
-	catRateLimited       = "rate_limited"
-	catUpstream4xx       = "upstream_4xx"
-	catNetworkTimeout    = "network_timeout"
-	catNetworkError      = "network_error"
-	catEmptyResponse     = "empty_response"
-	catStreamStalled     = "stream_stalled"
-	catTranslateError    = "translate_error"
-	catVLMDescribeFailed = "vlm_describe_failed"
+	catUpstream5xx    = "upstream_5xx"
+	catRateLimited    = "rate_limited"
+	catUpstream4xx    = "upstream_4xx"
+	catNetworkTimeout = "network_timeout"
+	catNetworkError   = "network_error"
+	catEmptyResponse  = "empty_response"
+	catStreamStalled  = "stream_stalled"
+	catTranslateError = "translate_error"
+	// catUpstreamStreamError covers a failure a gateway reports as an event
+	// inside an otherwise successful (HTTP 200) stream.
+	catUpstreamStreamError = "upstream_stream_error"
+	catVLMDescribeFailed   = "vlm_describe_failed"
 )
+
+// errUpstreamStream marks a failure delivered as a stream event rather than as
+// an HTTP status, so it can be classified like any other upstream error.
+var errUpstreamStream = errors.New("upstream reported an error in the stream")
 
 // classifyStatus maps an upstream HTTP status onto a failure category. It returns
 // "" for a status the proxy passes through as a success.
@@ -61,6 +89,9 @@ func classifyError(err error) string {
 	}
 	if errors.Is(err, errBodyIdle) {
 		return catStreamStalled
+	}
+	if errors.Is(err, errUpstreamStream) {
+		return catUpstreamStreamError
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
@@ -217,9 +248,7 @@ func (c *statsCollector) record(r *reqStat, u tokenUsage, category string, statu
 	if m.upstream == "" {
 		m.upstream = r.upstream
 	}
-	if r.alias != "" {
-		m.aliases[r.alias]++
-	}
+	m.countAliasLocked(r.alias)
 
 	failed := category != ""
 	m.requests++
@@ -268,6 +297,7 @@ func (c *statsCollector) modelEntryLocked(model string) *modelStats {
 	if model == "" {
 		model = unknownModelKey
 	}
+	model = truncateLabel(model)
 	if m, ok := c.models[model]; ok {
 		return m
 	}
@@ -280,6 +310,20 @@ func (c *statsCollector) modelEntryLocked(model string) *modelStats {
 	m := &modelStats{model: model, aliases: map[string]int64{}, errors: map[string]int64{}}
 	c.models[model] = m
 	return m
+}
+
+// countAliasLocked records which client-facing name reached this model, keeping
+// the alias map bounded: once it is full, further distinct names fold into a
+// single bucket rather than growing the map per request.
+func (m *modelStats) countAliasLocked(alias string) {
+	if alias == "" {
+		return
+	}
+	alias = truncateLabel(alias)
+	if _, seen := m.aliases[alias]; !seen && len(m.aliases) >= maxTrackedAliases {
+		alias = otherModelKey
+	}
+	m.aliases[alias]++
 }
 
 // reset clears all counters and restarts the uptime clock.

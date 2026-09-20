@@ -75,6 +75,7 @@
   .chk label { margin: 0; color: var(--text); }
   .banner { padding: 10px 14px; border-radius: 6px; margin-bottom: 12px; font-size: 13px; display: none; white-space: pre-wrap; }
   .banner.show { display: block; }
+  .banner .close { float: right; border: none; background: none; cursor: pointer; font-size: 15px; line-height: 1; padding: 0 0 0 10px; color: inherit; }
   .banner.err { background: #fef2f2; border: 1px solid #fecaca; color: var(--bad); }
   .banner.ok { background: #f0fdf4; border: 1px solid #bbf7d0; color: var(--ok); }
   .banner.warnbox { background: #fffbeb; border: 1px solid #fde68a; color: var(--warn); }
@@ -102,7 +103,6 @@
     <h2>总览</h2>
     <div class="cards" id="totals"></div>
   </section>
-
   <section>
     <h2>模型调用情况</h2>
     <div class="panel scroll" id="models"></div>
@@ -115,6 +115,7 @@
 
   <section>
     <h2>配置</h2>
+    <div id="save-banner" class="banner"></div>
     <div class="panel">
       <div class="form-body">
         <div class="grid">
@@ -168,6 +169,11 @@
         <div class="form-body" style="border-top:1px solid var(--border)">
           <button id="btn-add-route">添加路由</button>
         </div>
+        <div class="form-body" style="border-top:1px solid var(--border)">
+          <label style="margin-bottom:6px">生效路由（只读）</label>
+          <div class="hint" style="margin:0 0 8px">经过默认网关与内置兜底之后，每个别名实际走哪个模型。这里的内容不会被保存。</div>
+          <div id="effective-routes"></div>
+        </div>
       </div>
       <div class="form-actions">
         <button class="primary" id="btn-save">保存配置</button>
@@ -210,13 +216,25 @@
     return sec + " 秒";
   }
 
-  function banner(kind, text) {
-    var el = document.getElementById("banner");
+  // Stats errors and config-save results get separate regions: a save warning
+  // (port change needs a restart, unknown keys dropped) must survive the stats
+  // refresh that follows the save, and the periodic refresh after that.
+  function banner(id, kind, text, dismissible) {
+    var el = document.getElementById(id);
     el.className = "banner show " + kind;
     el.textContent = text;
+    if (dismissible) {
+      var btn = document.createElement("button");
+      btn.className = "close";
+      btn.type = "button";
+      btn.title = "关闭";
+      btn.textContent = "×";
+      btn.addEventListener("click", function () { hideBanner(id); });
+      el.insertBefore(btn, el.firstChild);
+    }
   }
-  function hideBanner() {
-    document.getElementById("banner").className = "banner";
+  function hideBanner(id) {
+    document.getElementById(id).className = "banner";
   }
 
   async function api(path, opts) {
@@ -342,7 +360,7 @@
   async function refresh() {
     try {
       var stats = await api("/admin/api/stats");
-      hideBanner();
+      hideBanner("banner");
       renderTotals(stats);
       renderModels(stats);
       renderFailures(stats);
@@ -350,7 +368,7 @@
         "版本 " + stats.version + " · 运行 " + uptime(stats.uptime_seconds) +
         " · 更新于 " + new Date(stats.generated_at).toLocaleTimeString("zh-CN");
     } catch (err) {
-      banner("err", "读取统计失败：" + err.message);
+      banner("banner", "err", "读取统计失败：" + err.message);
     }
   }
 
@@ -412,6 +430,17 @@
     var host = document.getElementById("routes");
     host.innerHTML = "";
     (cfg.routing || []).forEach(function (e) { host.appendChild(routeRow(e)); });
+
+    var eff = cfg.effective_routing || {};
+    var names = Object.keys(eff).sort();
+    document.getElementById("effective-routes").innerHTML = names.length
+      ? names.map(function (alias) {
+          var e = eff[alias];
+          return '<span class="tag" title="' + (e.declared ? "文件中已声明" : "未声明，使用内置兜底") + '">' +
+                 esc(alias) + " → " + esc(e.model) + "（" + esc(e.upstream || "anthropic") + "）" +
+                 (e.declared ? "" : " · 兜底") + "</span>";
+        }).join(" ")
+      : '<span class="muted">—</span>';
   }
 
   function collectPayload() {
@@ -470,7 +499,7 @@
     try {
       renderConfig(await api("/admin/api/config"));
     } catch (err) {
-      banner("err", "读取配置失败：" + err.message);
+      banner("save-banner", "err", "读取配置失败：" + err.message, true);
     }
   }
 
@@ -490,18 +519,18 @@
         // The old password no longer authenticates, so stop polling and reload
         // to let the browser prompt for the new one.
         setAuto(false);
-        banner("warnbox", "配置已保存。" + (warns.length ? "\n· " + warns.join("\n· ") : "") +
-          "\n管理口令已更新，页面即将刷新，请用新口令登录。");
+        banner("save-banner", "warnbox", "配置已保存。" + (warns.length ? "\n· " + warns.join("\n· ") : "") +
+          "\n管理口令已更新，页面即将刷新，请用新口令登录。", true);
         setTimeout(function () { location.reload(); }, 2500);
       } else if (warns.length) {
-        banner("warnbox", "已保存并生效。\n· " + warns.join("\n· "));
+        banner("save-banner", "warnbox", "已保存并生效。\n· " + warns.join("\n· "), true);
       } else {
-        banner("ok", "已保存并生效。");
+        banner("save-banner", "ok", "已保存并生效。", true);
       }
       document.getElementById("save-hint").textContent = "已保存 " + new Date().toLocaleTimeString("zh-CN");
       if (!res.reauth_required) refresh();
     } catch (err) {
-      banner("err", "保存失败（配置未改动）：" + err.message);
+      banner("save-banner", "err", "保存失败（配置未改动）：" + err.message, true);
       document.getElementById("save-hint").textContent = "";
     } finally {
       btn.disabled = false;
@@ -514,10 +543,10 @@
     if (!confirm("清零所有调用统计？此操作不可撤销。")) return;
     try {
       await api("/admin/api/stats/reset", { method: "POST" });
-      banner("ok", "统计已清零。");
+      banner("banner", "ok", "统计已清零。");
       refresh();
     } catch (err) {
-      banner("err", "清零失败：" + err.message);
+      banner("banner", "err", "清零失败：" + err.message);
     }
   });
   document.getElementById("btn-add-route").addEventListener("click", function () {
@@ -525,7 +554,7 @@
   });
   document.getElementById("btn-save").addEventListener("click", saveConfig);
   document.getElementById("btn-reload").addEventListener("click", function () {
-    hideBanner();
+    hideBanner("save-banner");
     document.getElementById("save-hint").textContent = "";
     loadConfig();
   });

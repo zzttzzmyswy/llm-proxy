@@ -46,6 +46,100 @@ func newBodyCapture(isSSE bool) bodyCapture {
 	return newLimitedBuffer(maxNonStreamBuffer)
 }
 
+// maxSSELineBytes bounds the partial line the error watcher holds. A line longer
+// than this is dropped rather than buffered.
+const maxSSELineBytes = 64 << 10
+
+// sseDataError reports the error carried by one SSE `data:` payload, if any.
+// Anthropic wraps it in a `type: "error"` event; OpenAI puts a bare `error`
+// object in the chunk.
+func sseDataError(payload []byte) (string, bool) {
+	var ev struct {
+		Type  string `json:"type"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(payload, &ev) != nil || ev.Error == nil {
+		return "", false
+	}
+	if ev.Type != "" && ev.Type != "error" {
+		return "", false
+	}
+	msg := ev.Error.Message
+	if msg == "" {
+		msg = "upstream reported an error"
+	}
+	return msg, true
+}
+
+// sseError reports the error a buffered SSE body carries. A gateway can report a
+// failure as an event inside an HTTP 200 response, which would otherwise be
+// counted as a successful request.
+func sseError(body []byte) (string, bool) {
+	var msg string
+	var found bool
+	forEachSSEData(body, func(payload []byte) {
+		if m, ok := sseDataError(payload); ok {
+			msg, found = m, true
+		}
+	})
+	return msg, found
+}
+
+// sseErrorWatcher forwards a stream untouched while remembering the first error
+// event it carries. It keeps only a bounded partial line, so watching a long
+// stream costs a fixed amount of memory.
+type sseErrorWatcher struct {
+	w      io.Writer
+	line   []byte
+	msg    string
+	failed bool
+}
+
+func newSSEErrorWatcher(w io.Writer) *sseErrorWatcher {
+	return &sseErrorWatcher{w: w}
+}
+
+func (s *sseErrorWatcher) Write(p []byte) (int, error) {
+	if !s.failed {
+		s.scan(p)
+	}
+	return s.w.Write(p)
+}
+
+func (s *sseErrorWatcher) scan(p []byte) {
+	s.line = append(s.line, p...)
+	for {
+		i := bytes.IndexByte(s.line, '\n')
+		if i < 0 {
+			break
+		}
+		s.checkLine(s.line[:i])
+		s.line = s.line[i+1:]
+	}
+	if len(s.line) > maxSSELineBytes {
+		s.line = s.line[:0]
+	}
+}
+
+func (s *sseErrorWatcher) checkLine(line []byte) {
+	line = bytes.TrimRight(line, "\r")
+	if !bytes.HasPrefix(line, []byte("data:")) {
+		return
+	}
+	payload := bytes.TrimSpace(line[len("data:"):])
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return
+	}
+	if msg, ok := sseDataError(payload); ok {
+		s.msg, s.failed = msg, true
+	}
+}
+
+// Error reports the first error the watched stream carried, if any.
+func (s *sseErrorWatcher) Error() (string, bool) { return s.msg, s.failed }
+
 // tailBuffer keeps only the last max bytes written to it. Streaming responses are
 // inspected for a trailing usage chunk, which lets the proxy read that chunk
 // without buffering the whole stream in memory.

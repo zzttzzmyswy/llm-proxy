@@ -39,9 +39,11 @@
 保存流程：
 
 1. 服务端校验（端口范围、URL scheme、路由别名与 model 非空、`upstream` 取值合法）。
-2. 把当前配置文件备份为 `<path>.bak.<YYYYMMDD-HHMMSS>`（沿用仓库既有习惯）。
-3. 生成带说明注释的 TOML 文本，先写 `<path>.tmp` 再 `rename` 原子替换，保持原文件权限。
-4. 重新加载配置并热切换。
+2. 把当前配置文件备份为 `<path>.bak.<YYYYMMDD-HHMMSS>`（沿用仓库既有习惯）。同一秒内的第二次保存会追加序号，并以 `O_EXCL` 独占创建，保证首次保存留下的原始副本不被覆盖。
+3. 生成带说明注释的 TOML 文本，先写临时文件再 `rename` 原子替换，保持原文件权限。
+4. 重新加载配置并热切换；失败则写回备份并重新加载，回滚本身失败时如实分别报告。
+
+整个「读取旧值 → 备份 → 写入 → 重载/回滚」事务由一把专用 mutex 串行化。`cfgMu` 只保护发布，挡不住两个并发保存交错，导致磁盘与内存不一致。
 
 **已知取舍**：重写会丢失原文件里手写的注释与注释掉的备选路由（live 配置里就有几条注释掉的 `sonnet` 备选）。用带注释的生成模板 + 时间戳备份来补偿，备份文件可随时回滚。这是为了让"可视化修改"成立而付出的代价，写在文档里而不是藏着。
 
@@ -54,18 +56,27 @@
 
 `clear` 会清空口令，管理页面随即关闭（`/admin*` 全部 404），页面会明确告知这一点。
 
-### 4. 热重载：RWMutex + 访问器，不原地改全局
+### 4. 热重载：不可变快照 + RWMutex，请求内只取一次
 
 现状：`cfg` / `routeTargets` 是裸全局，请求路径直接读；现有测试也直接读写这两个全局。
 
-做法：保留全局变量（测试兼容），新增 `cfgMu sync.RWMutex`：
+做法：保留全局变量（测试兼容），新增 `cfgMu sync.RWMutex` 与一个**请求级快照** `reqConfig`：
 
-- 读：`currentConfig()` / `currentRoutes()` 在 `RLock` 下取快照，请求处理函数在入口取**一次**快照后用局部变量，锁不跨越 I/O。
-- 写：`reloadConfig()` 解析出全新的 `Config` 与路由表，在 `Lock` 下整体替换。
+- 入口 `snapshotConfig()` 在一次 `RLock` 内同时取出 `cfg` 与解析后的路由表，构成 `reqConfig`。
+- 该快照被贯穿整条请求链路：路由解析、VLM 描述、请求构造、超时/重试、响应读取。辅助函数（`apiKey` / `headerTimeout` / `bodyIdle` / `maxRetries` / `openAICompletionsURL` / `httpClient` / `routeTarget`）都变成 `reqConfig` 的方法，不再各自回读全局。
+- 写：`storeConfig()` 在 `Lock` 下整体替换 `cfg` / `routeTargets` / `declaredRoutes`。
 
-选择整体替换而不是原地修改字段：请求路径读到的永远是自洽的一份配置，不会出现"路由表已更新、超时还是旧的"的中间态。
+**为什么必须贯穿**：只在入口取一份 `Config` 不够——如果后半程再回读全局，热重载发生在 VLM 描述期间就会出现「旧模型 + 新上游地址 + 新密钥」的混合状态。一次请求只允许看到一份配置。
 
-### 5. 统计：进程内采集器，按**上游模型名**聚合
+`reqConfig` 是值类型（小结构体 + map 头），传递成本可忽略；锁只在取快照时持有，不跨 I/O。
+
+### 5. 编辑视图区分「声明值」与「生效值」
+
+`[routing]` 在运行时会被 `default_upstream` 与内置兜底回填。如果编辑表单直接展示回填后的结果，保存就会把**继承关系固化成显式值**——用户之后修改 `default_upstream` 将不再影响这些条目。
+
+做法：`parseConfig` 同时产出 `declared`（文件里怎么写的）与 `resolved`（回填后实际怎么走），`storeConfig` 一并发布。编辑视图的 `routing` 用 `declared`，另有只读的 `effective_routing` 展示每个别名实际走哪个模型（含未声明的内置兜底），供操作者对照。保存只写声明值。
+
+### 6. 统计：进程内采集器，按**上游模型名**聚合
 
 采集器 `stats.go`，`sync.Mutex` 保护，按实际发给上游的模型名聚合（live 配置里 `sonnet→DeepSeek-Flash`、`opus→GLM-5.3`、`haiku→glm-5.3-flash`，三个模型三条记录）。每条记录包含：
 
@@ -80,7 +91,7 @@ TPM / RPM 由环形桶精确计算：TPM = 最近 60 秒槽位 token 之和，RP
 
 桶数上限：跟踪的模型数封顶 128，超出归入 `(other)`，防止 `/v1/chat/completions` 透传路径上客户端随意填 `model` 导致内存无界增长。
 
-### 6. token 用量来源：优先真实 usage，缺失时估算并标注
+### 7. token 用量来源：优先真实 usage，缺失时估算并标注
 
 | 路径 | 来源 | 精度 |
 |------|------|------|
@@ -94,7 +105,7 @@ TPM / RPM 由环形桶精确计算：TPM = 最近 60 秒槽位 token 之和，RP
 
 流式路径不做全量缓冲（既有的 Anthropic SSE 缓冲保持不变），OpenAI 流式路径用**尾部缓冲**（保留最后 64KB）取末尾的 usage chunk，内存有界。
 
-### 7. 失败分类
+### 8. 失败分类
 
 | 分类 | 触发条件 |
 |------|----------|
@@ -105,10 +116,11 @@ TPM / RPM 由环形桶精确计算：TPM = 最近 60 秒槽位 token 之和，RP
 | `network_error` | 连接重置、EOF 等瞬态网络错误 |
 | `empty_response` | 上游 0 字节响应 |
 | `stream_stalled` | 响应体静默超 `body_idle_seconds` |
+| `upstream_stream_error` | 网关在 HTTP 200 的流内以 `error` 事件报错（Anthropic `type:"error"` 事件或 OpenAI 的 `error` chunk） |
 | `translate_error` | OpenAI↔Anthropic 翻译失败 |
 | `vlm_describe_failed` | VLM 描述失败（请求回退到 VLM，仍算成功，但记一条事件） |
 
-### 8. 版本与发布
+### 9. 版本与发布
 
 新增 `const version`，启动日志与页面页脚展示。按仓库既有约定发 `v0.9.0` release，资产为 `llm-proxy-linux-amd64` / `llm-proxy-linux-arm64` / `SHA256SUMS`。
 
@@ -139,7 +151,7 @@ POST /admin/api/stats/reset      → 清零统计
 ```json
 {
   "config_path": "/etc/llm-proxy/config.toml",
-  "admin_enabled": true,
+  "admin": {"token_set": true, "token_from_env": false},
   "proxy": {"port": 8088, "vlm_model": "MiniMax-M3", "vlm_max_tokens": 8000},
   "upstream": {
     "anthropic_url": "...", "openai_url": "...", "default_upstream": "",
@@ -148,13 +160,20 @@ POST /admin/api/stats/reset      → 清零统计
   "keys": {"sophnet_set": true, "sophnet_from_env": false},
   "routing": [
     {"alias": "sonnet", "model": "DeepSeek-Flash", "upstream": "", "supports_image": true}
-  ]
+  ],
+  "effective_routing": {
+    "sonnet": {"model": "DeepSeek-Flash", "upstream": "openai", "declared": true},
+    "opus": {"model": "GLM-5.2", "upstream": "", "declared": false}
+  }
 }
 ```
 
+`routing` 是文件里的声明值（表单编辑它）；`effective_routing` 是回填 `default_upstream` 与内置兜底之后的实际走向，只读展示，`declared` 标记该别名是否在文件中声明。
+
 `POST /admin/api/config` 请求体在响应结构基础上把 `keys` 换成
-`{"sophnet_action": "keep|set|clear", "sophnet": "<新密钥>"}`。
-成功返回 `{"ok": true, "config": {...}, "warnings": ["..."]}`，校验失败返回 400 + `{"ok": false, "error": "..."}`，且**不落盘**。
+`{"sophnet_action": "keep|set|clear", "sophnet": "<新密钥>"}`，并新增
+`{"admin": {"token_action": "keep|set|clear", "token": "<新口令>"}}`。
+成功返回 `{"ok": true, "config": {...}, "reauth_required": false, "warnings": ["..."]}`——改口令时 `reauth_required` 为 true，页面据此提示重新登录。校验失败返回 400 + `{"ok": false, "error": "..."}`，且**不落盘**。
 
 `GET /admin/api/stats` 响应：
 

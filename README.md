@@ -61,8 +61,8 @@ Claude Code 默认只认 Anthropic 官方模型名（`sonnet` / `opus` / `haiku`
 页面分三块：
 
 - **总览 / 模型调用情况**：每个模型一行，含请求数、成功/失败、失败率、TPM（最近 60 秒 token）、RPM（最近 60 秒请求）、输入/输出 token 累计、平均与最大延迟，以及最近 30 分钟每分钟 token 的迷你趋势图。按实际发给上游的模型名聚合，并列出打到该模型的别名分布。
-- **失败情况**：按分类（`upstream_5xx` / `rate_limited` / `upstream_4xx` / `network_timeout` / `network_error` / `empty_response` / `stream_stalled` / `translate_error` / `vlm_describe_failed`）计数，并列出最近失败的时间、模型、别名、分类、状态码与消息。
-- **配置**：结构化表单编辑代理参数、上游地址与超时、上游密钥、管理页面口令、`[routing]` 路由表（可增删改）。保存后**立即生效**（进程内热重载），无需重启服务。
+- **失败情况**：按分类（`upstream_5xx` / `rate_limited` / `upstream_4xx` / `network_timeout` / `network_error` / `empty_response` / `stream_stalled` / `upstream_stream_error` / `translate_error` / `vlm_describe_failed`）计数，并列出最近失败的时间、模型、别名、分类、状态码与消息。网关在 HTTP 200 的流内以 `error` 事件报的错也会计入 `upstream_stream_error`，不会被当成成功。
+- **配置**：结构化表单编辑代理参数、上游地址与超时、上游密钥、管理页面口令、`[routing]` 路由表（可增删改）。保存后**立即生效**（进程内热重载），无需重启服务。表单编辑的是**文件里声明的**路由，另有只读的「生效路由」展示回填默认网关与内置兜底之后每个别名实际走哪个模型——这样修改 `default_upstream` 会真正影响那些没有显式声明网关的条目。
 
 ### 启用
 

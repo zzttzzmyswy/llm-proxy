@@ -156,20 +156,28 @@ func TestAdminConfigViewRedactsKey(t *testing.T) {
 	if view.Proxy.VLMModel != "MiniMax-M3" || view.Upstream.HeaderTimeoutSeconds != 120 {
 		t.Fatalf("defaults must be applied to the view: %+v", view)
 	}
-	// The config declares sonnet and haiku; opus is filled in from the builtin
-	// fallback, so all three aliases must be visible to the page.
-	if len(view.Routing) != 3 {
-		t.Fatalf("routing must list every resolved alias, got %+v", view.Routing)
+	// routing lists what the file declares, so a save cannot freeze an inherited
+	// value into the file. The builtin opus fallback is not declared, so it shows
+	// up only in the effective view.
+	if len(view.Routing) != 2 {
+		t.Fatalf("routing must list the declared aliases only, got %+v", view.Routing)
 	}
 	byAlias := map[string]adminRoutingEntry{}
 	for _, e := range view.Routing {
 		byAlias[e.Alias] = e
 	}
-	if e := byAlias["opus"]; e.Model != "GLM-5.2" {
-		t.Fatalf("the builtin opus fallback must be shown, got %+v", e)
+	if _, ok := byAlias["opus"]; ok {
+		t.Fatalf("an undeclared builtin fallback must not appear in the editable routing, got %+v", byAlias["opus"])
 	}
 	if e := byAlias["sonnet"]; !e.SupportsImage || e.Model != "DeepSeek-Flash" {
 		t.Fatalf("sonnet route: %+v", e)
+	}
+	// The fallback is still reported as effective, so the operator can see it.
+	if e, ok := view.EffectiveRouting["opus"]; !ok || e.Model != "GLM-5.2" || e.Declared {
+		t.Fatalf("the builtin opus fallback must be reported as effective and undeclared, got %+v", e)
+	}
+	if e, ok := view.EffectiveRouting["haiku"]; !ok || !e.Declared || e.Upstream != "openai" {
+		t.Fatalf("a declared route must be reported as effective and declared, got %+v", e)
 	}
 }
 
@@ -222,7 +230,7 @@ func TestAdminConfigSaveAppliesAndBacksUp(t *testing.T) {
 	if got := currentConfig().Proxy.VLMModel; got != "Qwen3-VL" {
 		t.Fatalf("save must reload the running config, vlm -> %q", got)
 	}
-	if got := maxRetries(); got != 5 {
+	if got := snapshotConfig().maxRetries(); got != 5 {
 		t.Fatalf("save must reload retries, got %d", got)
 	}
 

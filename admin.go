@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -125,6 +126,16 @@ type adminRoutingEntry struct {
 	SupportsImage bool   `json:"supports_image"`
 }
 
+// adminEffectiveRoute is the gateway and model an alias actually resolves to
+// after the default gateway and the builtin fallbacks are applied. It is shown
+// read-only: the form edits what the file declares, so a value inherited from
+// default_upstream is not frozen into the file by a save.
+type adminEffectiveRoute struct {
+	Model    string `json:"model"`
+	Upstream string `json:"upstream"`
+	Declared bool   `json:"declared"`
+}
+
 type adminConfigView struct {
 	ConfigPath string              `json:"config_path"`
 	Admin      adminAuthView       `json:"admin"`
@@ -132,6 +143,9 @@ type adminConfigView struct {
 	Upstream   adminUpstreamView   `json:"upstream"`
 	Keys       adminKeysView       `json:"keys"`
 	Routing    []adminRoutingEntry `json:"routing"`
+	// EffectiveRouting covers every alias the proxy will serve, including the
+	// builtin fallbacks that are not written in the file.
+	EffectiveRouting map[string]adminEffectiveRoute `json:"effective_routing"`
 }
 
 type adminKeysPayload struct {
@@ -158,25 +172,40 @@ type adminConfigPayload struct {
 
 // currentConfigView renders the running config for the page. The upstream key is
 // never returned — only whether one is configured and where it comes from.
+//
+// routing lists the aliases as declared in the file, which is what the form
+// edits; effective_routing reports where each alias actually goes once the
+// default gateway and the builtin fallbacks are applied.
 func currentConfigView() adminConfigView {
 	c := currentConfig()
-	routes := currentRoutes()
+	declared := currentDeclaredRoutes()
+	resolved := currentRoutes()
 
-	aliases := make([]string, 0, len(routes))
-	for alias := range routes {
+	aliases := make([]string, 0, len(declared))
+	for alias := range declared {
 		aliases = append(aliases, alias)
 	}
 	sort.Strings(aliases)
 
 	entries := make([]adminRoutingEntry, 0, len(aliases))
 	for _, alias := range aliases {
-		e := routes[alias]
+		e := declared[alias]
 		entries = append(entries, adminRoutingEntry{
 			Alias:         alias,
 			Model:         e.Model,
 			Upstream:      e.Upstream,
 			SupportsImage: e.SupportsImage,
 		})
+	}
+
+	effective := make(map[string]adminEffectiveRoute, len(resolved))
+	for alias, e := range resolved {
+		_, isDeclared := declared[alias]
+		effective[alias] = adminEffectiveRoute{
+			Model:    e.Model,
+			Upstream: e.Upstream,
+			Declared: isDeclared,
+		}
 	}
 
 	return adminConfigView{
@@ -202,9 +231,16 @@ func currentConfigView() adminConfigView {
 			SophnetSet:     c.Keys.Sophnet != "",
 			SophnetFromEnv: os.Getenv("SOPHNET_API_KEY") != "",
 		},
-		Routing: entries,
+		Routing:          entries,
+		EffectiveRouting: effective,
 	}
 }
+
+// configSaveMu serializes the whole save transaction — reading the previous
+// value, backing up, writing, reloading or rolling back. cfgMu only protects
+// publishing, so without this two concurrent saves can interleave and leave the
+// file and the running config disagreeing.
+var configSaveMu sync.Mutex
 
 func handleAdminConfigSave(w http.ResponseWriter, r *http.Request) {
 	var payload adminConfigPayload
@@ -217,6 +253,9 @@ func handleAdminConfigSave(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	configSaveMu.Lock()
+	defer configSaveMu.Unlock()
 
 	path := configPathFromEnv()
 	oldConfig := currentConfig()
@@ -252,7 +291,7 @@ func handleAdminConfigSave(w http.ResponseWriter, r *http.Request) {
 	// Read the keys the rewrite is about to drop before the file is replaced.
 	dropped := unknownConfigKeys(path)
 
-	backup, err := backupConfigFile(path)
+	backup, backupPath, err := backupConfigFile(path)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "备份配置失败: "+err.Error())
 		return
@@ -263,11 +302,23 @@ func handleAdminConfigSave(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := loadConfig(); err != nil {
 		// The file is on disk but unusable: put the previous one back so the
-		// running proxy and the file never disagree.
-		if restoreErr := writeFileAtomic(path, backup); restoreErr == nil {
-			_ = loadConfig()
+		// running proxy and the file never disagree. Report each way the rollback
+		// itself can fail rather than claiming success unconditionally.
+		restoreErr := writeFileAtomic(path, backup)
+		var reloadErr error
+		if restoreErr == nil {
+			reloadErr = loadConfig()
 		}
-		writeJSONError(w, http.StatusInternalServerError, "配置重载失败，已回滚: "+err.Error())
+		msg := "配置重载失败: " + err.Error()
+		switch {
+		case restoreErr != nil:
+			msg += "；回滚写入也失败: " + restoreErr.Error() + "（配置文件可能已是新内容，保存前的副本在 " + backupPath + "）"
+		case reloadErr != nil:
+			msg += "；已写回保存前的配置，但重新加载仍失败: " + reloadErr.Error()
+		default:
+			msg += "；已回滚到保存前的配置"
+		}
+		writeJSONError(w, http.StatusInternalServerError, msg)
 		return
 	}
 
@@ -502,21 +553,45 @@ func renderConfigTOML(p adminConfigPayload, adminTok, sophnetKey string) string 
 	return b.String()
 }
 
-// backupConfigFile copies the current config aside and returns its contents, so
-// a failed reload can be rolled back without re-reading a file we just replaced.
-func backupConfigFile(path string) ([]byte, error) {
+// backupConfigFile copies the current config aside and returns its contents plus
+// the path it was written to, so a failed reload can be rolled back without
+// re-reading a file we just replaced.
+//
+// The name is timestamped to the second, which two saves in the same second
+// would collide on; O_EXCL plus a numeric suffix guarantees the first save's
+// copy of the original file is never overwritten.
+func backupConfigFile(path string) ([]byte, string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, "", nil
 		}
-		return nil, err
+		return nil, "", err
 	}
-	backupPath := fmt.Sprintf("%s.bak.%s", path, time.Now().Format("20060102-150405"))
-	if err := os.WriteFile(backupPath, data, 0o600); err != nil {
-		return nil, err
+
+	stamp := time.Now().Format("20060102-150405")
+	for attempt := 0; attempt < 100; attempt++ {
+		backupPath := fmt.Sprintf("%s.bak.%s", path, stamp)
+		if attempt > 0 {
+			backupPath = fmt.Sprintf("%s.bak.%s-%d", path, stamp, attempt)
+		}
+		f, err := os.OpenFile(backupPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			if os.IsExist(err) {
+				continue
+			}
+			return nil, "", err
+		}
+		if _, err := f.Write(data); err != nil {
+			f.Close()
+			return nil, "", err
+		}
+		if err := f.Close(); err != nil {
+			return nil, "", err
+		}
+		return data, backupPath, nil
 	}
-	return data, nil
+	return nil, "", fmt.Errorf("同秒内备份次数过多，无法生成唯一备份文件名")
 }
 
 // writeFileAtomic replaces path via a temporary file in the same directory, so a

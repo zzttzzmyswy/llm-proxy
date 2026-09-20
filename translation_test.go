@@ -155,19 +155,19 @@ func TestRouteTargetResolution(t *testing.T) {
 	setRoute(t, "flash", "glm-5.3-flash", "openai")
 	setRoute(t, "main", "GLM-5.3", "")
 
-	if tr := routeTarget("flash"); tr.Model != "glm-5.3-flash" || tr.Upstream != "openai" {
+	if tr := snapshotConfig().routeTarget("flash"); tr.Model != "glm-5.3-flash" || tr.Upstream != "openai" {
 		t.Fatalf("custom alias route must win, got %+v", tr)
 	}
-	if tr := routeTarget("sonnet"); tr.Model != "DeepSeek-V4-Flash-0731" || tr.Upstream != "" {
+	if tr := snapshotConfig().routeTarget("sonnet"); tr.Model != "DeepSeek-V4-Flash-0731" || tr.Upstream != "" {
 		t.Fatalf("fixed key must resolve via legacy field, got %+v", tr)
 	}
-	if tr := routeTarget("main"); tr.Model != "GLM-5.3" {
+	if tr := snapshotConfig().routeTarget("main"); tr.Model != "GLM-5.3" {
 		t.Fatalf("string table entry must decode, got %+v", tr)
 	}
-	if tr := routeTarget("claude-sonnet-4"); tr.Model != "DeepSeek-V4-Flash-0731" {
+	if tr := snapshotConfig().routeTarget("claude-sonnet-4"); tr.Model != "DeepSeek-V4-Flash-0731" {
 		t.Fatalf("composed name must match by substring, got %+v", tr)
 	}
-	if tr := routeTarget("unknown-model"); tr.Model != "" || tr.Upstream != "" {
+	if tr := snapshotConfig().routeTarget("unknown-model"); tr.Model != "" || tr.Upstream != "" {
 		t.Fatalf("unknown model must passthrough untouched, got %+v", tr)
 	}
 }
@@ -193,13 +193,13 @@ opus = "GLM-5.3"
 	if err := loadConfig(); err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if tr := routeTarget("sonnet"); tr.Model != "glm-5.3-flash" || tr.Upstream != "openai" {
+	if tr := snapshotConfig().routeTarget("sonnet"); tr.Model != "glm-5.3-flash" || tr.Upstream != "openai" {
 		t.Fatalf("table-form sonnet must route to the openai gateway, got %+v", tr)
 	}
-	if tr := routeTarget("haiku"); tr.Model != "glm-5.3-flash" || tr.Upstream != "openai" {
+	if tr := snapshotConfig().routeTarget("haiku"); tr.Model != "glm-5.3-flash" || tr.Upstream != "openai" {
 		t.Fatalf("haiku must inherit sonnet's target including upstream, got %+v", tr)
 	}
-	if tr := routeTarget("opus"); tr.Model != "GLM-5.3" || tr.Upstream != "" {
+	if tr := snapshotConfig().routeTarget("opus"); tr.Model != "GLM-5.3" || tr.Upstream != "" {
 		t.Fatalf("string-form opus must stay on the anthropic gateway, got %+v", tr)
 	}
 }
@@ -211,11 +211,11 @@ func TestOpenAICompletionsURLNoDoubleAppend(t *testing.T) {
 	t.Cleanup(func() { cfg.Upstream.OpenAIURL = old })
 
 	cfg.Upstream.OpenAIURL = "https://api.sophnet.com/v1/chat/completions"
-	if got := openAICompletionsURL(); got != "https://api.sophnet.com/v1/chat/completions" {
+	if got := snapshotConfig().openAICompletionsURL(); got != "https://api.sophnet.com/v1/chat/completions" {
 		t.Fatalf("full endpoint must be used as-is, got %q", got)
 	}
 	cfg.Upstream.OpenAIURL = "https://www.sophnet.com/api/open-apis/openai"
-	if got := openAICompletionsURL(); got != "https://www.sophnet.com/api/open-apis/openai/v1/chat/completions" {
+	if got := snapshotConfig().openAICompletionsURL(); got != "https://www.sophnet.com/api/open-apis/openai/v1/chat/completions" {
 		t.Fatalf("base URL must get the path appended, got %q", got)
 	}
 }

@@ -117,6 +117,108 @@ func currentRoutes() map[string]RouteEntry {
 	return routeTargets
 }
 
+// declaredRoutes holds [routing] exactly as written in the config file, before
+// the default gateway and the builtin fallbacks are applied. The admin page edits
+// these, so saving never freezes an inherited value into the file.
+var declaredRoutes map[string]RouteEntry
+
+// currentDeclaredRoutes returns a snapshot of the routes as they are declared.
+func currentDeclaredRoutes() map[string]RouteEntry {
+	cfgMu.RLock()
+	defer cfgMu.RUnlock()
+	return declaredRoutes
+}
+
+// reqConfig is the configuration one request runs against. A handler takes it
+// once at entry and threads it through routing, the VLM pass, request building,
+// retries and response reading. Taking a fresh snapshot at each step would let a
+// config saved mid-request pair the model chosen before the save with the
+// upstream URL and key read after it.
+type reqConfig struct {
+	cfg    Config
+	routes map[string]RouteEntry
+}
+
+// snapshotConfig captures the running config and its routing table under a single
+// read lock, so both come from the same published version.
+func snapshotConfig() reqConfig {
+	cfgMu.RLock()
+	defer cfgMu.RUnlock()
+	return reqConfig{cfg: cfg, routes: routeTargets}
+}
+
+func (rc reqConfig) apiKey() string {
+	if k := os.Getenv("SOPHNET_API_KEY"); k != "" {
+		return k
+	}
+	return rc.cfg.Keys.Sophnet
+}
+
+func (rc reqConfig) headerTimeout() time.Duration {
+	if s := rc.cfg.Upstream.HeaderTimeoutSeconds; s > 0 {
+		return time.Duration(s) * time.Second
+	}
+	return 120 * time.Second
+}
+
+func (rc reqConfig) bodyIdle() time.Duration {
+	if s := rc.cfg.Upstream.BodyIdleSeconds; s > 0 {
+		return time.Duration(s) * time.Second
+	}
+	return 90 * time.Second
+}
+
+func (rc reqConfig) maxRetries() int {
+	if n := rc.cfg.Upstream.MaxRetries; n > 0 {
+		return n
+	}
+	return 2
+}
+
+func (rc reqConfig) anthropicMessagesURL() string {
+	return rc.cfg.Upstream.AnthropicURL + "/v1/messages"
+}
+
+// openAICompletionsURL returns the OpenAI chat-completions endpoint. The
+// configured openai_url may be a base URL (path appended) or already carry the
+// full /chat/completions endpoint.
+func (rc reqConfig) openAICompletionsURL() string {
+	base := strings.TrimSuffix(rc.cfg.Upstream.OpenAIURL, "/")
+	if strings.HasSuffix(base, "/chat/completions") {
+		return base
+	}
+	return base + "/v1/chat/completions"
+}
+
+func (rc reqConfig) httpClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DisableCompression:    true,
+			ResponseHeaderTimeout: rc.headerTimeout(),
+		},
+		Timeout: 0,
+	}
+}
+
+// routeTarget resolves the routing target for a client model name. Exact names
+// (builtin aliases and custom config aliases alike) resolve through the routing
+// table; composed names (claude-sonnet-4, opus-2, ...) fall back to substring
+// matching against the builtin targets.
+func (rc reqConfig) routeTarget(model string) RouteEntry {
+	if e, ok := rc.routes[model]; ok {
+		return e
+	}
+	switch {
+	case strings.Contains(model, "opus"):
+		return rc.routes["opus"]
+	case strings.Contains(model, "haiku"):
+		return rc.routes["haiku"]
+	case strings.Contains(model, "sonnet"):
+		return rc.routes["sonnet"]
+	}
+	return RouteEntry{}
+}
+
 const configPath = "/etc/llm-proxy/config.toml"
 
 // configPathFromEnv returns the config file path, honoring LLM_PROXY_CONFIG so
@@ -126,15 +228,6 @@ func configPathFromEnv() string {
 		return p
 	}
 	return configPath
-}
-
-// apiKey returns the sophnet upstream key, preferring the SOPHNET_API_KEY env var
-// so the key does not have to be stored in plaintext in a config file.
-func apiKey() string {
-	if k := os.Getenv("SOPHNET_API_KEY"); k != "" {
-		return k
-	}
-	return currentConfig().Keys.Sophnet
 }
 
 // adminToken returns the admin page password, preferring LLM_PROXY_ADMIN_TOKEN
@@ -148,40 +241,47 @@ func adminToken() string {
 }
 
 func loadConfig() error {
-	c, routes, err := parseConfig()
+	c, routes, declared, err := parseConfig()
 	if err != nil {
 		return err
 	}
-	storeConfig(c, routes)
+	storeConfig(c, routes, declared)
 	return nil
 }
 
-// storeConfig publishes a freshly parsed config. It is the only writer of cfg
-// and routeTargets, so a reload swaps both atomically from a reader's point of
-// view.
-func storeConfig(c Config, routes map[string]RouteEntry) {
+// storeConfig publishes a freshly parsed config. It is the only writer of cfg,
+// routeTargets and declaredRoutes, so a reload swaps all three atomically from a
+// reader's point of view.
+func storeConfig(c Config, routes, declared map[string]RouteEntry) {
 	cfgMu.Lock()
 	defer cfgMu.Unlock()
 	cfg = c
 	routeTargets = routes
+	declaredRoutes = declared
 }
 
 // parseConfig reads the config file and resolves it into a Config plus its
-// [routing] table, applying defaults and the builtin fallback routes. It never
+// routing table, applying defaults and the builtin fallback routes. It never
 // touches the live globals, so a failed parse leaves the running config intact.
-func parseConfig() (Config, map[string]RouteEntry, error) {
+// The declared routes are returned alongside the resolved ones: the admin page
+// edits what the file says, not the result of resolving it.
+func parseConfig() (Config, map[string]RouteEntry, map[string]RouteEntry, error) {
 	var c Config
 	data, err := os.ReadFile(configPathFromEnv())
 	if err != nil {
-		return c, nil, fmt.Errorf("read config %s: %w", configPathFromEnv(), err)
+		return c, nil, nil, fmt.Errorf("read config %s: %w", configPathFromEnv(), err)
 	}
 	if err := toml.Unmarshal(data, &c); err != nil {
-		return c, nil, fmt.Errorf("parse config: %w", err)
+		return c, nil, nil, fmt.Errorf("parse config: %w", err)
 	}
 
 	applyDefaults(&c)
 
-	routes := buildRouteTargets(c.Routing)
+	declared := buildRouteTargets(c.Routing)
+	routes := make(map[string]RouteEntry, len(declared)+3)
+	for alias, e := range declared {
+		routes[alias] = e
+	}
 	ensureRoute(routes, "sonnet", "DeepSeek-V4-Pro")
 	ensureRoute(routes, "opus", "GLM-5.2")
 	if _, ok := routes["haiku"]; !ok {
@@ -189,7 +289,7 @@ func parseConfig() (Config, map[string]RouteEntry, error) {
 	}
 	applyDefaultUpstream(&c, routes)
 
-	return c, routes, nil
+	return c, routes, declared, nil
 }
 
 // applyDefaults fills every unset field with the value the proxy documents.
@@ -293,43 +393,6 @@ func (fw *flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// headerTimeout returns the per-attempt response-header timeout, honoring the
-// config value when present.
-func headerTimeout() time.Duration {
-	if s := currentConfig().Upstream.HeaderTimeoutSeconds; s > 0 {
-		return time.Duration(s) * time.Second
-	}
-	return 120 * time.Second
-}
-
-// bodyIdle returns the maximum silence allowed while reading an upstream
-// response body before the stream is declared stalled.
-func bodyIdle() time.Duration {
-	if s := currentConfig().Upstream.BodyIdleSeconds; s > 0 {
-		return time.Duration(s) * time.Second
-	}
-	return 90 * time.Second
-}
-
-// maxRetries returns how many extra attempts the proxy makes on transient
-// upstream failures before giving up.
-func maxRetries() int {
-	if n := currentConfig().Upstream.MaxRetries; n > 0 {
-		return n
-	}
-	return 2
-}
-
-func httpClient() *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			DisableCompression:    true,
-			ResponseHeaderTimeout: headerTimeout(),
-		},
-		Timeout: 0,
-	}
-}
-
 // retryBackoffs is the sleep between retry attempts.
 var retryBackoffs = []time.Duration{500 * time.Millisecond, 1 * time.Second, 2 * time.Second}
 
@@ -384,7 +447,7 @@ func isRetryableStatus(code int) bool {
 
 // doPostAttempt issues a single POST, honoring the client context so a
 // disconnected client aborts the upstream call.
-func doPostAttempt(ctx context.Context, url string, body []byte, headers map[string]string) (*http.Response, error) {
+func doPostAttempt(ctx context.Context, url string, body []byte, headers map[string]string, rc reqConfig) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -392,17 +455,17 @@ func doPostAttempt(ctx context.Context, url string, body []byte, headers map[str
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	return httpClient().Do(req)
+	return rc.httpClient().Do(req)
 }
 
 // postUpstream issues an HTTP POST, retrying transient network errors and
-// retryable statuses up to maxRetries() times. The last response (even a
+// retryable statuses up to the configured retry count. The last response (even a
 // retryable status) is returned once retries are exhausted; the caller owns
 // closing its body.
-func postUpstream(ctx context.Context, url string, body []byte, headers map[string]string) (*http.Response, error) {
-	max := maxRetries()
+func postUpstream(ctx context.Context, url string, body []byte, headers map[string]string, rc reqConfig) (*http.Response, error) {
+	max := rc.maxRetries()
 	for attempt := 0; ; attempt++ {
-		resp, err := doPostAttempt(ctx, url, body, headers)
+		resp, err := doPostAttempt(ctx, url, body, headers, rc)
 		if err == nil && !(attempt < max && isRetryableStatus(resp.StatusCode)) {
 			return resp, nil
 		}
@@ -524,9 +587,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	if m, ok := req["model"].(string); ok {
 		model = m
 	}
-	// One snapshot per request: a config saved from the admin page mid-flight
-	// must not apply to half of this request.
-	c := currentConfig()
+	// One snapshot for the whole request: a config saved from the admin page
+	// mid-flight must not apply to half of it.
+	rc := snapshotConfig()
 
 	// Routing strategy:
 	//   - text-only requests go to the mapped text model (LLM)
@@ -542,7 +605,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	// describe pass runs BEFORE the openai branch so image-carrying requests are
 	// reduced to text first — a raw image translated to image_url is rejected by
 	// text-only openai models ("model ... do not support image params").
-	target := routeTarget(model)
+	target := rc.routeTarget(model)
 	newModel := target.Model
 	// vlmFallback is set when the describe pass failed: the original (still
 	// image-carrying) request must be routed to the VLM model via the anthropic
@@ -554,16 +617,16 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	// input) skips the builtin VLM describe pass: the image-carrying request is
 	// forwarded to the model as-is (image blocks intact; openai routes translate
 	// them to image_url parts).
-	if containsImage(req) && c.Proxy.VLMModel != "" && !target.SupportsImage {
-		if describeImages(req) {
+	if containsImage(req) && rc.cfg.Proxy.VLMModel != "" && !target.SupportsImage {
+		if describeImages(req, rc) {
 			body, _ = json.Marshal(req)
 		} else {
 			// Describe failed partway (some images replaced, some not): restore the
 			// original request and route the whole thing to the VLM so no image is lost.
 			json.Unmarshal(body, &req)
-			newModel = c.Proxy.VLMModel
+			newModel = rc.cfg.Proxy.VLMModel
 			vlmFallback = true
-			stats.warn(model, c.Proxy.VLMModel, "anthropic", catVLMDescribeFailed,
+			stats.warn(model, rc.cfg.Proxy.VLMModel, "anthropic", catVLMDescribeFailed,
 				"VLM 图片描述失败，整个请求已回退路由到 VLM")
 		}
 	}
@@ -581,7 +644,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	tracker := stats.beginReqAt(startedAt, model, newModel, gateway)
 
 	if gateway == "openai" {
-		handleOpenAIRequest(w, r, req, target.Model, tracker)
+		handleOpenAIRequest(w, r, req, target.Model, tracker, rc)
 		return
 	}
 
@@ -594,7 +657,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[%s] %s -> %s len=%d\n", time.Now().Format("15:04:05"), model, newModel, len(body))
 
-	resp, err := doUpstreamRequest(body, r)
+	resp, err := doUpstreamRequest(body, r, rc)
 	if err != nil {
 		log.Printf("[RESP] error: %v\n", err)
 		tracker.failure(classifyError(err), 0, err.Error())
@@ -606,16 +669,16 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	// detection missed (400 "Model do not support image input"), retry once with the
 	// VLM model. A route marked supports_image=true skips this too — the model is
 	// declared image-capable, so a rejection is a config error worth surfacing.
-	if resp.StatusCode == 400 && c.Proxy.VLMModel != "" && newModel != c.Proxy.VLMModel && !target.SupportsImage {
+	if resp.StatusCode == 400 && rc.cfg.Proxy.VLMModel != "" && newModel != rc.cfg.Proxy.VLMModel && !target.SupportsImage {
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if strings.Contains(string(respBody), "do not support image") {
-			log.Printf("[RETRY] image 400 -> vlm %s\n", c.Proxy.VLMModel)
-			req["model"] = c.Proxy.VLMModel
+			log.Printf("[RETRY] image 400 -> vlm %s\n", rc.cfg.Proxy.VLMModel)
+			req["model"] = rc.cfg.Proxy.VLMModel
 			body, _ = json.Marshal(req)
 			// The retry goes to the VLM, so the request is accounted against it.
-			tracker.model = c.Proxy.VLMModel
-			resp, err = doUpstreamRequest(body, r)
+			tracker.model = rc.cfg.Proxy.VLMModel
+			resp, err = doUpstreamRequest(body, r, rc)
 			if err != nil {
 				log.Printf("[RESP] retry error: %v\n", err)
 				tracker.failure(classifyError(err), 0, err.Error())
@@ -669,7 +732,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	// silent would otherwise leave the client waiting forever. On a stall the
 	// stream is terminated with an SSE error event (or the connection cut for
 	// non-stream), never left hanging.
-	respBody := newIdleReader(resp.Body, bodyIdle())
+	respBody := newIdleReader(resp.Body, rc.bodyIdle())
 	if isSSE {
 		// Streaming response: normalize malformed thinking blocks while proxying.
 		// If the upstream emits a `content_block_start` for a thinking block without a
@@ -692,7 +755,14 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		} else {
 			log.Printf("[STREAM_END] ok bytes=%d\n", totalBytes)
 		}
-		tracker.success(extractAnthropicUsage(buf.Bytes(), true))
+		// A gateway can report a failure as an event inside an HTTP 200 stream.
+		// Counting that as a success would hide it from the dashboard.
+		if msg, isErr := sseError(buf.Bytes()); isErr {
+			log.Printf("[STREAM_END] upstream stream error: %s\n", truncate(msg, 200))
+			tracker.failure(classifyError(fmt.Errorf("%w: %s", errUpstreamStream, msg)), resp.StatusCode, msg)
+		} else {
+			tracker.success(extractAnthropicUsage(buf.Bytes(), true))
+		}
 	} else {
 		// The body is buffered so its trailing usage block can be read; the buffer
 		// is capped, and a body that exceeds the cap still reaches the client
@@ -706,7 +776,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if captured.truncated {
-			tracker.success(tokenUsage{})
+			// The reply was too large to inspect: the token counts are unknown, so
+			// fall back to the request-side estimate rather than reporting zero.
+			tracker.success(tokenUsage{Input: estimateTokens(string(body))})
 		} else {
 			tracker.success(extractAnthropicUsage(captured.Bytes(), false))
 		}
@@ -789,26 +861,6 @@ func hasContentBlockOfType(content []interface{}, want string) bool {
 		}
 	}
 	return false
-}
-
-// routeTarget resolves the routing target for a client model name. Exact names
-// (builtin aliases and custom config aliases alike) resolve through
-// routeTargets; composed names (claude-sonnet-4, opus-2, ...) fall back to
-// substring matching against the builtin targets.
-func routeTarget(model string) RouteEntry {
-	routes := currentRoutes()
-	if e, ok := routes[model]; ok {
-		return e
-	}
-	switch {
-	case strings.Contains(model, "opus"):
-		return routes["opus"]
-	case strings.Contains(model, "haiku"):
-		return routes["haiku"]
-	case strings.Contains(model, "sonnet"):
-		return routes["sonnet"]
-	}
-	return RouteEntry{}
 }
 
 // routeModelName returns the configured upstream model for a builtin alias
@@ -943,17 +995,17 @@ func normalizeThinkingBlock(raw json.RawMessage) ([]byte, bool) {
 // doUpstreamRequest forwards the (already model-routed) body to the Anthropic
 // upstream and returns the response, retrying transient failures. Reused for
 // the initial attempt and the VLM image-fallback retry.
-func doUpstreamRequest(body []byte, r *http.Request) (*http.Response, error) {
+func doUpstreamRequest(body []byte, r *http.Request, rc reqConfig) (*http.Response, error) {
 	headers := map[string]string{
 		"Content-Type":      "application/json",
-		"x-api-key":         apiKey(),
+		"x-api-key":         rc.apiKey(),
 		"anthropic-version": "2023-06-01",
 		"Accept":            "application/json",
 	}
 	if beta := r.Header.Get("anthropic-beta"); beta != "" {
 		headers["anthropic-beta"] = beta
 	}
-	return postUpstream(r.Context(), currentConfig().Upstream.AnthropicURL+"/v1/messages", body, headers)
+	return postUpstream(r.Context(), rc.anthropicMessagesURL(), body, headers, rc)
 }
 
 // containsImage reports whether any message in the request carries an image block
@@ -997,7 +1049,7 @@ func contentHasImage(v interface{}) bool {
 // conversation is asking instead of being a generic caption. Returns false when
 // the describe pass fails (e.g. upstream unavailable), in which case the caller
 // falls back to routing the unmodified request to the VLM model.
-func describeImages(req map[string]interface{}) bool {
+func describeImages(req map[string]interface{}, rc reqConfig) bool {
 	messages, hasMessages := req["messages"].([]interface{})
 	if !hasMessages {
 		return true
@@ -1010,24 +1062,24 @@ func describeImages(req map[string]interface{}) bool {
 			continue
 		}
 		ctx := messageContext(msg, toolUses)
-		if !describeContent(msg["content"], ctx) {
+		if !describeContent(msg["content"], ctx, rc) {
 			ok = false
 		}
 	}
 	return ok
 }
 
-func describeContent(v interface{}, ctx string) bool {
+func describeContent(v interface{}, ctx string, rc reqConfig) bool {
 	switch c := v.(type) {
 	case string:
 		return true
 	case []interface{}:
 		for i, item := range c {
-			if !describeBlock(item, ctx) {
+			if !describeBlock(item, ctx, rc) {
 				return false
 			}
 			if b, isMap := item.(map[string]interface{}); isMap && isImageBlock(b) {
-				block, ok := imageDescriptionBlock(b, ctx)
+				block, ok := imageDescriptionBlock(b, ctx, rc)
 				if !ok {
 					return false
 				}
@@ -1039,15 +1091,15 @@ func describeContent(v interface{}, ctx string) bool {
 	return true
 }
 
-func describeBlock(v interface{}, ctx string) bool {
+func describeBlock(v interface{}, ctx string, rc reqConfig) bool {
 	switch b := v.(type) {
 	case map[string]interface{}:
 		if isImageBlock(b) {
 			return true
 		}
-		return describeContent(b["content"], ctx)
+		return describeContent(b["content"], ctx, rc)
 	case []interface{}:
-		return describeContent(b, ctx)
+		return describeContent(b, ctx, rc)
 	}
 	return true
 }
@@ -1175,8 +1227,8 @@ func isImageBlock(b map[string]interface{}) bool {
 // context) and returns a text block carrying that description. ok is false when
 // the describe call failed, signalling the caller to fall back to VLM routing
 // instead of losing the image.
-func imageDescriptionBlock(b map[string]interface{}, ctx string) (block map[string]interface{}, ok bool) {
-	desc, ok := describeImageWithVLM(b, ctx)
+func imageDescriptionBlock(b map[string]interface{}, ctx string, rc reqConfig) (block map[string]interface{}, ok bool) {
+	desc, ok := describeImageWithVLM(b, ctx, rc)
 	if !ok {
 		return nil, false
 	}
@@ -1419,7 +1471,7 @@ func imageCacheKey(block map[string]interface{}, ctx string) (string, bool) {
 // message context and returns the model's description. The result is memoized by
 // image content hash AND context so repeated turns that resend the same image with
 // the same context reuse the description instead of re-calling VLM.
-func describeImageWithVLM(block map[string]interface{}, ctx string) (string, bool) {
+func describeImageWithVLM(block map[string]interface{}, ctx string, rc reqConfig) (string, bool) {
 	img := block
 	// OpenAI-style image_url with a data URL must be converted to an Anthropic
 	// image block, or the upstream rejects it. Non-data image_urls (remote URLs)
@@ -1449,8 +1501,8 @@ func describeImageWithVLM(block map[string]interface{}, ctx string) (string, boo
 	}
 
 	req := map[string]interface{}{
-		"model":      currentConfig().Proxy.VLMModel,
-		"max_tokens": currentConfig().Proxy.VLMMaxTokens,
+		"model":      rc.cfg.Proxy.VLMModel,
+		"max_tokens": rc.cfg.Proxy.VLMMaxTokens,
 		"messages": []interface{}{
 			map[string]interface{}{
 				"role": "user",
@@ -1466,16 +1518,16 @@ func describeImageWithVLM(block map[string]interface{}, ctx string) (string, boo
 		return "", false
 	}
 
-	httpReq, err := http.NewRequest("POST", currentConfig().Upstream.AnthropicURL+"/v1/messages", bytes.NewReader(body))
+	httpReq, err := http.NewRequest("POST", rc.anthropicMessagesURL(), bytes.NewReader(body))
 	if err != nil {
 		return "", false
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", apiKey())
+	httpReq.Header.Set("x-api-key", rc.apiKey())
 	httpReq.Header.Set("anthropic-version", "2023-06-01")
 	httpReq.Header.Set("Accept", "application/json")
 
-	resp, err := httpClient().Do(httpReq)
+	resp, err := rc.httpClient().Do(httpReq)
 	if err != nil {
 		log.Printf("[VLM] describe error: %v\n", err)
 		return "", false
@@ -2051,6 +2103,9 @@ type anthroSSE struct {
 	// OpenAI-compatible gateways only send when stream_options asks for it.
 	promptTok int
 	usageSeen bool
+	// streamErr holds an error the upstream reported as a stream event rather
+	// than as an HTTP status, so the caller can account for it as a failure.
+	streamErr string
 }
 
 // usage reports this stream's token counts. Without an upstream usage chunk the
@@ -2109,6 +2164,9 @@ func translateOpenAIStream(stream io.Reader, w io.Writer, model string) (tokenUs
 	}
 	if !c.finished {
 		c.finish("")
+	}
+	if c.streamErr != "" {
+		return c.usage(), fmt.Errorf("%w: %s", errUpstreamStream, c.streamErr)
 	}
 	return c.usage(), nil
 }
@@ -2183,6 +2241,9 @@ func (c *anthroSSE) handleChunk(d []byte) {
 			"error": map[string]interface{}{"type": "api_error", "message": msg},
 		})
 		c.finished = true
+		// Remember it so the caller accounts for this request as a failure; the
+		// error event has already been sent, so it is not emitted twice.
+		c.streamErr = msg
 		return
 	}
 	if len(chunk.Choices) == 0 {
@@ -2331,11 +2392,24 @@ func randHex(n int) string {
 	return hex.EncodeToString([]byte(fmt.Sprint(time.Now().UnixNano())))[:2*n]
 }
 
+// estimateMissingInput fills in the input token count when the upstream did not
+// report usage at all. Streaming gateways that ignore stream_options leave it
+// unknown, and reporting a hard zero would systematically understate both the
+// totals and TPM. The result stays marked unreported, so the model is shown as
+// estimated rather than passing the number off as exact.
+func estimateMissingInput(u tokenUsage, requestBody []byte) tokenUsage {
+	if u.Reported || u.Input > 0 {
+		return u
+	}
+	u.Input = estimateTokens(string(requestBody))
+	return u
+}
+
 // handleOpenAIRequest serves a request whose route targets the OpenAI gateway:
 // it translates the Anthropic body to OpenAI format, forwards it, and translates
 // the reply back into Anthropic framing (JSON or SSE events). tracker accounts
 // the call against the model it actually reaches.
-func handleOpenAIRequest(w http.ResponseWriter, r *http.Request, req map[string]interface{}, openAIModel string, tracker *reqStat) {
+func handleOpenAIRequest(w http.ResponseWriter, r *http.Request, req map[string]interface{}, openAIModel string, tracker *reqStat, rc reqConfig) {
 	out := anthropicToOpenAIRequest(req, openAIModel)
 	body, err := json.Marshal(out)
 	if err != nil {
@@ -2349,13 +2423,13 @@ func handleOpenAIRequest(w http.ResponseWriter, r *http.Request, req map[string]
 
 	headers := map[string]string{
 		"Content-Type":  "application/json",
-		"Authorization": "Bearer " + apiKey(),
+		"Authorization": "Bearer " + rc.apiKey(),
 		"Accept":        "application/json",
 	}
 	if stream {
 		headers["Accept"] = "text/event-stream"
 	}
-	resp, err := postUpstream(r.Context(), openAICompletionsURL(), body, headers)
+	resp, err := postUpstream(r.Context(), rc.openAICompletionsURL(), body, headers, rc)
 	if err != nil {
 		log.Printf("[RESP] openai error: %v\n", err)
 		tracker.failure(classifyError(err), 0, err.Error())
@@ -2388,18 +2462,18 @@ func handleOpenAIRequest(w http.ResponseWriter, r *http.Request, req map[string]
 		// The upstream body is bounded by bodyIdle: a stream that stops emitting
 		// (stalled model, dead connection) is cut with an Anthropic error event
 		// instead of leaving the client hanging.
-		usage, err := translateOpenAIStream(newIdleReader(resp.Body, bodyIdle()), fw, openAIModel)
+		usage, err := translateOpenAIStream(newIdleReader(resp.Body, rc.bodyIdle()), fw, openAIModel)
 		if err != nil {
 			log.Printf("[STREAM_END] openai stream error: %v\n", err)
 			tracker.failure(classifyError(err), resp.StatusCode, err.Error())
 			return
 		}
 		log.Printf("[STREAM_END] openai stream ok\n")
-		tracker.success(usage)
+		tracker.success(estimateMissingInput(usage, body))
 		return
 	}
 
-	respBody, err := io.ReadAll(newIdleReader(resp.Body, bodyIdle()))
+	respBody, err := io.ReadAll(newIdleReader(resp.Body, rc.bodyIdle()))
 	if err != nil {
 		log.Printf("[RESP] openai read error: %v\n", err)
 		tracker.failure(classifyError(err), resp.StatusCode, err.Error())
@@ -2540,10 +2614,11 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	model, _ := req["model"].(string)
 	tracker := stats.beginReqAt(startedAt, model, model, "openai")
 
-	resp, err := postUpstream(r.Context(), currentConfig().Upstream.OpenAIURL+"/v1/chat/completions", body, map[string]string{
+	rc := snapshotConfig()
+	resp, err := postUpstream(r.Context(), rc.openAICompletionsURL(), body, map[string]string{
 		"Content-Type":  "application/json",
-		"Authorization": "Bearer " + apiKey(),
-	})
+		"Authorization": "Bearer " + rc.apiKey(),
+	}, rc)
 	if err != nil {
 		log.Printf("[RESP] chat error: %v\n", err)
 		tracker.failure(classifyError(err), 0, err.Error())
@@ -2567,14 +2642,23 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 	captured := newBodyCapture(isSSE)
-	if _, err := io.Copy(io.MultiWriter(w, captured), newIdleReader(resp.Body, bodyIdle())); err != nil {
+	// A streaming gateway can report a failure as an event inside an HTTP 200
+	// response. Watching each line as it passes catches that without buffering
+	// the stream.
+	watcher := newSSEErrorWatcher(io.MultiWriter(w, captured))
+	if _, err := io.Copy(watcher, newIdleReader(resp.Body, rc.bodyIdle())); err != nil {
 		// Headers already committed; cut the connection so the client unblocks.
 		log.Printf("[RESP] chat body error: %v\n", err)
 		tracker.failure(classifyError(err), resp.StatusCode, err.Error())
 		return
 	}
+	if msg, isErr := watcher.Error(); isErr {
+		log.Printf("[RESP] chat upstream stream error: %s\n", truncate(msg, 200))
+		tracker.failure(catUpstreamStreamError, resp.StatusCode, msg)
+		return
+	}
 	if !captured.Complete() {
-		tracker.success(tokenUsage{})
+		tracker.success(tokenUsage{Input: estimateTokens(string(body))})
 		return
 	}
 	tracker.success(extractOpenAIUsage(captured.Bytes(), isSSE))
