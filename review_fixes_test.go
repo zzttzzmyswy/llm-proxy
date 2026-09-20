@@ -413,3 +413,53 @@ func TestReviewStoreConfigPublishesDeclaredRoutes(t *testing.T) {
 		t.Fatalf("declared routes must be published, got %q", got)
 	}
 }
+
+// P2: a failed save must not promise the config was left untouched. The backend
+// distinguishes a failed reload from a failed rollback, and a response lost in
+// flight cannot be told apart from a write that never happened.
+func TestReviewSaveFailureMessageDoesNotPromiseRollback(t *testing.T) {
+	page := string(adminHTML)
+	if strings.Contains(page, "配置未改动") {
+		t.Fatal("a save failure must not claim the config is unchanged")
+	}
+	if !strings.Contains(page, `"保存失败："`) {
+		t.Fatal("the save failure banner must keep the backend's own status text")
+	}
+}
+
+// P3: LLM_PROXY_ADMIN_TOKEN outranks the file, so clearing the file password
+// leaves the page open. The warning must describe that, not claim every /admin*
+// now returns 404.
+func TestReviewClearWarningRespectsEnvPassword(t *testing.T) {
+	withTempConfig(t, testConfigTOML)
+	t.Setenv("LLM_PROXY_ADMIN_TOKEN", "env-token")
+
+	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "env-token")
+	var view adminConfigView
+	decodeBody(t, w, &view)
+
+	p := payloadFromView(t, view)
+	p.Admin = adminAuthPayload{Action: "clear"}
+
+	var out struct {
+		Warnings []string `json:"warnings"`
+	}
+	res := postConfig(t, p, "env-token")
+	if res.Code != http.StatusOK {
+		t.Fatalf("clear failed: %d %s", res.Code, res.Body.String())
+	}
+	decodeBody(t, res, &out)
+
+	joined := strings.Join(out.Warnings, " | ")
+	if strings.Contains(joined, "管理页面现已关闭") || strings.Contains(joined, "404") {
+		t.Fatalf("the env password keeps the page open, got warnings: %v", out.Warnings)
+	}
+	if !strings.Contains(joined, "仍然生效") {
+		t.Fatalf("the warning must say the env password still applies, got: %v", out.Warnings)
+	}
+
+	// And the page really is still reachable with the environment password.
+	if w := adminCall(t, requireAdmin(handleAdminPage), http.MethodGet, "/admin", "", "env-token"); w.Code != http.StatusOK {
+		t.Fatalf("the env password must keep the page open, got %d", w.Code)
+	}
+}

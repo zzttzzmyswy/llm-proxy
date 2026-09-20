@@ -530,7 +530,7 @@
       document.getElementById("save-hint").textContent = "已保存 " + new Date().toLocaleTimeString("zh-CN");
       if (!res.reauth_required) refresh();
     } catch (err) {
-      banner("save-banner", "err", "保存失败（配置未改动）：" + err.message, true);
+      banner("save-banner", "err", "保存失败：" + err.message, true);
       document.getElementById("save-hint").textContent = "";
     } finally {
       btn.disabled = false;

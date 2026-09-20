@@ -357,10 +357,15 @@ func configWarnings(payload adminConfigPayload, old Config, droppedKeys []string
 	if os.Getenv("SOPHNET_API_KEY") != "" {
 		warnings = append(warnings, "环境变量 SOPHNET_API_KEY 已设置，它的优先级高于配置文件里的密钥。")
 	}
-	if os.Getenv("LLM_PROXY_ADMIN_TOKEN") != "" {
-		warnings = append(warnings, "环境变量 LLM_PROXY_ADMIN_TOKEN 已设置，它的优先级高于配置文件里的管理口令；在页面上修改口令不会生效。")
-	}
-	if payload.Admin.Action == "clear" {
+	if envAdminTok := os.Getenv("LLM_PROXY_ADMIN_TOKEN"); envAdminTok != "" {
+		if payload.Admin.Action == "clear" {
+			// An environment password outranks the file, so clearing the file
+			// does not close the page here and the warning must not claim it did.
+			warnings = append(warnings, "配置文件中的管理口令已清空，但环境变量 LLM_PROXY_ADMIN_TOKEN 仍然生效，管理页面保持开放。")
+		} else {
+			warnings = append(warnings, "环境变量 LLM_PROXY_ADMIN_TOKEN 已设置，它的优先级高于配置文件里的管理口令；在页面上修改口令不会生效。")
+		}
+	} else if payload.Admin.Action == "clear" {
 		warnings = append(warnings, "管理口令已清空：管理页面现已关闭，所有 /admin* 返回 404。如需重新启用，请在配置文件或 LLM_PROXY_ADMIN_TOKEN 中设置口令。")
 	}
 	return warnings

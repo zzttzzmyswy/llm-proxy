@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -36,7 +37,9 @@ const (
 )
 
 // truncateLabel bounds a client-supplied model or alias name, trimming to a rune
-// boundary so the retained label stays valid UTF-8.
+// boundary so the retained label stays valid UTF-8. The result is still a view
+// into the caller's string, so anything kept past the request must go through
+// retainLabel instead of being stored directly.
 func truncateLabel(s string) string {
 	if len(s) <= maxLabelLen {
 		return s
@@ -46,6 +49,18 @@ func truncateLabel(s string) string {
 		cut--
 	}
 	return s[:cut]
+}
+
+// retainLabel produces a label that is safe to keep for the lifetime of the
+// process: bounded in length and detached from the caller's backing array. A
+// truncated Go substring still points into the original allocation, so storing
+// one would let a single oversized client-supplied model name pin the whole
+// string in memory no matter how short the visible label is.
+func retainLabel(s string) string {
+	if s == "" {
+		return ""
+	}
+	return strings.Clone(truncateLabel(s))
 }
 
 // Failure categories surfaced by the admin page.
@@ -286,6 +301,10 @@ func (c *statsCollector) record(r *reqStat, u tokenUsage, category string, statu
 
 func (m *modelStats) noteErrorLocked(now time.Time, ev errorEvent) {
 	ev.Time = now
+	// The alias is client-supplied on the passthrough endpoint and can be
+	// arbitrarily large, so it is bounded and copied here — the one place both
+	// the failure and the warn path pass through.
+	ev.Alias = retainLabel(ev.Alias)
 	m.errors[ev.Category]++
 	m.recent = append(m.recent, ev)
 	if len(m.recent) > recentErrorLimit {
@@ -307,6 +326,10 @@ func (c *statsCollector) modelEntryLocked(model string) *modelStats {
 			return m
 		}
 	}
+	// Copying here rather than on every request keeps the steady state
+	// allocation-free while still detaching the stored key from the client's
+	// string; at most maxTrackedModels entries ever take this path.
+	model = strings.Clone(model)
 	m := &modelStats{model: model, aliases: map[string]int64{}, errors: map[string]int64{}}
 	c.models[model] = m
 	return m
@@ -314,16 +337,22 @@ func (c *statsCollector) modelEntryLocked(model string) *modelStats {
 
 // countAliasLocked records which client-facing name reached this model, keeping
 // the alias map bounded: once it is full, further distinct names fold into a
-// single bucket rather than growing the map per request.
+// single bucket rather than growing the map per request. Like the model key, a
+// new alias is copied so a long client string cannot be pinned by the map.
 func (m *modelStats) countAliasLocked(alias string) {
 	if alias == "" {
 		return
 	}
 	alias = truncateLabel(alias)
-	if _, seen := m.aliases[alias]; !seen && len(m.aliases) >= maxTrackedAliases {
-		alias = otherModelKey
+	if _, seen := m.aliases[alias]; seen {
+		m.aliases[alias]++
+		return
 	}
-	m.aliases[alias]++
+	if len(m.aliases) >= maxTrackedAliases {
+		m.aliases[otherModelKey]++
+		return
+	}
+	m.aliases[strings.Clone(alias)]++
 }
 
 // reset clears all counters and restarts the uptime clock.
