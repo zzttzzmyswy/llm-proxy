@@ -107,6 +107,17 @@ type adminKeysView struct {
 	SophnetFromEnv bool `json:"sophnet_from_env"`
 }
 
+// adminAuthView reports the state of the page's own password. The password is
+// never returned, only whether one is configured and which source wins.
+type adminAuthView struct {
+	// TokenSet is false when no password is configured, in which case the whole
+	// /admin subtree is closed.
+	TokenSet bool `json:"token_set"`
+	// TokenFromEnv is true when LLM_PROXY_ADMIN_TOKEN supplies the effective
+	// password, so a value saved into the file would not take effect.
+	TokenFromEnv bool `json:"token_from_env"`
+}
+
 type adminRoutingEntry struct {
 	Alias         string `json:"alias"`
 	Model         string `json:"model"`
@@ -115,12 +126,12 @@ type adminRoutingEntry struct {
 }
 
 type adminConfigView struct {
-	ConfigPath   string              `json:"config_path"`
-	AdminEnabled bool                `json:"admin_enabled"`
-	Proxy        adminProxyView      `json:"proxy"`
-	Upstream     adminUpstreamView   `json:"upstream"`
-	Keys         adminKeysView       `json:"keys"`
-	Routing      []adminRoutingEntry `json:"routing"`
+	ConfigPath string              `json:"config_path"`
+	Admin      adminAuthView       `json:"admin"`
+	Proxy      adminProxyView      `json:"proxy"`
+	Upstream   adminUpstreamView   `json:"upstream"`
+	Keys       adminKeysView       `json:"keys"`
+	Routing    []adminRoutingEntry `json:"routing"`
 }
 
 type adminKeysPayload struct {
@@ -130,10 +141,18 @@ type adminKeysPayload struct {
 	Sophnet string `json:"sophnet"`
 }
 
+type adminAuthPayload struct {
+	// Action is "keep" (default), "set" or "clear", with the same meaning as for
+	// the upstream key.
+	Action string `json:"token_action"`
+	Token  string `json:"token"`
+}
+
 type adminConfigPayload struct {
 	Proxy    adminProxyView      `json:"proxy"`
 	Upstream adminUpstreamView   `json:"upstream"`
 	Keys     adminKeysPayload    `json:"keys"`
+	Admin    adminAuthPayload    `json:"admin"`
 	Routing  []adminRoutingEntry `json:"routing"`
 }
 
@@ -161,8 +180,11 @@ func currentConfigView() adminConfigView {
 	}
 
 	return adminConfigView{
-		ConfigPath:   configPathFromEnv(),
-		AdminEnabled: adminToken() != "",
+		ConfigPath: configPathFromEnv(),
+		Admin: adminAuthView{
+			TokenSet:     adminToken() != "",
+			TokenFromEnv: os.Getenv("LLM_PROXY_ADMIN_TOKEN") != "",
+		},
 		Proxy: adminProxyView{
 			Port:         c.Proxy.Port,
 			VLMModel:     c.Proxy.VLMModel,
@@ -199,10 +221,6 @@ func handleAdminConfigSave(w http.ResponseWriter, r *http.Request) {
 	path := configPathFromEnv()
 	oldConfig := currentConfig()
 
-	// The admin token is not editable from the page, so it is carried over
-	// verbatim rather than silently dropped by the rewrite.
-	adminTok := oldConfig.Admin.Token
-
 	newKey := oldConfig.Keys.Sophnet
 	switch payload.Keys.Action {
 	case "set":
@@ -211,7 +229,17 @@ func handleAdminConfigSave(w http.ResponseWriter, r *http.Request) {
 		newKey = ""
 	}
 
-	rendered := renderConfigTOML(payload, adminTok, newKey)
+	// The admin password is editable from the page. "keep" carries the stored
+	// value over verbatim so a save never silently drops it.
+	newAdminTok := oldConfig.Admin.Token
+	switch payload.Admin.Action {
+	case "set":
+		newAdminTok = payload.Admin.Token
+	case "clear":
+		newAdminTok = ""
+	}
+
+	rendered := renderConfigTOML(payload, newAdminTok, newKey)
 
 	// Parse before writing: a config file that cannot be read would take the
 	// proxy down on its next restart.
@@ -245,9 +273,14 @@ func handleAdminConfigSave(w http.ResponseWriter, r *http.Request) {
 
 	warnings := configWarnings(payload, oldConfig, dropped)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ok":       true,
-		"config":   currentConfigView(),
-		"warnings": warnings,
+		"ok":     true,
+		"config": currentConfigView(),
+		// The browser is still holding the old password, so it has to
+		// re-authenticate before the page can talk to the API again. A password
+		// supplied by the environment cannot change from here, so it needs no
+		// re-auth.
+		"reauth_required": newAdminTok != oldConfig.Admin.Token && os.Getenv("LLM_PROXY_ADMIN_TOKEN") == "",
+		"warnings":        warnings,
 	})
 }
 
@@ -272,6 +305,12 @@ func configWarnings(payload adminConfigPayload, old Config, droppedKeys []string
 	}
 	if os.Getenv("SOPHNET_API_KEY") != "" {
 		warnings = append(warnings, "环境变量 SOPHNET_API_KEY 已设置，它的优先级高于配置文件里的密钥。")
+	}
+	if os.Getenv("LLM_PROXY_ADMIN_TOKEN") != "" {
+		warnings = append(warnings, "环境变量 LLM_PROXY_ADMIN_TOKEN 已设置，它的优先级高于配置文件里的管理口令；在页面上修改口令不会生效。")
+	}
+	if payload.Admin.Action == "clear" {
+		warnings = append(warnings, "管理口令已清空：管理页面现已关闭，所有 /admin* 返回 404。如需重新启用，请在配置文件或 LLM_PROXY_ADMIN_TOKEN 中设置口令。")
 	}
 	return warnings
 }
@@ -304,6 +343,18 @@ func validateConfigPayload(p *adminConfigPayload) error {
 	}
 	if p.Keys.Action == "set" && p.Keys.Sophnet == "" {
 		return fmt.Errorf("sophnet_action 为 set 时密钥不能为空（如需清空请用 clear）")
+	}
+
+	switch p.Admin.Action {
+	case "", "keep", "set", "clear":
+	default:
+		return fmt.Errorf("token_action 只能是 keep、set 或 clear")
+	}
+	if p.Admin.Action == "set" && p.Admin.Token == "" {
+		return fmt.Errorf("token_action 为 set 时管理口令不能为空（如需关闭管理页面请用 clear）")
+	}
+	if hasControlChars(p.Admin.Token) {
+		return fmt.Errorf("管理口令含非法控制字符")
 	}
 
 	seen := map[string]bool{}

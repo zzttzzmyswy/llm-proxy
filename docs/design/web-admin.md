@@ -47,6 +47,13 @@
 
 密钥字段特殊处理：接口从不回传明文，只回传 `sophnet_set`（是否已配置）与 `sophnet_from_env`（是否来自环境变量）。提交时用 `sophnet_action: "keep" | "set" | "clear"` 三态显式表达意图，避免"空字符串到底是不改还是清空"的歧义。
 
+**管理页面口令同样在页面上可改**，用同一套 `admin.token_action: "keep" | "set" | "clear"` 三态。两个后果需要处理：
+
+- 改口令后浏览器手里的旧凭据立即失效。保存响应带 `reauth_required`，页面据此停止轮询、提示并刷新，让浏览器重新弹认证框。
+- 口令来自 `LLM_PROXY_ADMIN_TOKEN` 时，写文件不起作用。此时 `reauth_required` 为 false，并在告警里说明环境变量优先。
+
+`clear` 会清空口令，管理页面随即关闭（`/admin*` 全部 404），页面会明确告知这一点。
+
 ### 4. 热重载：RWMutex + 访问器，不原地改全局
 
 现状：`cfg` / `routeTargets` 是裸全局，请求路径直接读；现有测试也直接读写这两个全局。

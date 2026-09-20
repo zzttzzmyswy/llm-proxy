@@ -342,9 +342,9 @@ func TestAdminConfigKeyActions(t *testing.T) {
 	}
 }
 
-// The admin token is not editable from the page, so a save must carry it over
-// rather than locking the operator out.
-func TestAdminConfigSavePreservesAdminToken(t *testing.T) {
+// The admin token is editable from the page, but a save that does not ask to
+// change it must carry it over rather than locking the operator out.
+func TestAdminConfigSaveKeepsAdminTokenByDefault(t *testing.T) {
 	path := withTempConfig(t, testConfigTOML)
 
 	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
@@ -365,6 +365,144 @@ func TestAdminConfigSavePreservesAdminToken(t *testing.T) {
 	// And the page is still reachable with the same password.
 	if w := adminCall(t, requireAdmin(handleAdminPage), http.MethodGet, "/admin", "", "s3cret"); w.Code != http.StatusOK {
 		t.Fatalf("the page must still accept the unchanged password, got %d", w.Code)
+	}
+}
+
+func TestAdminConfigViewReportsAdminTokenState(t *testing.T) {
+	withTempConfig(t, testConfigTOML)
+
+	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
+	var view adminConfigView
+	decodeBody(t, w, &view)
+	if !view.Admin.TokenSet {
+		t.Fatal("the page must know a password is configured")
+	}
+	if view.Admin.TokenFromEnv {
+		t.Fatal("no env password is set in this test")
+	}
+	if strings.Contains(w.Body.String(), "s3cret") {
+		t.Fatal("the admin password must never be returned to the page")
+	}
+
+	t.Setenv("LLM_PROXY_ADMIN_TOKEN", "env-token")
+	w = adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "env-token")
+	decodeBody(t, w, &view)
+	if !view.Admin.TokenFromEnv {
+		t.Fatal("the page must report when the env var supplies the password")
+	}
+}
+
+// set replaces the password and makes the old one stop working; clear closes the
+// page entirely.
+func TestAdminConfigAdminTokenActions(t *testing.T) {
+	path := withTempConfig(t, testConfigTOML)
+	readToken := func(t *testing.T) string {
+		t.Helper()
+		data, _ := os.ReadFile(path)
+		var c Config
+		if err := toml.Unmarshal(data, &c); err != nil {
+			t.Fatal(err)
+		}
+		return c.Admin.Token
+	}
+
+	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
+	var view adminConfigView
+	decodeBody(t, w, &view)
+
+	p := payloadFromView(t, view)
+	p.Admin = adminAuthPayload{Action: "set", Token: "new-secret"}
+	res := postConfig(t, p, "s3cret")
+	if res.Code != http.StatusOK {
+		t.Fatalf("set failed: %s", res.Body.String())
+	}
+	if got := readToken(t); got != "new-secret" {
+		t.Fatalf("set must store the new password, got %q", got)
+	}
+	if w := adminCall(t, requireAdmin(handleAdminPage), http.MethodGet, "/admin", "", "new-secret"); w.Code != http.StatusOK {
+		t.Fatalf("the new password must authenticate, got %d", w.Code)
+	}
+	if w := adminCall(t, requireAdmin(handleAdminPage), http.MethodGet, "/admin", "", "s3cret"); w.Code != http.StatusUnauthorized {
+		t.Fatalf("the old password must stop working, got %d", w.Code)
+	}
+
+	// clear disables the page: requireAdmin then 404s.
+	p = payloadFromView(t, view)
+	p.Admin = adminAuthPayload{Action: "clear"}
+	if res := postConfig(t, p, "new-secret"); res.Code != http.StatusOK {
+		t.Fatalf("clear failed: %s", res.Body.String())
+	}
+	if got := readToken(t); got != "" {
+		t.Fatalf("clear must empty the password, got %q", got)
+	}
+	if w := adminCall(t, requireAdmin(handleAdminPage), http.MethodGet, "/admin", "", "new-secret"); w.Code != http.StatusNotFound {
+		t.Fatalf("a cleared password must close the page with 404, got %d", w.Code)
+	}
+}
+
+// Changing the password invalidates the credentials the browser is still
+// holding, so the page has to be told to re-authenticate. A password supplied by
+// the environment cannot change from the page, so it needs no re-auth.
+func TestAdminConfigSaveReportsReauthRequired(t *testing.T) {
+	withTempConfig(t, testConfigTOML)
+
+	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
+	var view adminConfigView
+	decodeBody(t, w, &view)
+
+	var out struct {
+		ReauthRequired bool     `json:"reauth_required"`
+		Warnings       []string `json:"warnings"`
+	}
+
+	res := postConfig(t, payloadFromView(t, view), "s3cret")
+	decodeBody(t, res, &out)
+	if out.ReauthRequired {
+		t.Fatal("a save that keeps the password must not ask for re-auth")
+	}
+
+	p := payloadFromView(t, view)
+	p.Admin = adminAuthPayload{Action: "set", Token: "rotated"}
+	decodeBody(t, postConfig(t, p, "s3cret"), &out)
+	if !out.ReauthRequired {
+		t.Fatal("changing the password must ask the browser to re-authenticate")
+	}
+
+	// With the env var in charge, a file edit has no effect, so no re-auth.
+	view = adminConfigView{}
+	w = adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
+	decodeBody(t, w, &view)
+	t.Setenv("LLM_PROXY_ADMIN_TOKEN", "env-token")
+	p = payloadFromView(t, view)
+	p.Admin = adminAuthPayload{Action: "set", Token: "ignored"}
+	decodeBody(t, postConfig(t, p, "env-token"), &out)
+	if out.ReauthRequired {
+		t.Fatal("a password supplied by the environment cannot change, so no re-auth is needed")
+	}
+	if !strings.Contains(strings.Join(out.Warnings, " | "), "LLM_PROXY_ADMIN_TOKEN") {
+		t.Fatalf("the env override must be reported, got %v", out.Warnings)
+	}
+}
+
+func TestAdminConfigRejectsEmptyAdminTokenSet(t *testing.T) {
+	path := withTempConfig(t, testConfigTOML)
+	before, _ := os.ReadFile(path)
+
+	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
+	var view adminConfigView
+	decodeBody(t, w, &view)
+
+	for _, action := range []string{"set", "wipe"} {
+		p := payloadFromView(t, view)
+		p.Admin = adminAuthPayload{Action: action, Token: ""}
+		res := postConfig(t, p, "s3cret")
+		if res.Code != http.StatusBadRequest {
+			t.Fatalf("action %q must be rejected, got %d %s", action, res.Code, res.Body.String())
+		}
+	}
+	after, _ := os.ReadFile(path)
+	if string(after) != string(before) {
+		t.Fatal("a rejected save must leave the config file untouched")
 	}
 }
 

@@ -149,6 +149,16 @@
           <div class="chk"><input type="checkbox" id="cfg-key-clear"><label for="cfg-key-clear">清除已保存的密钥</label></div>
         </div>
       </div>
+      <div class="form-body" style="border-top:1px solid var(--border)">
+        <div class="grid">
+          <div>
+            <label>管理页面口令</label>
+            <input type="password" id="cfg-admin-token" placeholder="留空则保持原口令不变" autocomplete="new-password">
+            <div class="hint" id="cfg-admin-hint"></div>
+          </div>
+          <div class="chk"><input type="checkbox" id="cfg-admin-clear"><label for="cfg-admin-clear">清除口令（关闭管理页面）</label></div>
+        </div>
+      </div>
       <div style="border-top:1px solid var(--border)">
         <div class="form-body" style="padding-bottom:8px; display:flex; align-items:center;">
           <strong style="font-size:13px">模型路由表</strong>
@@ -165,7 +175,7 @@
         <span class="hint" id="save-hint" style="margin:0"></span>
       </div>
     </div>
-    <div class="hint">保存会先备份为 <code>&lt;配置文件&gt;.bak.&lt;时间戳&gt;</code>，再原子写入并立即生效（端口变更除外，需重启服务）。管理页面口令不在表单内，请在配置文件或 <code>LLM_PROXY_ADMIN_TOKEN</code> 中修改。</div>
+    <div class="hint">保存会先备份为 <code>&lt;配置文件&gt;.bak.&lt;时间戳&gt;</code>，再原子写入并立即生效（端口变更除外，需重启服务）。</div>
   </section>
 </main>
 
@@ -393,6 +403,12 @@
       : (cfg.keys.sophnet_set ? "已配置（不回显明文）" : "未配置");
     document.getElementById("cfg-key-hint").textContent = hint;
 
+    document.getElementById("cfg-admin-token").value = "";
+    document.getElementById("cfg-admin-clear").checked = false;
+    document.getElementById("cfg-admin-hint").textContent = cfg.admin.token_from_env
+      ? "已通过环境变量 LLM_PROXY_ADMIN_TOKEN 配置（优先级高于此处，在此修改不会生效）"
+      : (cfg.admin.token_set ? "已配置（不回显明文）。修改后需用新口令重新登录。" : "未配置：管理页面当前已关闭");
+
     var host = document.getElementById("routes");
     host.innerHTML = "";
     (cfg.routing || []).forEach(function (e) { host.appendChild(routeRow(e)); });
@@ -421,6 +437,15 @@
       keyValue = document.getElementById("cfg-sophnet").value;
     }
 
+    var tokenAction = "keep";
+    var tokenValue = "";
+    if (document.getElementById("cfg-admin-clear").checked) {
+      tokenAction = "clear";
+    } else if (document.getElementById("cfg-admin-token").value !== "") {
+      tokenAction = "set";
+      tokenValue = document.getElementById("cfg-admin-token").value;
+    }
+
     return {
       proxy: {
         port: parseInt(document.getElementById("cfg-port").value, 10) || 0,
@@ -436,6 +461,7 @@
         max_retries: parseInt(document.getElementById("cfg-max-retries").value, 10) || 0
       },
       keys: { sophnet_action: keyAction, sophnet: keyValue },
+      admin: { token_action: tokenAction, token: tokenValue },
       routing: routing
     };
   }
@@ -460,10 +486,20 @@
       });
       renderConfig(res.config);
       var warns = res.warnings || [];
-      if (warns.length) banner("warnbox", "已保存并生效。\n· " + warns.join("\n· "));
-      else banner("ok", "已保存并生效。");
+      if (res.reauth_required) {
+        // The old password no longer authenticates, so stop polling and reload
+        // to let the browser prompt for the new one.
+        setAuto(false);
+        banner("warnbox", "配置已保存。" + (warns.length ? "\n· " + warns.join("\n· ") : "") +
+          "\n管理口令已更新，页面即将刷新，请用新口令登录。");
+        setTimeout(function () { location.reload(); }, 2500);
+      } else if (warns.length) {
+        banner("warnbox", "已保存并生效。\n· " + warns.join("\n· "));
+      } else {
+        banner("ok", "已保存并生效。");
+      }
       document.getElementById("save-hint").textContent = "已保存 " + new Date().toLocaleTimeString("zh-CN");
-      refresh();
+      if (!res.reauth_required) refresh();
     } catch (err) {
       banner("err", "保存失败（配置未改动）：" + err.message);
       document.getElementById("save-hint").textContent = "";
@@ -495,6 +531,9 @@
   });
   document.getElementById("cfg-key-clear").addEventListener("change", function () {
     if (this.checked) document.getElementById("cfg-sophnet").value = "";
+  });
+  document.getElementById("cfg-admin-clear").addEventListener("change", function () {
+    if (this.checked) document.getElementById("cfg-admin-token").value = "";
   });
 
   setAuto(true);
