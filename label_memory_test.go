@@ -115,3 +115,57 @@ func TestRetainedLabelsDoNotPinOversizedStrings(t *testing.T) {
 		t.Fatalf("label truncation retains the original oversized string allocations")
 	}
 }
+
+// P1: bumping an alias that is already tracked must not write the map. A Go map
+// assignment stores the key it is handed even when that key is already present,
+// so an `m.aliases[alias]++` on the update path would put this request's
+// substring back and undo the copy made on insert.
+func TestExistingAliasBumpKeepsCopiedKey(t *testing.T) {
+	c := newStatsCollector()
+	prefix := strings.Repeat("a", maxLabelLen)
+	c.beginReq(prefix, "model", "openai").success(tokenUsage{Reported: true})
+
+	raw := prefix + strings.Repeat("x", 1<<20)
+	c.beginReq(raw, "model", "openai").success(tokenUsage{Reported: true})
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	m := c.models["model"]
+	if m == nil || len(m.aliases) != 1 {
+		t.Fatalf("expected one alias bucket, got %d", len(m.aliases))
+	}
+	for key, counter := range m.aliases {
+		if counter.n != 2 {
+			t.Fatalf("alias count=%d, want 2", counter.n)
+		}
+		if sharesStorage(key, raw) {
+			t.Fatalf("bumping an existing alias replaced its copied key with the client's %d-byte string", len(raw))
+		}
+	}
+}
+
+// The same defect at scale: a short alias seen first, then the same truncated
+// prefix arriving inside a 1MiB client string on every subsequent request.
+func TestRepeatedAliasBumpsDoNotPinOversizedStrings(t *testing.T) {
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	c := newStatsCollector()
+	for i := 0; i < 32; i++ {
+		prefix := fmt.Sprintf("alias-%03d-", i) + strings.Repeat("a", maxLabelLen-10)
+		c.beginReq(prefix, "model", "openai").success(tokenUsage{Reported: true})
+		c.beginReq(prefix+strings.Repeat("x", 1<<20), "model", "openai").success(tokenUsage{Reported: true})
+	}
+
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	runtime.KeepAlive(c)
+
+	retained := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+	t.Logf("32 aliases bumped with oversized client strings retain %d bytes after GC", retained)
+	if retained > 16<<20 {
+		t.Fatalf("bumping an existing alias pins the client's oversized string")
+	}
+}

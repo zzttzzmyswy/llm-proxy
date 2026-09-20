@@ -135,10 +135,16 @@ type errorEvent struct {
 	Message  string    `json:"message,omitempty"`
 }
 
+// aliasCounter is held by pointer so bumping an alias that is already tracked
+// needs no map write. A Go map assignment stores the key it is handed even when
+// that key is already present, so `m.aliases[alias]++` would put the current
+// request's substring back into the map and pin the client's allocation again.
+type aliasCounter struct{ n int64 }
+
 type modelStats struct {
 	model    string
 	upstream string
-	aliases  map[string]int64
+	aliases  map[string]*aliasCounter
 
 	requests   int64
 	successes  int64
@@ -330,29 +336,37 @@ func (c *statsCollector) modelEntryLocked(model string) *modelStats {
 	// allocation-free while still detaching the stored key from the client's
 	// string; at most maxTrackedModels entries ever take this path.
 	model = strings.Clone(model)
-	m := &modelStats{model: model, aliases: map[string]int64{}, errors: map[string]int64{}}
+	m := &modelStats{model: model, aliases: map[string]*aliasCounter{}, errors: map[string]int64{}}
 	c.models[model] = m
 	return m
 }
 
 // countAliasLocked records which client-facing name reached this model, keeping
 // the alias map bounded: once it is full, further distinct names fold into a
-// single bucket rather than growing the map per request. Like the model key, a
-// new alias is copied so a long client string cannot be pinned by the map.
+// single bucket rather than growing the map per request.
+//
+// Only an insert writes the map, and an insert always writes a detached key, so
+// no client-supplied string is ever stored. Existing entries are bumped through
+// their pointer instead, which keeps the steady state allocation-free and stops
+// the key from being replaced by a later request's substring.
 func (m *modelStats) countAliasLocked(alias string) {
 	if alias == "" {
 		return
 	}
 	alias = truncateLabel(alias)
-	if _, seen := m.aliases[alias]; seen {
-		m.aliases[alias]++
+	if c, seen := m.aliases[alias]; seen {
+		c.n++
 		return
 	}
 	if len(m.aliases) >= maxTrackedAliases {
-		m.aliases[otherModelKey]++
+		if c, seen := m.aliases[otherModelKey]; seen {
+			c.n++
+			return
+		}
+		m.aliases[otherModelKey] = &aliasCounter{n: 1}
 		return
 	}
-	m.aliases[strings.Clone(alias)]++
+	m.aliases[strings.Clone(alias)] = &aliasCounter{n: 1}
 }
 
 // reset clears all counters and restarts the uptime clock.
@@ -453,7 +467,7 @@ func (m *modelStats) snapshotLocked(now time.Time) modelSnapshot {
 	ms := modelSnapshot{
 		Model:        m.model,
 		Upstream:     m.upstream,
-		Aliases:      copyInt64Map(m.aliases),
+		Aliases:      copyAliasCounts(m.aliases),
 		Estimated:    m.estimated,
 		Requests:     m.requests,
 		Successes:    m.successes,
@@ -479,6 +493,18 @@ func copyInt64Map(in map[string]int64) map[string]int64 {
 	out := make(map[string]int64, len(in))
 	for k, v := range in {
 		out[k] = v
+	}
+	return out
+}
+
+// copyAliasCounts flattens the per-alias counters into the plain map the
+// snapshot serialises.
+func copyAliasCounts(in map[string]*aliasCounter) map[string]int64 {
+	out := make(map[string]int64, len(in))
+	for k, v := range in {
+		if v != nil {
+			out[k] = v.n
+		}
 	}
 	return out
 }
