@@ -739,7 +739,7 @@ func TestAPIKeyFromEnvOverridesConfig(t *testing.T) {
 	cfg.Keys.Sophnet = "file-key"
 	t.Cleanup(func() { cfg.Keys.Sophnet = "" })
 
-	got := apiKey()
+	got := snapshotConfig().apiKey()
 	if got != "env-key-123" {
 		t.Fatalf("SOPHNET_API_KEY should override config key, got %q", got)
 	}
@@ -751,7 +751,7 @@ func TestAPIKeyFallsBackToConfig(t *testing.T) {
 	cfg.Keys.Sophnet = "file-key"
 	t.Cleanup(func() { cfg.Keys.Sophnet = "" })
 
-	if got := apiKey(); got != "file-key" {
+	if got := snapshotConfig().apiKey(); got != "file-key" {
 		t.Fatalf("config key should be used when env var is empty, got %q", got)
 	}
 }

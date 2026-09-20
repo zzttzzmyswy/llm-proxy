@@ -52,6 +52,51 @@ Claude Code 默认只认 Anthropic 官方模型名（`sonnet` / `opus` / `haiku`
 | 瞬态重试 | 上游网络错误（超时/连接重置/EOF）或 429/5xx 自动重试（默认 2 次，退避 0.5s/1s/2s），重试耗尽可能的 5xx 原样返回 |
 | 错误帧格式 | 上游失败时非流返回 Anthropic error JSON envelope、流式返回 SSE `error` 事件，客户端可解析而不会悬置 |
 | 密钥安全 | 支持 `SOPHNET_API_KEY` 环境变量，无需明文落盘 |
+| Web 管理页面 | `/admin`：可视化修改配置（改完立即生效）+ 查看各模型调用情况（TPM/RPM、失败率、失败分类与明细、延迟）。HTTP Basic 认证，未配置口令时整体关闭 |
+
+## Web 管理页面
+
+浏览器打开 `http://<host>:8088/admin`，用配置里的 `[admin] token` 作为口令（HTTP Basic，用户名任意）。
+
+页面分三块：
+
+- **总览 / 模型调用情况**：每个模型一行，含请求数、成功/失败、失败率、TPM（最近 60 秒 token）、RPM（最近 60 秒请求）、输入/输出 token 累计、平均与最大延迟，以及最近 30 分钟每分钟 token 的迷你趋势图。按实际发给上游的模型名聚合，并列出打到该模型的别名分布。
+- **失败情况**：按分类（`upstream_5xx` / `rate_limited` / `upstream_4xx` / `network_timeout` / `network_error` / `empty_response` / `stream_stalled` / `upstream_stream_error` / `translate_error` / `vlm_describe_failed`）计数，并列出最近失败的时间、模型、别名、分类、状态码与消息。网关在 HTTP 200 的流内以 `error` 事件报的错也会计入 `upstream_stream_error`，不会被当成成功。
+- **配置**：结构化表单编辑代理参数、上游地址与超时、上游密钥、管理页面口令、`[routing]` 路由表（可增删改）。保存后**立即生效**（进程内热重载），无需重启服务。表单编辑的是**文件里声明的**路由，另有只读的「生效路由」展示回填默认网关与内置兜底之后每个别名实际走哪个模型——这样修改 `default_upstream` 会真正影响那些没有显式声明网关的条目。
+
+### 启用
+
+```toml
+[admin]
+token = "your-admin-password"
+```
+
+或用环境变量（推荐，避免明文落盘）：
+
+```bash
+export LLM_PROXY_ADMIN_TOKEN="your-admin-password"
+```
+
+`token` 留空时管理页面**整体关闭**，所有 `/admin*` 返回 404——代理监听在可路由地址上，匿名可用的配置编辑器会把上游密钥和路由表暴露给整个网段。环境变量 `LLM_PROXY_ADMIN_TOKEN` 非空时例外：它优先于文件，此时文件里 `token` 为空也不影响页面开放。
+
+### 保存行为
+
+保存配置时：
+
+1. 校验（端口范围、URL、路由别名与模型名、`upstream` 取值）；不合法直接拒绝，配置文件不动。
+2. 把当前配置备份为 `<配置文件>.bak.<时间戳>`。
+3. 生成带说明注释的 TOML，先写临时文件再原子替换。
+4. 重新加载并热切换。
+
+> **取舍**：重写会**丢失原文件里手写的注释与注释掉的备选路由**（生成的文件带标准注释，但你的自定义注释不会保留）。备份文件是回滚路径。原文件中管理页面不认识的顶层字段也会被丢弃，保存时会在页面上明确告警。
+>
+> **管理页面口令可以在页面上修改**（留空则保持不变，勾选「清除口令」则关闭管理页面）。修改口令后当前页面持有的旧凭据失效，页面会自动刷新并提示用新口令重新登录。若口令来自 `LLM_PROXY_ADMIN_TOKEN`，页面上改不动它，保存时会告警；此时勾选「清除口令」只清空文件里的口令，页面仍由环境变量保持开放，告警会如实说明这一点。
+>
+> **端口变更不会热生效**，保存时页面会提示需重启服务；其余配置项立即生效。
+
+### 统计口径
+
+统计是**进程内内存态**，重启清零。token 用量优先取上游返回的 `usage`；OpenAI 网关的流式响应若未返回 usage（网关未支持 `stream_options.include_usage`），该模型的 token 数为按文本长度估算，页面会标「估算」标记，不把估算值伪装成精确值。
 
 ## 架构
 
@@ -59,8 +104,9 @@ Claude Code 默认只认 Anthropic 官方模型名（`sonnet` / `opus` / `haiku`
 Claude Code ──HTTP──> llm-proxy (:8088) ──HTTP──> 上游 anthropic/openai 端点
                           │
                           ├─ 文字请求 → 按模型名映射到文本目标模型
-                          └─ 带图请求 → VLM 描述后插入文本，再发文本模型
-                                          └─ 描述按图片哈希缓存（20MB LRU）
+                          ├─ 带图请求 → VLM 描述后插入文本，再发文本模型
+                          │               └─ 描述按图片哈希缓存（20MB LRU）
+                          └─ /admin    → Web 管理页面（配置热重载 + 调用统计）
 ```
 
 ## 快速开始
@@ -134,6 +180,7 @@ export ANTHROPIC_AUTH_TOKEN="<任意值，代理会替换为真实上游密钥>"
 | `upstream.body_idle_seconds` | `90` | 读取上游响应体允许的最长静默时间(秒)。流式上游中途停住时向客户端发 SSE `error` 事件终止,避免 Claude Code 永久等待 |
 | `upstream.max_retries` | `2` | 瞬态网络错误(超时/连接重置/EOF)或 429/5xx 时的额外重试次数(总尝试 = `max_retries` + 1,退避 0.5s/1s/2s) |
 | `keys.sophnet` | — | 上游密钥（可用 `SOPHNET_API_KEY` 覆盖） |
+| `admin.token` | `""`（管理页面关闭） | Web 管理页面口令，HTTP Basic 用（可用 `LLM_PROXY_ADMIN_TOKEN` 覆盖）。留空 = `/admin*` 全部 404 |
 | `routing.sonnet` | `DeepSeek-V4-Pro` | `sonnet` 映射目标(字符串 = 默认网关,或表值选网关) |
 | `routing.opus` | `GLM-5.2` | `opus` 映射目标 |
 | `routing.haiku` | 沿用 `sonnet` | `haiku` 映射目标 |
@@ -152,6 +199,8 @@ go test ./...
 
 覆盖：文本/图像/`image_url` 路由、图像经 VLM 描述后插入文本并路由到文本模型、VLM 描述请求携带带图消息的上下文（角色/同消息文本）、`tool_result` 内图片带出工具名与入参、嵌套 `tool_result` 图片替换、多图逐一描述、同图不同上下文不共用缓存描述、VLM 描述失败回退到 VLM、描述缓存（同图同上下文跨请求命中、异图不混淆、超限淘汰、不可缓存 URL）、haiku 显式路由与缺省回退、非流式 JSON 原样透传、SSE 安全网补帧与去重、stripThinking 剥离时禁用 thinking 参数、损坏 thinking 块规范化（缺失的 `thinking` 字段补空串且不改动其余块）、OpenAI 网关路由（`[routing]` 表值解析、Anthropic→OpenAI 请求翻译的纯文本/图片/工具调用/thinking 剥离、OpenAI→Anthropic 非流式回复与错误透传、流式 SSE 文本与工具调用事件序列、`openai_url` 全端点去重）、image 能力声明（表值 `supports_image` 解析、带图请求跳过 VLM 直发目标/翻译为 `image_url`、image 400 透传不重试）、默认网关（`default_upstream = "openai"` 回填所有未显式声明 upstream 的条目且请求实际走 OpenAI 网关、显式 `upstream = "anthropic"` 不被覆盖、缺省保持 claude/anthropic 网关）、超时与重试（上游 header 超时自动重试成功后客户端拿到正常回复、重试耗尽返回 502 + Anthropic error JSON envelope、流式上游中途停滞发 SSE `error` 事件终止、`/v1/chat/completions` 透传对 503 重试、超时配置默认值、`isRetryableError`/`isRetryableStatus` 分类）、环境变量覆盖配置路径与密钥。
 
+Web 管理页面部分覆盖：用量提取（Anthropic/OpenAI 的非流式与流式 `usage`，缺失 usage 时不伪造精确值，尾部缓冲与有界缓冲的边界）、统计采集（请求/失败计数、失败率、别名分布、延迟均值与峰值、TPM/RPM 的 60 秒窗口边界、30 分钟分桶、模型数上限溢出、`warn` 不计请求数、每条请求只发布一次、reset）、保留标签的内存边界（模型桶键/别名表键/失败与 `warn` 明细的 `alias` 都不得指向客户端原字符串，用 `unsafe.StringData` 断言而非只看长度；覆盖首次插入与"已有别名被重复计数"两条路径；32 个 1MiB 模型名、32 个被重复计数的别名在 GC 后的保留堆内存）、请求路径埋点（Anthropic 非流式与流式、上游 5xx 与不可达、空响应、OpenAI 网关路由、`/v1/chat/completions` 透传、热重载后路由跟随变化）、管理端（未配置口令时 404、认证失败 401、环境变量口令优先、配置读接口密钥脱敏、保存落盘 + 备份 + 热重载生效、非法输入不落盘、密钥 keep/set/clear 三态、保存保留管理口令、口令三态、端口变更与未声明别名与未知顶层字段的告警、环境变量口令生效时 clear 告警不误称页面已关闭、保存失败提示不承诺配置未改动、重载失败回滚、生成 TOML 的往返解析）。
+
 ## 日志
 
 ```bash
@@ -162,6 +211,9 @@ sudo journalctl -u llm-proxy -f
 
 - 上游模型（如 DeepSeek-V4-Pro）实际上下文上限远低于 Claude 的 `[1m]` 上下文窗口；`[1m]` 后缀只影响 Claude Code 的上下文管理，不改变上游限制
 - `/v1/chat/completions` 为原样透传，不做模型路由（如需请自行扩展）
+- 管理页面的调用统计是进程内内存态，重启清零；只保留最近 30 分钟的分钟级趋势，失败明细每个模型最多 50 条
+- 统计里的模型名与别名来自客户端请求，页面上按 128 字节截断显示；模型数封顶 128、每个模型的别名数封顶 64，超出归入 `(other)`
+- 管理页面保存配置会重写整个文件，原文件里手写的注释与注释掉的备选路由不会保留（每次保存前有 `.bak.<时间戳>` 备份）
 
 ## 许可证
 

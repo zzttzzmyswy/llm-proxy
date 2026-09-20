@@ -35,6 +35,15 @@ openai_url = "https://www.sophnet.com/api/open-apis/openai"
 # Alternative: export SOPHNET_API_KEY=... and leave this empty.
 sophnet = ""
 
+[admin]
+# Web 管理页面口令（HTTP Basic，用户名任意，口令即此值）。页面地址为
+# http://<host>:<port>/admin，可可视化修改本文件并查看各模型调用情况。
+# 留空 = 关闭管理页面（fail closed）：所有 /admin* 返回 404。代理监听在可路由
+# 地址上，因此默认不开放匿名可用的配置编辑器。
+# 也可用环境变量 LLM_PROXY_ADMIN_TOKEN 覆盖，避免明文落盘；环境变量存在时
+# 页面上修改口令不会生效。
+token = ""
+
 [routing]
 # 内置别名同样支持表值:`{ model = "...", upstream = "openai" }` 表示命中该
 # 别名的请求翻译为 OpenAI 协议转发给 openai_url(适用于 Anthropic 网关不支持
