@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/subtle"
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -19,9 +18,6 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-//go:embed admin.html
-var adminHTML []byte
-
 // registerAdmin wires the admin page onto the proxy's own listener. Every route
 // is behind requireAdmin, and an unset token disables the subtree entirely.
 func registerAdmin() {
@@ -29,6 +25,7 @@ func registerAdmin() {
 	http.HandleFunc("/admin/", requireAdmin(handleAdminPage))
 	http.HandleFunc("/admin/api/config", requireAdmin(handleAdminConfig))
 	http.HandleFunc("/admin/api/stats", requireAdmin(handleAdminStats))
+	http.HandleFunc("/admin/api/stats/history", requireAdmin(handleAdminStatsHistory))
 	http.HandleFunc("/admin/api/stats/reset", requireAdmin(handleAdminStatsReset))
 }
 
@@ -52,12 +49,6 @@ func requireAdmin(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func handleAdminPage(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Write(adminHTML)
-}
-
 func handleAdminStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -66,6 +57,27 @@ func handleAdminStats(w http.ResponseWriter, r *http.Request) {
 	snap := stats.snapshot()
 	snap.Version = version
 	writeJSON(w, http.StatusOK, snap)
+}
+
+// historyMaxFilter bounds how many ?model= values the history endpoint will act
+// on. The page only ever sends the handful of models it draws, so anything past
+// this is a caller asking the server to do unbounded work.
+const historyMaxFilter = 32
+
+// handleAdminStatsHistory serves the trend chart behind the admin page's
+// historical-rate view.
+func handleAdminStatsHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	// Repeated ?model= params narrow the response to the series the page draws;
+	// anything else is folded away server-side so the payload stays bounded.
+	models := r.URL.Query()["model"]
+	if len(models) > historyMaxFilter {
+		models = models[:historyMaxFilter]
+	}
+	writeJSON(w, http.StatusOK, stats.history(historyWindowSeconds(r.URL.Query().Get("range")), models))
 }
 
 func handleAdminStatsReset(w http.ResponseWriter, r *http.Request) {

@@ -157,9 +157,12 @@ type modelStats struct {
 	// token counts derived from text length instead of upstream usage.
 	estimated bool
 
-	ring   [statsRingSeconds]secBucket
-	errors map[string]int64
-	recent []errorEvent
+	ring [statsRingSeconds]secBucket
+	// history backs the admin page's trend chart and reaches 24 hours back; ring
+	// only covers 30 minutes and exists for the exact trailing-60s TPM/RPM.
+	history [historyRingMinutes]historyMinute
+	errors  map[string]int64
+	recent  []errorEvent
 }
 
 func (m *modelStats) bump(now time.Time, tokens int64, failed bool) {
@@ -294,6 +297,7 @@ func (c *statsCollector) record(r *reqStat, u tokenUsage, category string, statu
 	}
 
 	m.bump(now, int64(u.total()), failed)
+	m.bumpHistory(now, int64(u.total()), failed, elapsed)
 
 	if failed {
 		m.noteErrorLocked(now, errorEvent{
