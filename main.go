@@ -24,7 +24,7 @@ import (
 )
 
 // version is reported in the startup log and on the admin page.
-const version = "0.9.0"
+const version = "0.10.0"
 
 // Config represents /etc/llm-proxy/config.toml
 type Config struct {

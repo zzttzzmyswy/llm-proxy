@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -716,5 +717,101 @@ func TestAdminConfigSaveRollsBackOnReloadFailure(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("the original config file must still exist: %v", err)
+	}
+}
+
+// --- history endpoint ---
+
+// The chart asks for one window at a time; an unrecognised range must still get
+// a usable answer rather than an error, because the value only ever comes from
+// the page's own buttons.
+func TestAdminHistoryDefaultsTo24hAndEchoesRange(t *testing.T) {
+	withTempConfig(t, testConfigTOML)
+
+	for _, tc := range []struct{ query, want string }{
+		{"", "24h"},
+		{"?range=1h", "1h"},
+		{"?range=6h", "6h"},
+		{"?range=24h", "24h"},
+		{"?range=nonsense", "24h"},
+	} {
+		w := adminCall(t, handleAdminStatsHistory, http.MethodGet, "/admin/api/stats/history"+tc.query, "", "s3cret")
+		if w.Code != http.StatusOK {
+			t.Fatalf("%q: status %d", tc.query, w.Code)
+		}
+		var snap historySnapshot
+		decodeBody(t, w, &snap)
+		if snap.Range != tc.want {
+			t.Errorf("%q: range %q, want %q", tc.query, snap.Range, tc.want)
+		}
+		if len(snap.Timestamps) == 0 {
+			t.Errorf("%q: the page needs an axis even with no traffic", tc.query)
+		}
+	}
+}
+
+// The series and the axis have to agree, or the page would plot points against
+// timestamps that do not line up.
+func TestAdminHistoryPointsMatchTheAxis(t *testing.T) {
+	withTempConfig(t, testConfigTOML)
+
+	w := adminCall(t, handleAdminStatsHistory, http.MethodGet, "/admin/api/stats/history?range=6h", "", "s3cret")
+	var snap historySnapshot
+	decodeBody(t, w, &snap)
+	for _, m := range snap.Models {
+		if len(m.Points) != len(snap.Timestamps) {
+			t.Fatalf("model %q has %d points for %d timestamps", m.Model, len(m.Points), len(snap.Timestamps))
+		}
+		for i, p := range m.Points {
+			if p.TS != snap.Timestamps[i] {
+				t.Fatalf("model %q point %d is at %d, axis says %d", m.Model, i, p.TS, snap.Timestamps[i])
+			}
+		}
+	}
+}
+
+func TestAdminHistoryRejectsNonGet(t *testing.T) {
+	withTempConfig(t, testConfigTOML)
+
+	w := adminCall(t, handleAdminStatsHistory, http.MethodPost, "/admin/api/stats/history", "", "s3cret")
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("want 405, got %d", w.Code)
+	}
+}
+
+// The endpoint is as closed as the rest of /admin: no token configured means the
+// whole subtree is off, and a wrong password gets 401.
+func TestAdminHistoryIsBehindAuth(t *testing.T) {
+	withTempConfig(t, strings.Replace(testConfigTOML, `token = "s3cret"`, `token = ""`, 1))
+	if w := adminCall(t, requireAdmin(handleAdminStatsHistory), http.MethodGet, "/admin/api/stats/history", "", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("without a token the route must 404, got %d", w.Code)
+	}
+
+	withTempConfig(t, testConfigTOML)
+	if w := adminCall(t, requireAdmin(handleAdminStatsHistory), http.MethodGet, "/admin/api/stats/history", "", "wrong"); w.Code != http.StatusUnauthorized {
+		t.Fatalf("a bad password must 401, got %d", w.Code)
+	}
+	if w := adminCall(t, requireAdmin(handleAdminStatsHistory), http.MethodGet, "/admin/api/stats/history", "", "s3cret"); w.Code != http.StatusOK {
+		t.Fatalf("the right password must pass, got %d", w.Code)
+	}
+}
+
+// A caller must not be able to make the server build an unbounded number of
+// series by repeating ?model=.
+func TestAdminHistoryCapsTheModelFilter(t *testing.T) {
+	withTempConfig(t, testConfigTOML)
+
+	q := "/admin/api/stats/history?range=1h"
+	for i := 0; i < historyMaxFilter+20; i++ {
+		q += "&model=m" + strconv.Itoa(i)
+	}
+	w := adminCall(t, handleAdminStatsHistory, http.MethodGet, q, "", "s3cret")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d", w.Code)
+	}
+	var snap historySnapshot
+	decodeBody(t, w, &snap)
+	if len(snap.Timestamps) != 60 {
+		t.Fatalf("the window must still be served, got %d points", len(snap.Timestamps))
 	}
 }
