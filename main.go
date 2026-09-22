@@ -24,7 +24,7 @@ import (
 )
 
 // version is reported in the startup log and on the admin page.
-const version = "0.10.0"
+const version = "0.11.0"
 
 // Config represents /etc/llm-proxy/config.toml
 type Config struct {
@@ -2099,9 +2099,10 @@ type anthroSSE struct {
 	tools    map[int]*anthroTool
 	finished bool
 	outTok   int
-	// promptTok and usageSeen record the upstream's own usage chunk, which
-	// OpenAI-compatible gateways only send when stream_options asks for it.
+	// promptTok, cachedTok and usageSeen record the upstream's own usage chunk,
+	// which OpenAI-compatible gateways only send when stream_options asks for it.
 	promptTok int
+	cachedTok int
 	usageSeen bool
 	// streamErr holds an error the upstream reported as a stream event rather
 	// than as an HTTP status, so the caller can account for it as a failure.
@@ -2112,7 +2113,7 @@ type anthroSSE struct {
 // output count is the translator's text-length estimate and the input count is
 // unknown, so the result is marked unreported rather than passed off as exact.
 func (c *anthroSSE) usage() tokenUsage {
-	return tokenUsage{Input: c.promptTok, Output: c.outTok, Reported: c.usageSeen}
+	return tokenUsage{Input: c.promptTok, Output: c.outTok, CacheRead: c.cachedTok, Reported: c.usageSeen}
 }
 
 type anthroTool struct {
@@ -2218,6 +2219,11 @@ func (c *anthroSSE) handleChunk(d []byte) {
 		Usage *struct {
 			PromptTokens     int `json:"prompt_tokens"`
 			CompletionTokens int `json:"completion_tokens"`
+			// Cached tokens sit inside prompt_tokens; the page reads them as the
+			// cache hit count.
+			PromptTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal(d, &chunk) != nil {
@@ -2225,6 +2231,7 @@ func (c *anthroSSE) handleChunk(d []byte) {
 	}
 	if chunk.Usage != nil && (chunk.Usage.PromptTokens > 0 || chunk.Usage.CompletionTokens > 0) {
 		c.promptTok = chunk.Usage.PromptTokens
+		c.cachedTok = chunk.Usage.PromptTokensDetails.CachedTokens
 		c.usageSeen = true
 		// Prefer the upstream's own completion count over the running estimate.
 		if chunk.Usage.CompletionTokens > 0 {

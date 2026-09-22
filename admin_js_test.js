@@ -38,6 +38,9 @@ test("formatCount abbreviates thousands and millions", () => {
 test("formatMetric switches units by metric", () => {
   assert.equal(admin.formatMetric(0.125, "failure"), "12.5%");
   assert.equal(admin.formatMetric(0, "failure"), "0%");
+  assert.equal(admin.formatMetric(0.734, "cache"), "73.4%");
+  assert.equal(admin.formatMetric(0.005, "cache"), "0.50%");
+  assert.equal(admin.formatMetric(0, "cache"), "0%");
   assert.equal(admin.formatMetric(250, "latency"), "250 ms");
   assert.equal(admin.formatMetric(2500, "latency"), "2.50 s");
   assert.equal(admin.formatMetric(420, "tpm"), "420.0");
@@ -60,6 +63,30 @@ test("metricValue treats a bucket with no requests as zero, not NaN", () => {
   const empty = { tokens: 0, requests: 0, failures: 0, latency_ms: 0 };
   assert.equal(admin.metricValue(empty, "failure", 60), 0);
   assert.equal(admin.metricValue(empty, "latency", 60), 0);
+  assert.equal(admin.metricValue(empty, "cache", 60), 0);
+});
+
+// The cache hit rate is not a per-minute rate: it is a share of the prompt, so it
+// must be the same number whatever the bucket length is.
+test("metricValue reads the cache hit rate straight off the bucket", () => {
+  const point = { input: 300, cache_read: 700, cache_creation: 0, requests: 2, tokens: 1010 };
+  assert.equal(admin.metricValue(point, "cache", 60), 0.7);
+  assert.equal(admin.metricValue(point, "cache", 900), 0.7);
+});
+
+// Cache writes belong in the denominator: a bucket that only wrote to the cache
+// read nothing, and calling that a 100% hit would flatter the ratio.
+test("metricValue counts cache writes against the hit rate", () => {
+  const point = { input: 0, cache_read: 500, cache_creation: 500, requests: 1, tokens: 500 };
+  assert.equal(admin.metricValue(point, "cache", 60), 0.5);
+});
+
+// Older payloads (and a bucket whose counters are all zero) must not divide by
+// zero or fall back to the pre-computed field, which can disagree with the raw
+// counters the tooltip shows.
+test("metricValue falls back to the reported rate when counters are absent", () => {
+  assert.equal(admin.metricValue({ cache_hit_rate: 0.42, requests: 1 }, "cache", 60), 0.42);
+  assert.equal(admin.metricValue({ requests: 1 }, "cache", 60), 0);
 });
 
 test("buildChartRows keeps one row per timestamp", () => {
@@ -189,6 +216,37 @@ test("summarizeModels ranks by failure rate and drops idle models", () => {
   assert.equal(rows[0].avgLatency, 200);
   assert.equal(rows[0].maxLatency, 900);
   assert.equal(rows[1].failureRate, 0);
+});
+
+// The summary's cache column is a token-weighted share over the whole window,
+// taken from the series totals rather than re-added from the buckets.
+test("summarizeModels carries the window cache hit rate", () => {
+  const snap = snapshot({
+    models: [
+      Object.assign(series("cached", [{ requests: 1, tokens: 10 }]), {
+        cache_read: 700,
+        cache_creation: 100,
+        cache_hit_rate: 0.7,
+      }),
+      Object.assign(series("uncached", [{ requests: 1, tokens: 10 }]), {
+        cache_hit_rate: 0,
+      }),
+    ],
+  });
+  const rows = admin.summarizeModels(snap);
+  assert.equal(rows[0].model, "cached");
+  assert.equal(rows[0].cacheHitRate, 0.7);
+  assert.equal(rows[0].cacheRead, 700);
+  assert.equal(rows[0].cacheCreation, 100);
+  assert.equal(rows[1].cacheHitRate, 0);
+});
+
+// A payload without the cache fields must still summarize, so the table does not
+// disappear against an older proxy.
+test("summarizeModels tolerates missing cache fields", () => {
+  const rows = admin.summarizeModels(snapshot({ models: [series("m1", [{ requests: 1 }])] }));
+  assert.equal(rows[0].cacheHitRate, 0);
+  assert.equal(rows[0].cacheRead, 0);
 });
 
 test("summarizeModels tolerates an empty payload", () => {

@@ -146,13 +146,18 @@ type modelStats struct {
 	upstream string
 	aliases  map[string]*aliasCounter
 
-	requests   int64
-	successes  int64
-	failures   int64
-	input      int64
-	output     int64
-	latency    time.Duration
-	maxLatency time.Duration
+	requests  int64
+	successes int64
+	failures  int64
+	input     int64
+	output    int64
+	// cacheRead / cacheCreation accumulate the upstream's cache counters. They are
+	// kept out of input/output: those two are what the page has always shown as
+	// "输入 / 输出 token", and cache traffic is neither.
+	cacheRead     int64
+	cacheCreation int64
+	latency       time.Duration
+	maxLatency    time.Duration
 	// estimated is set once any successful call on this model had to have its
 	// token counts derived from text length instead of upstream usage.
 	estimated bool
@@ -283,6 +288,8 @@ func (c *statsCollector) record(r *reqStat, u tokenUsage, category string, statu
 	}
 	m.input += int64(u.Input)
 	m.output += int64(u.Output)
+	m.cacheRead += int64(u.CacheRead)
+	m.cacheCreation += int64(u.CacheCreation)
 	if !u.Reported && !failed {
 		m.estimated = true
 	}
@@ -297,7 +304,7 @@ func (c *statsCollector) record(r *reqStat, u tokenUsage, category string, statu
 	}
 
 	m.bump(now, int64(u.total()), failed)
-	m.bumpHistory(now, int64(u.total()), failed, elapsed)
+	m.bumpHistory(now, int64(u.total()), failed, elapsed, int64(u.Input), int64(u.CacheRead), int64(u.CacheCreation))
 
 	if failed {
 		m.noteErrorLocked(now, errorEvent{
@@ -393,13 +400,18 @@ type modelSnapshot struct {
 	InputTokens  int64            `json:"input_tokens"`
 	OutputTokens int64            `json:"output_tokens"`
 	TotalTokens  int64            `json:"total_tokens"`
-	TPM          int64            `json:"tpm"`
-	RPM          int64            `json:"rpm"`
-	AvgLatencyMS int64            `json:"avg_latency_ms"`
-	MaxLatencyMS int64            `json:"max_latency_ms"`
-	ErrorCounts  map[string]int64 `json:"error_counts"`
-	RecentErrors []errorEvent     `json:"recent_errors"`
-	Sparkline    []int64          `json:"sparkline"`
+	CacheRead    int64            `json:"cache_read"`
+	// CacheCreation is the other half of the denominator: prompt tokens the
+	// upstream had to read to write the cache.
+	CacheCreation int64            `json:"cache_creation"`
+	CacheHitRate  float64          `json:"cache_hit_rate"`
+	TPM           int64            `json:"tpm"`
+	RPM           int64            `json:"rpm"`
+	AvgLatencyMS  int64            `json:"avg_latency_ms"`
+	MaxLatencyMS  int64            `json:"max_latency_ms"`
+	ErrorCounts   map[string]int64 `json:"error_counts"`
+	RecentErrors  []errorEvent     `json:"recent_errors"`
+	Sparkline     []int64          `json:"sparkline"`
 }
 
 type statsTotals struct {
@@ -469,27 +481,30 @@ func (m *modelStats) snapshotLocked(now time.Time) modelSnapshot {
 	}
 
 	ms := modelSnapshot{
-		Model:        m.model,
-		Upstream:     m.upstream,
-		Aliases:      copyAliasCounts(m.aliases),
-		Estimated:    m.estimated,
-		Requests:     m.requests,
-		Successes:    m.successes,
-		Failures:     m.failures,
-		InputTokens:  m.input,
-		OutputTokens: m.output,
-		TotalTokens:  m.input + m.output,
-		TPM:          windowTokens,
-		RPM:          windowRequests,
-		MaxLatencyMS: m.maxLatency.Milliseconds(),
-		ErrorCounts:  copyInt64Map(m.errors),
-		RecentErrors: copyErrorsNewestFirst(m.recent),
-		Sparkline:    spark,
+		Model:         m.model,
+		Upstream:      m.upstream,
+		Aliases:       copyAliasCounts(m.aliases),
+		Estimated:     m.estimated,
+		Requests:      m.requests,
+		Successes:     m.successes,
+		Failures:      m.failures,
+		InputTokens:   m.input,
+		OutputTokens:  m.output,
+		TotalTokens:   m.input + m.output,
+		CacheRead:     m.cacheRead,
+		CacheCreation: m.cacheCreation,
+		TPM:           windowTokens,
+		RPM:           windowRequests,
+		MaxLatencyMS:  m.maxLatency.Milliseconds(),
+		ErrorCounts:   copyInt64Map(m.errors),
+		RecentErrors:  copyErrorsNewestFirst(m.recent),
+		Sparkline:     spark,
 	}
 	if m.requests > 0 {
 		ms.FailureRate = float64(m.failures) / float64(m.requests)
 		ms.AvgLatencyMS = (m.latency / time.Duration(m.requests)).Milliseconds()
 	}
+	ms.CacheHitRate = cacheHitRate(m.cacheRead, m.cacheCreation, m.input)
 	return ms
 }
 

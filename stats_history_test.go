@@ -309,3 +309,109 @@ func TestHistoryResetClearsTheRing(t *testing.T) {
 		t.Fatalf("reset must drop history too, got %+v", snap.Models)
 	}
 }
+
+// --- cache hit rate ---
+
+// The hit rate is read tokens over every token the upstream had to read, so a
+// cache write has to sit in the denominator: a request that only wrote to the
+// cache read nothing, and counting it as a hit would flatter the ratio.
+func TestHistoryCacheHitRateUsesTheWholePrompt(t *testing.T) {
+	c, _ := newTestCollector()
+
+	c.beginReq("sonnet", "m1", "anthropic").success(tokenUsage{
+		Input: 100, Output: 10, CacheRead: 700, CacheCreation: 200, Reported: true,
+	})
+
+	s := seriesByName(t, c.history(historyRange1h, nil), "m1")
+	last := s.Points[len(s.Points)-1]
+	if last.CacheRead != 700 || last.CacheCreation != 200 {
+		t.Fatalf("cache counters must reach the bucket, got %+v", last)
+	}
+	if last.CacheHitRate != 0.7 {
+		t.Fatalf("700 of 1000 prompt tokens must be 0.7, got %v", last.CacheHitRate)
+	}
+	if s.CacheHitRate != 0.7 {
+		t.Fatalf("the series total must agree with its single bucket, got %v", s.CacheHitRate)
+	}
+}
+
+// OpenAI counts cached tokens inside prompt_tokens, so the same request shape
+// must not produce a different ratio on that path.
+func TestHistoryCacheHitRateAgreesAcrossGateways(t *testing.T) {
+	c, _ := newTestCollector()
+
+	// The same 1000-token prompt, 700 of it cached, as each gateway reports it.
+	anthropic := extractAnthropicUsage([]byte(`{"usage":{"input_tokens":300,"output_tokens":5,
+		"cache_read_input_tokens":700}}`), false)
+	openai := extractOpenAIUsage([]byte(`{"usage":{"prompt_tokens":1000,"completion_tokens":5,
+		"prompt_tokens_details":{"cached_tokens":700}}}`), false)
+	c.beginReq("sonnet", "anthropic-model", "anthropic").success(anthropic)
+	c.beginReq("sonnet", "openai-model", "openai").success(openai)
+
+	snap := c.history(historyRange1h, nil)
+	for _, name := range []string{"anthropic-model", "openai-model"} {
+		s := seriesByName(t, snap, name)
+		last := s.Points[len(s.Points)-1]
+		if last.CacheHitRate != 0.7 {
+			t.Fatalf("%s must read 0.7, got %v (prompt counted as %d)", name, last.CacheHitRate,
+				last.Tokens)
+		}
+	}
+}
+
+// A bucket with no cache traffic at all is a real zero, not a missing value; and
+// a bucket with no prompt tokens must not divide by zero.
+func TestHistoryCacheHitRateOnEmptyAndUncachedBuckets(t *testing.T) {
+	c, clk := newTestCollector()
+
+	c.beginReq("sonnet", "m1", "anthropic").success(tokenUsage{Input: 500, Output: 5, Reported: true})
+	clk.advance(2 * time.Minute)
+	c.beginReq("sonnet", "m1", "anthropic").success(tokenUsage{Input: 500, Output: 5, Reported: true})
+
+	s := seriesByName(t, c.history(historyRange1h, nil), "m1")
+	for i, p := range s.Points {
+		if p.CacheHitRate != 0 {
+			t.Fatalf("point %d must read 0%% when nothing was cached, got %v", i, p.CacheHitRate)
+		}
+	}
+	if s.CacheHitRate != 0 {
+		t.Fatalf("series total must be 0, got %v", s.CacheHitRate)
+	}
+}
+
+// The interval summary is what the page ranks models by, so it needs the same
+// ratio over the whole window rather than an average of per-bucket ratios.
+func TestHistorySummarizesCacheHitRatePerModel(t *testing.T) {
+	c, _ := newTestCollector()
+
+	// A big cached request and a small uncached one: the ratio must be weighted by
+	// tokens (700 of 1000 prompt tokens = 0.7), not the mean of 1.0 and 0.0.
+	c.beginReq("sonnet", "m1", "anthropic").success(tokenUsage{
+		Input: 100, Output: 5, CacheRead: 700, CacheCreation: 100, Reported: true,
+	})
+	c.beginReq("sonnet", "m1", "anthropic").success(tokenUsage{Input: 100, Output: 5, Reported: true})
+
+	s := seriesByName(t, c.history(historyRange1h, nil), "m1")
+	if s.CacheHitRate < 0.69 || s.CacheHitRate > 0.71 {
+		t.Fatalf("want a token-weighted 0.7, got %v", s.CacheHitRate)
+	}
+	if s.CacheRead != 700 || s.CacheCreation != 100 {
+		t.Fatalf("series must carry the raw counters too, got read=%d creation=%d", s.CacheRead, s.CacheCreation)
+	}
+}
+
+func TestStatsSnapshotReportsCacheHitRate(t *testing.T) {
+	c, _ := newTestCollector()
+
+	c.beginReq("sonnet", "m1", "anthropic").success(tokenUsage{
+		Input: 200, Output: 10, CacheRead: 800, Reported: true,
+	})
+
+	m := modelByName(t, c.snapshot(), "m1")
+	if m.CacheRead != 800 || m.CacheHitRate != 0.8 {
+		t.Fatalf("want 800 read / 0.8, got %d / %v", m.CacheRead, m.CacheHitRate)
+	}
+	if m.InputTokens != 200 {
+		t.Fatalf("the plain input count must not absorb the cache read, got %d", m.InputTokens)
+	}
+}

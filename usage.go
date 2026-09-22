@@ -9,13 +9,27 @@ import (
 // tokenUsage is how many tokens one upstream call consumed. Reported is false
 // when the upstream did not tell us and the caller had to fall back to a
 // length-based estimate, so the UI can label those numbers honestly.
+//
+// Input is the fresh, uncached prompt. The two gateways disagree about what
+// their prompt counter means — Anthropic's input_tokens excludes the cache
+// counters, OpenAI's prompt_tokens includes the cached ones — so the OpenAI
+// extractors subtract the cached count here, at the boundary. Everything
+// downstream (stats, the cache hit rate) then has one meaning to reason about,
+// and total() stays the same either way because it is a sum.
 type tokenUsage struct {
-	Input    int
-	Output   int
-	Reported bool
+	Input         int
+	Output        int
+	CacheRead     int
+	CacheCreation int
+	Reported      bool
 }
 
 func (u tokenUsage) total() int { return u.Input + u.Output }
+
+// promptTokens is everything the upstream had to read to answer: the fresh
+// prompt plus both cache counters. With Input normalised to exclude cached
+// tokens, this is the same expression on both gateways.
+func (u tokenUsage) promptTokens() int { return u.Input + u.CacheRead + u.CacheCreation }
 
 // maxNonStreamBuffer caps how much of a non-streaming upstream body is retained
 // for usage extraction. A single message is far below this; a body that exceeds
@@ -221,6 +235,10 @@ func forEachSSEData(body []byte, fn func([]byte)) {
 type anthropicUsageFields struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+	// The cache counters ride along in the same usage blocks. A stream may
+	// report them in message_start only, or repeat them in message_delta.
+	CacheCreationTokens int `json:"cache_creation_input_tokens"`
+	CacheReadTokens     int `json:"cache_read_input_tokens"`
 }
 
 // extractAnthropicUsage reads token counts from an Anthropic response. A
@@ -235,10 +253,17 @@ func extractAnthropicUsage(body []byte, isSSE bool) tokenUsage {
 		if json.Unmarshal(body, &m) != nil {
 			return tokenUsage{}
 		}
-		if m.Usage.InputTokens == 0 && m.Usage.OutputTokens == 0 {
+		u := m.Usage
+		if u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheReadTokens == 0 && u.CacheCreationTokens == 0 {
 			return tokenUsage{}
 		}
-		return tokenUsage{Input: m.Usage.InputTokens, Output: m.Usage.OutputTokens, Reported: true}
+		return tokenUsage{
+			Input:         u.InputTokens,
+			Output:        u.OutputTokens,
+			CacheRead:     u.CacheReadTokens,
+			CacheCreation: u.CacheCreationTokens,
+			Reported:      true,
+		}
 	}
 
 	var u tokenUsage
@@ -262,6 +287,10 @@ func extractAnthropicUsage(body []byte, isSSE bool) tokenUsage {
 	return u
 }
 
+// mergeAnthropicUsage folds one usage block into the running total. Each counter
+// is taken only when the block actually carries it: a message_delta that reports
+// output tokens alone must not clear the input and cache counts message_start
+// already gave.
 func mergeAnthropicUsage(u tokenUsage, f anthropicUsageFields) tokenUsage {
 	if f.InputTokens > 0 {
 		u.Input = f.InputTokens
@@ -269,7 +298,13 @@ func mergeAnthropicUsage(u tokenUsage, f anthropicUsageFields) tokenUsage {
 	if f.OutputTokens > 0 {
 		u.Output = f.OutputTokens
 	}
-	if f.InputTokens > 0 || f.OutputTokens > 0 {
+	if f.CacheReadTokens > 0 {
+		u.CacheRead = f.CacheReadTokens
+	}
+	if f.CacheCreationTokens > 0 {
+		u.CacheCreation = f.CacheCreationTokens
+	}
+	if f.InputTokens > 0 || f.OutputTokens > 0 || f.CacheReadTokens > 0 || f.CacheCreationTokens > 0 {
 		u.Reported = true
 	}
 	return u
@@ -282,6 +317,10 @@ func extractOpenAIUsage(body []byte, isSSE bool) tokenUsage {
 	type openAIUsage struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
+		// Cached tokens are a subset of prompt_tokens, not an addition to it.
+		PromptTokensDetails struct {
+			CachedTokens int `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
 	}
 	if !isSSE {
 		var m struct {
@@ -290,10 +329,17 @@ func extractOpenAIUsage(body []byte, isSSE bool) tokenUsage {
 		if json.Unmarshal(body, &m) != nil {
 			return tokenUsage{}
 		}
-		if m.Usage.PromptTokens == 0 && m.Usage.CompletionTokens == 0 {
+		u := m.Usage
+		if u.PromptTokens == 0 && u.CompletionTokens == 0 {
 			return tokenUsage{}
 		}
-		return tokenUsage{Input: m.Usage.PromptTokens, Output: m.Usage.CompletionTokens, Reported: true}
+		cached := u.PromptTokensDetails.CachedTokens
+		return tokenUsage{
+			Input:     freshPrompt(u.PromptTokens, cached),
+			Output:    u.CompletionTokens,
+			CacheRead: cached,
+			Reported:  true,
+		}
 	}
 
 	var u tokenUsage
@@ -305,10 +351,26 @@ func extractOpenAIUsage(body []byte, isSSE bool) tokenUsage {
 			return
 		}
 		if ev.Usage.PromptTokens > 0 || ev.Usage.CompletionTokens > 0 {
-			u.Input = ev.Usage.PromptTokens
+			cached := ev.Usage.PromptTokensDetails.CachedTokens
+			u.Input = freshPrompt(ev.Usage.PromptTokens, cached)
 			u.Output = ev.Usage.CompletionTokens
+			u.CacheRead = cached
 			u.Reported = true
 		}
 	})
 	return u
+}
+
+// freshPrompt turns OpenAI's prompt_tokens (which counts cached tokens inside
+// it) into the fresh prompt the rest of the proxy works with. A gateway that
+// reports more cached tokens than prompt tokens would otherwise produce a
+// negative input, which would in turn push the cache hit rate above 100%.
+func freshPrompt(promptTokens, cached int) int {
+	if cached <= 0 {
+		return promptTokens
+	}
+	if cached >= promptTokens {
+		return 0
+	}
+	return promptTokens - cached
 }
