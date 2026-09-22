@@ -815,3 +815,32 @@ func TestAdminHistoryCapsTheModelFilter(t *testing.T) {
 		t.Fatalf("the window must still be served, got %d points", len(snap.Timestamps))
 	}
 }
+
+// The cache columns in the interval summary are read straight off the series, so
+// the payload has to carry the window totals and not only the per-bucket points.
+func TestAdminHistoryCarriesCacheTotals(t *testing.T) {
+	withTempConfig(t, testConfigTOML)
+
+	stats.reset()
+	c := stats.beginReq("sonnet", "DeepSeek-Flash", "anthropic")
+	c.success(tokenUsage{Input: 300, Output: 5, CacheRead: 700, Reported: true})
+
+	w := adminCall(t, handleAdminStatsHistory, http.MethodGet, "/admin/api/stats/history?range=1h", "", "s3cret")
+	var snap historySnapshot
+	decodeBody(t, w, &snap)
+	if len(snap.Models) != 1 {
+		t.Fatalf("want one series, got %d", len(snap.Models))
+	}
+	m := snap.Models[0]
+	if m.CacheRead != 700 || m.CacheHitRate != 0.7 {
+		t.Fatalf("series must report 700 read / 0.7, got %d / %v", m.CacheRead, m.CacheHitRate)
+	}
+	if snap.Totals.CacheRead != 700 {
+		t.Fatalf("totals must carry the cache counters, got %+v", snap.Totals)
+	}
+	last := m.Points[len(m.Points)-1]
+	if last.Input != 300 || last.CacheRead != 700 || last.CacheHitRate != 0.7 {
+		t.Fatalf("the newest bucket must carry its own counters, got %+v", last)
+	}
+	stats.reset()
+}

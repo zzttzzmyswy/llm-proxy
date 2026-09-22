@@ -66,6 +66,15 @@ type historyMinute struct {
 	failures   int64
 	latencyMS  int64
 	maxLatency int64
+	// input is the fresh (uncached) prompt tokens. It is kept apart from tokens
+	// because tokens also counts the completion, and a cache hit rate whose
+	// denominator included the model's own output would sag as answers got longer.
+	input int64
+	// cacheRead and cacheCreation are prompt tokens served from the upstream's
+	// cache and written into it. They are kept apart from tokens so the chart can
+	// show a hit rate: folding them into one number would lose the split.
+	cacheRead     int64
+	cacheCreation int64
 }
 
 func (m *historyMinute) add(o *historyMinute) {
@@ -76,6 +85,9 @@ func (m *historyMinute) add(o *historyMinute) {
 	if o.maxLatency > m.maxLatency {
 		m.maxLatency = o.maxLatency
 	}
+	m.input += o.input
+	m.cacheRead += o.cacheRead
+	m.cacheCreation += o.cacheCreation
 }
 
 // historyPoint is one bucket on the chart: the counters for a model inside
@@ -89,17 +101,33 @@ type historyPoint struct {
 	MaxLatencyMS int64   `json:"max_latency_ms"`
 	FailureRate  float64 `json:"failure_rate"`
 	AvgLatencyMS int64   `json:"avg_latency_ms"`
+	// Input is the fresh (uncached) prompt tokens; with the two cache counters it
+	// is the denominator the hit rate is computed from.
+	Input     int64 `json:"input"`
+	CacheRead int64 `json:"cache_read"`
+	// CacheCreation is in the payload because it belongs in the denominator: a
+	// bucket that only wrote to the cache read nothing, and hiding it would make
+	// the ratio look better than it was.
+	CacheCreation int64   `json:"cache_creation"`
+	CacheHitRate  float64 `json:"cache_hit_rate"`
 }
 
 type historyModelSeries struct {
 	Model  string         `json:"model"`
 	Points []historyPoint `json:"points"`
+	// The window totals behind the points, so the summary table does not have to
+	// re-add 96 buckets in the browser.
+	CacheRead     int64   `json:"cache_read"`
+	CacheCreation int64   `json:"cache_creation"`
+	CacheHitRate  float64 `json:"cache_hit_rate"`
 }
 
 type historyTotals struct {
-	Requests int64 `json:"requests"`
-	Failures int64 `json:"failures"`
-	Tokens   int64 `json:"tokens"`
+	Requests      int64 `json:"requests"`
+	Failures      int64 `json:"failures"`
+	Tokens        int64 `json:"tokens"`
+	CacheRead     int64 `json:"cache_read"`
+	CacheCreation int64 `json:"cache_creation"`
 }
 
 type historySnapshot struct {
@@ -124,7 +152,7 @@ type historySnapshot struct {
 
 // bumpHistory records one finished request into the current minute of the model's
 // history ring. It runs under the collector lock, next to the second-ring write.
-func (m *modelStats) bumpHistory(now time.Time, tokens int64, failed bool, latency time.Duration) {
+func (m *modelStats) bumpHistory(now time.Time, tokens int64, failed bool, latency time.Duration, input, cacheRead, cacheCreation int64) {
 	min := now.Unix() / 60 * 60
 	b := &m.history[min%historyRingMinutes]
 	if b.min != min {
@@ -135,6 +163,9 @@ func (m *modelStats) bumpHistory(now time.Time, tokens int64, failed bool, laten
 	if failed {
 		b.failures++
 	}
+	b.input += input
+	b.cacheRead += cacheRead
+	b.cacheCreation += cacheCreation
 	ms := latency.Milliseconds()
 	b.latencyMS += ms
 	if ms > b.maxLatency {
@@ -186,9 +217,12 @@ func (c *statsCollector) historySnapshotLocked(now time.Time, rangeSec int, mode
 	}
 
 	type ranked struct {
-		model  string
-		tokens int64
-		points []historyPoint
+		model         string
+		tokens        int64
+		points        []historyPoint
+		input         int64
+		cacheRead     int64
+		cacheCreation int64
 	}
 	var all []ranked
 
@@ -197,7 +231,7 @@ func (c *statsCollector) historySnapshotLocked(now time.Time, rangeSec int, mode
 			continue
 		}
 		byBucket := make([]historyMinute, points)
-		var tokens int64
+		var tokens, input, cacheRead, cacheCreation int64
 		seen := false
 		for i := range m.history {
 			h := &m.history[i]
@@ -210,6 +244,9 @@ func (c *statsCollector) historySnapshotLocked(now time.Time, rangeSec int, mode
 			}
 			byBucket[idx].add(h)
 			tokens += h.tokens
+			input += h.input
+			cacheRead += h.cacheRead
+			cacheCreation += h.cacheCreation
 			seen = true
 		}
 		if !seen {
@@ -218,19 +255,30 @@ func (c *statsCollector) historySnapshotLocked(now time.Time, rangeSec int, mode
 		series := make([]historyPoint, points)
 		for i := range series {
 			series[i] = historyPoint{
-				TS:           timestamps[i],
-				Tokens:       byBucket[i].tokens,
-				Requests:     byBucket[i].requests,
-				Failures:     byBucket[i].failures,
-				LatencyMS:    byBucket[i].latencyMS,
-				MaxLatencyMS: byBucket[i].maxLatency,
+				TS:            timestamps[i],
+				Tokens:        byBucket[i].tokens,
+				Requests:      byBucket[i].requests,
+				Failures:      byBucket[i].failures,
+				LatencyMS:     byBucket[i].latencyMS,
+				MaxLatencyMS:  byBucket[i].maxLatency,
+				Input:         byBucket[i].input,
+				CacheRead:     byBucket[i].cacheRead,
+				CacheCreation: byBucket[i].cacheCreation,
 			}
 			if byBucket[i].requests > 0 {
 				series[i].FailureRate = float64(byBucket[i].failures) / float64(byBucket[i].requests)
 				series[i].AvgLatencyMS = byBucket[i].latencyMS / byBucket[i].requests
 			}
+			series[i].CacheHitRate = cacheHitRate(byBucket[i].cacheRead, byBucket[i].cacheCreation, byBucket[i].input)
 		}
-		all = append(all, ranked{model: m.model, tokens: tokens, points: series})
+		all = append(all, ranked{
+			model:         m.model,
+			tokens:        tokens,
+			points:        series,
+			input:         input,
+			cacheRead:     cacheRead,
+			cacheCreation: cacheCreation,
+		})
 	}
 
 	sort.Slice(all, func(i, j int) bool {
@@ -253,19 +301,32 @@ func (c *statsCollector) historySnapshotLocked(now time.Time, rangeSec int, mode
 		kept = kept[:historyMaxSeries]
 	}
 	for _, r := range kept {
-		snap.Models = append(snap.Models, historyModelSeries{Model: r.model, Points: r.points})
+		snap.Models = append(snap.Models, historyModelSeries{
+			Model:         r.model,
+			Points:        r.points,
+			CacheRead:     r.cacheRead,
+			CacheCreation: r.cacheCreation,
+			CacheHitRate:  cacheHitRate(r.cacheRead, r.cacheCreation, r.input),
+		})
 	}
 	if snap.ModelsExcluded > 0 {
 		other := make([]historyPoint, points)
 		for i := range other {
 			other[i].TS = timestamps[i]
 		}
+		var otherRead, otherCreation, otherInput int64
 		for _, r := range all[historyMaxSeries:] {
+			otherRead += r.cacheRead
+			otherCreation += r.cacheCreation
+			otherInput += r.input
 			for i := range other {
 				other[i].Tokens += r.points[i].Tokens
 				other[i].Requests += r.points[i].Requests
 				other[i].Failures += r.points[i].Failures
 				other[i].LatencyMS += r.points[i].LatencyMS
+				other[i].Input += r.points[i].Input
+				other[i].CacheRead += r.points[i].CacheRead
+				other[i].CacheCreation += r.points[i].CacheCreation
 				if r.points[i].MaxLatencyMS > other[i].MaxLatencyMS {
 					other[i].MaxLatencyMS = r.points[i].MaxLatencyMS
 				}
@@ -276,13 +337,22 @@ func (c *statsCollector) historySnapshotLocked(now time.Time, rangeSec int, mode
 				other[i].FailureRate = float64(other[i].Failures) / float64(other[i].Requests)
 				other[i].AvgLatencyMS = other[i].LatencyMS / other[i].Requests
 			}
+			other[i].CacheHitRate = cacheHitRate(other[i].CacheRead, other[i].CacheCreation, other[i].Input)
 		}
-		snap.Models = append(snap.Models, historyModelSeries{Model: otherModelKey, Points: other})
+		snap.Models = append(snap.Models, historyModelSeries{
+			Model:         otherModelKey,
+			Points:        other,
+			CacheRead:     otherRead,
+			CacheCreation: otherCreation,
+			CacheHitRate:  cacheHitRate(otherRead, otherCreation, otherInput),
+		})
 	}
 
 	// Totals cover every model in the window, not just the plotted ones, so the
 	// headline numbers stay honest when the cap folds the tail away.
 	for _, r := range all {
+		snap.Totals.CacheRead += r.cacheRead
+		snap.Totals.CacheCreation += r.cacheCreation
 		for i := range r.points {
 			snap.Totals.Requests += r.points[i].Requests
 			snap.Totals.Failures += r.points[i].Failures
@@ -290,6 +360,24 @@ func (c *statsCollector) historySnapshotLocked(now time.Time, rangeSec int, mode
 		}
 	}
 	return snap
+}
+
+// cacheHitRate is the share of the prompt the upstream served from its cache.
+//
+// The denominator is every prompt token the upstream had to read: fresh input
+// plus the cache counters. Dividing by the fresh input alone would report a hit
+// rate above 100% on a well-cached request, and leaving cache writes out of the
+// denominator would count a request that only wrote to the cache as a pure win.
+//
+// A model that reported no cache counters at all reads as 0%, which is the
+// honest answer: nothing was served from cache. A bucket with no prompt tokens
+// divides by zero, so it is 0 as well.
+func cacheHitRate(cacheRead, cacheCreation, freshInput int64) float64 {
+	prompt := cacheRead + cacheCreation + freshInput
+	if prompt <= 0 {
+		return 0
+	}
+	return float64(cacheRead) / float64(prompt)
 }
 
 // history builds the chart payload under the collector lock.

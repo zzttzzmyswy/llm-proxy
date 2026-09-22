@@ -49,6 +49,7 @@
   var HISTORY_METRICS = [
     { value: "tpm", label: "Token 速率", unit: "token/分", stacked: true },
     { value: "rpm", label: "请求速率", unit: "请求/分", stacked: true },
+    { value: "cache", label: "缓存命中率", unit: "%", stacked: false },
     { value: "failure", label: "失败率", unit: "%", stacked: false },
     { value: "latency", label: "平均延迟", unit: "ms", stacked: false }
   ];
@@ -81,8 +82,10 @@
 
   /** 纵轴与提示里的数值：按口径选单位，小值保留一位小数。 */
   function formatMetric(value, metric) {
-    if (!isFinite(value) || value <= 0) return metric === "failure" ? "0%" : "0";
-    if (metric === "failure") return (value * 100).toFixed(value < 0.1 ? 2 : 1) + "%";
+    if (!isFinite(value) || value <= 0) return metric === "failure" || metric === "cache" ? "0%" : "0";
+    if (metric === "failure" || metric === "cache") {
+      return (value * 100).toFixed(value < 0.1 ? 2 : 1) + "%";
+    }
     if (metric === "latency") return value >= 1000 ? (value / 1000).toFixed(2) + " s" : Math.round(value) + " ms";
     if (value >= 1000) return formatCount(value);
     return value.toFixed(1);
@@ -116,7 +119,29 @@
     if (metric === "tpm") return (point.tokens || 0) * perMinute;
     if (metric === "rpm") return (point.requests || 0) * perMinute;
     if (metric === "failure") return point.requests > 0 ? (point.failures || 0) / point.requests : 0;
+    if (metric === "cache") return cacheHitRate(point);
     return point.requests > 0 ? (point.latency_ms || 0) / point.requests : 0;
+  }
+
+  /**
+   * 缓存命中率 = 命中缓存的 prompt token / 全部 prompt token。
+   *
+   * 分母必须带上写缓存的那部分：只写不读的请求一个 token 都没命中，把它算成
+   * 命中会让曲线虚高。也不能只除以未命中的部分，那样一个缓存良好的请求会算出
+   * 超过 100%。桶里没有 prompt token 时返回 0，不做除零。
+   *
+   * 拿不到原始计数时回落到后端算好的 cache_hit_rate，这样页面在旧版本代理上
+   * 也不会整块消失。
+   */
+  function cacheHitRate(point) {
+    var read = point.cache_read || 0;
+    var written = point.cache_creation || 0;
+    var fresh = point.input || 0;
+    var prompt = read + written + fresh;
+    if (prompt <= 0) {
+      return point.cache_hit_rate || 0;
+    }
+    return read / prompt;
   }
 
   /**
@@ -256,7 +281,17 @@
     if (!snapshot || !snapshot.models) return out;
     for (var i = 0; i < snapshot.models.length; i++) {
       var series = snapshot.models[i];
-      var acc = { model: series.model, requests: 0, failures: 0, tokens: 0, latency: 0, maxLatency: 0 };
+      var acc = {
+        model: series.model,
+        requests: 0,
+        failures: 0,
+        tokens: 0,
+        latency: 0,
+        maxLatency: 0,
+        cacheRead: series.cache_read || 0,
+        cacheCreation: series.cache_creation || 0,
+        cacheHitRate: series.cache_hit_rate || 0,
+      };
       var points = series.points || [];
       for (var j = 0; j < points.length; j++) {
         acc.requests += points[j].requests || 0;
@@ -352,8 +387,10 @@
       host.innerHTML = '<div class="empty">所选区间内没有流量。</div>';
       return;
     }
-    // 失败率的纵轴固定 0-100%，否则一次失败就把曲线顶满，看不出「本来是 0」。
-    var yMax = history.metric === "failure" ? 1 : niceCeil(max);
+    // 失败率与命中率的纵轴都固定 0-100%：自适应的话一次失败就把曲线顶满，而
+    // 命中率永远在 0-1 之间，自适应只会把「80% 还是 90%」这点差别放大成噪声。
+    var percentAxis = history.metric === "failure" || history.metric === "cache";
+    var yMax = percentAxis ? 1 : niceCeil(max);
 
     // PAD_L leaves room for the y labels; PAD_B for the x labels, which sit below
     // the plot rather than inside it.
@@ -473,6 +510,23 @@
         html += '<div class="tip-row tip-total"><span>合计</span><span class="mono">' +
           esc(formatMetric(total, history.metric)) + "</span></div>";
       }
+      if (history.metric === "cache") {
+        // 命中率的分母是 prompt token，不是各模型命中率之和，所以这里另给一行
+        // 区间合计，按 token 加权。
+        var point = function (name) { return (snap.models.filter(function (m) {
+          return m.model === name;
+        })[0] || {}).points || []; };
+        var read = 0, written = 0, fresh = 0;
+        names.forEach(function (name) {
+          var p = point(name)[index] || {};
+          read += p.cache_read || 0;
+          written += p.cache_creation || 0;
+          fresh += p.input || 0;
+        });
+        var prompt = read + written + fresh;
+        html += '<div class="tip-row tip-total"><span>命中 token</span><span class="mono">' +
+          esc(formatCount(read)) + " / " + esc(formatCount(prompt)) + "</span></div>";
+      }
       html += '<div class="tip-unit">口径：' + esc(metric.label) + "（" + esc(metric.unit) + "）</div>";
       tooltip.innerHTML = html;
       tooltip.classList.add("show");
@@ -513,13 +567,18 @@
         '<td class="num">' + num(r.failures) + "</td>" +
         '<td class="num ' + cls + '">' + pct(r.failureRate) + "</td>" +
         '<td class="num">' + num(r.tokens) + "</td>" +
+        '<td class="num" title="命中缓存 / 写缓存 / 未命中（prompt token）">' +
+          pct(r.cacheHitRate) + " <span class=\"muted\">" +
+          formatCount(r.cacheRead) + " / " + formatCount(r.cacheCreation) + "</span></td>" +
         '<td class="num">' + ms(r.avgLatency) + "</td>" +
         '<td class="num">' + ms(r.maxLatency) + "</td>" +
         "</tr>";
     }).join("");
     host.innerHTML = '<table><thead><tr><th>模型</th>' +
       '<th class="num">请求</th><th class="num">失败</th><th class="num">失败率</th>' +
-      '<th class="num">token</th><th class="num">平均延迟</th><th class="num">最大延迟</th>' +
+      '<th class="num">token</th>' +
+      '<th class="num" title="命中缓存的 prompt token 占比；括号内是命中 / 写入">缓存命中</th>' +
+      '<th class="num">平均延迟</th><th class="num">最大延迟</th>' +
       "</tr></thead><tbody>" + body + "</tbody></table>";
   }
 
@@ -609,6 +668,9 @@
         '<td class="num">' + num(m.tpm) + "</td>" +
         '<td class="num">' + num(m.rpm) + "</td>" +
         '<td class="num">' + num(m.input_tokens) + " / " + num(m.output_tokens) + "</td>" +
+        '<td class="num" title="命中缓存 / 写缓存（prompt token）">' +
+          pct(m.cache_hit_rate || 0) + " <span class=\"muted\">" +
+          num(m.cache_read) + " / " + num(m.cache_creation) + "</span></td>" +
         '<td class="num">' + ms(m.avg_latency_ms) + " / " + ms(m.max_latency_ms) + "</td>" +
         "<td>" + sparkline(m.sparkline || []) + "</td>" +
         "</tr>";
@@ -617,7 +679,9 @@
       "<th>模型</th><th>网关</th><th>别名</th>" +
       '<th class="num">请求</th><th class="num">成功 / 失败</th><th class="num">失败率</th>' +
       '<th class="num">TPM</th><th class="num">RPM</th>' +
-      '<th class="num">输入 / 输出 token</th><th class="num">平均 / 最大延迟</th>' +
+      '<th class="num">输入 / 输出 token</th>' +
+      '<th class="num" title="命中缓存的 prompt token 占比；括号内是命中 / 写入">缓存命中</th>' +
+      '<th class="num">平均 / 最大延迟</th>' +
       "<th>最近 30 分钟</th>" +
       "</tr></thead><tbody>" + rows + "</tbody></table>";
   }
