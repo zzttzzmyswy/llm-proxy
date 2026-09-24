@@ -24,7 +24,7 @@ import (
 )
 
 // version is reported in the startup log and on the admin page.
-const version = "0.11.0"
+const version = "0.12.0"
 
 // Config represents /etc/llm-proxy/config.toml
 type Config struct {
@@ -191,12 +191,20 @@ func (rc reqConfig) openAICompletionsURL() string {
 }
 
 func (rc reqConfig) httpClient() *http.Client {
-	return &http.Client{
-		Transport: &http.Transport{
-			DisableCompression:    true,
-			ResponseHeaderTimeout: rc.headerTimeout(),
-		},
-		Timeout: 0,
+	return &http.Client{Transport: newUpstreamTransport(rc.headerTimeout()), Timeout: 0}
+}
+
+// newUpstreamTransport builds the transport every upstream call goes through.
+func newUpstreamTransport(headerTimeout time.Duration) *http.Transport {
+	return &http.Transport{
+		DisableCompression:    true,
+		ResponseHeaderTimeout: headerTimeout,
+		// Resolve through the caching dialer so a flaky local resolver cannot
+		// fail a request a recent lookup already answered.
+		DialContext: upstreamDial.DialContext,
+		// A custom dial hook suppresses net/http's automatic HTTP/2 setup, and
+		// the upstream gateway serves HTTP/2 — keep it.
+		ForceAttemptHTTP2: true,
 	}
 }
 
@@ -412,6 +420,16 @@ func retryBackoff(attempt int) time.Duration {
 func isRetryableError(err error) bool {
 	if err == nil {
 		return false
+	}
+	// A resolver failure is transient far more often than not — SERVFAIL and
+	// REFUSED say nothing about the upstream, and a dropped UDP query surfaces as
+	// a read timeout — so it earns another attempt. NXDOMAIN is the exception: it
+	// is a definitive answer, and retrying only delays the error a bad upstream
+	// URL deserves. Production hit the SERVFAIL case: the proxy answered 502 on
+	// the first "server misbehaving" without retrying at all.
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return !dnsErr.IsNotFound
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {

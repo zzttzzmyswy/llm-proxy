@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -270,6 +272,35 @@ func TestIsRetryableError(t *testing.T) {
 		// any deadline as a retryable timeout.
 		{"deadline exceeded", context.DeadlineExceeded, true},
 		{"plain error", errors.New("boom"), false},
+	}
+	for _, c := range cases {
+		if got := isRetryableError(c.err); got != c.want {
+			t.Errorf("%s: isRetryableError = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// A resolver failure must be retried: the upstream hostname is stable, so a
+// SERVFAIL ("server misbehaving") or a UDP read timeout from the local resolver
+// says nothing about the upstream being reachable. Production showed the proxy
+// answering 502 on the very first "server misbehaving" with no retry line in the
+// log at all, which is what this pins down.
+func TestIsRetryableErrorDNS(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"servfail", &net.DNSError{Err: "server misbehaving", Name: "www.sophnet.com", IsTemporary: true}, true},
+		{"udp read timeout", &net.DNSError{Err: "i/o timeout", Name: "www.sophnet.com", IsTimeout: true}, true},
+		{"servfail wrapped in url.Error", &url.Error{
+			Op:  "Post",
+			URL: "https://www.sophnet.com/api/open-apis/anthropic/v1/messages",
+			Err: &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "server misbehaving", Name: "www.sophnet.com"}},
+		}, true},
+		// NXDOMAIN is a definitive answer, not a transient one: retrying it only
+		// delays the error a misconfigured upstream URL deserves.
+		{"nxdomain", &net.DNSError{Err: "no such host", Name: "nope.invalid", IsNotFound: true}, false},
 	}
 	for _, c := range cases {
 		if got := isRetryableError(c.err); got != c.want {

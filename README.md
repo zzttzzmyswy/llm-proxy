@@ -49,7 +49,8 @@ Claude Code 默认只认 Anthropic 官方模型名（`sonnet` / `opus` / `haiku`
 | 压缩禁用 | `DisableCompression: true`，避免 gzip 破坏 SSE 缓冲 |
 | 超时保护 | `header_timeout_seconds: 120s`，上游不响应头时按瞬态错误**自动重试**（`max_retries` 次）后向下游报错 |
 | 流停滞保护 | `body_idle_seconds: 90s`，流式上游中途静默（模型挂起/连接假死）时向客户端发 SSE `error` 事件终止，杜绝 Claude Code 永久等待 |
-| 瞬态重试 | 上游网络错误（超时/连接重置/EOF）或 429/5xx 自动重试（默认 2 次，退避 0.5s/1s/2s），重试耗尽可能的 5xx 原样返回 |
+| 瞬态重试 | 上游网络错误（超时/连接重置/EOF/**DNS 解析失败**）或 429/5xx 自动重试（默认 2 次，退避 0.5s/1s/2s），重试耗尽可能的 5xx 原样返回 |
+| DNS 兜底 | 上游域名的解析结果进程内缓存 5 分钟；解析失败（SERVFAIL / REFUSED / UDP 读超时）时回退到最后一次可用地址并打 `[DNS]` 告警，本机 DNS 抖动不再直接变成 502。故障期间每 30 秒才重新探测一次解析器，避免每个请求都等一遍解析超时。NXDOMAIN 是确定性答案，不重试 |
 | 错误帧格式 | 上游失败时非流返回 Anthropic error JSON envelope、流式返回 SSE `error` 事件，客户端可解析而不会悬置 |
 | 密钥安全 | 支持 `SOPHNET_API_KEY` 环境变量，无需明文落盘 |
 | Web 管理页面 | `/admin`：可视化修改配置（改完立即生效）+ 查看各模型调用情况（TPM/RPM、失败率、失败分类与明细、延迟）。HTTP Basic 认证，未配置口令时整体关闭 |
@@ -232,7 +233,7 @@ export ANTHROPIC_AUTH_TOKEN="<任意值，代理会替换为真实上游密钥>"
 go test ./...
 ```
 
-覆盖：文本/图像/`image_url` 路由、图像经 VLM 描述后插入文本并路由到文本模型、VLM 描述请求携带带图消息的上下文（角色/同消息文本）、`tool_result` 内图片带出工具名与入参、嵌套 `tool_result` 图片替换、多图逐一描述、同图不同上下文不共用缓存描述、VLM 描述失败回退到 VLM、描述缓存（同图同上下文跨请求命中、异图不混淆、超限淘汰、不可缓存 URL）、haiku 显式路由与缺省回退、非流式 JSON 原样透传、SSE 安全网补帧与去重、stripThinking 剥离时禁用 thinking 参数、损坏 thinking 块规范化（缺失的 `thinking` 字段补空串且不改动其余块）、OpenAI 网关路由（`[routing]` 表值解析、Anthropic→OpenAI 请求翻译的纯文本/图片/工具调用/thinking 剥离、OpenAI→Anthropic 非流式回复与错误透传、流式 SSE 文本与工具调用事件序列、`openai_url` 全端点去重）、image 能力声明（表值 `supports_image` 解析、带图请求跳过 VLM 直发目标/翻译为 `image_url`、image 400 透传不重试）、默认网关（`default_upstream = "openai"` 回填所有未显式声明 upstream 的条目且请求实际走 OpenAI 网关、显式 `upstream = "anthropic"` 不被覆盖、缺省保持 claude/anthropic 网关）、超时与重试（上游 header 超时自动重试成功后客户端拿到正常回复、重试耗尽返回 502 + Anthropic error JSON envelope、流式上游中途停滞发 SSE `error` 事件终止、`/v1/chat/completions` 透传对 503 重试、超时配置默认值、`isRetryableError`/`isRetryableStatus` 分类）、环境变量覆盖配置路径与密钥。
+覆盖：文本/图像/`image_url` 路由、图像经 VLM 描述后插入文本并路由到文本模型、VLM 描述请求携带带图消息的上下文（角色/同消息文本）、`tool_result` 内图片带出工具名与入参、嵌套 `tool_result` 图片替换、多图逐一描述、同图不同上下文不共用缓存描述、VLM 描述失败回退到 VLM、描述缓存（同图同上下文跨请求命中、异图不混淆、超限淘汰、不可缓存 URL）、haiku 显式路由与缺省回退、非流式 JSON 原样透传、SSE 安全网补帧与去重、stripThinking 剥离时禁用 thinking 参数、损坏 thinking 块规范化（缺失的 `thinking` 字段补空串且不改动其余块）、OpenAI 网关路由（`[routing]` 表值解析、Anthropic→OpenAI 请求翻译的纯文本/图片/工具调用/thinking 剥离、OpenAI→Anthropic 非流式回复与错误透传、流式 SSE 文本与工具调用事件序列、`openai_url` 全端点去重）、image 能力声明（表值 `supports_image` 解析、带图请求跳过 VLM 直发目标/翻译为 `image_url`、image 400 透传不重试）、默认网关（`default_upstream = "openai"` 回填所有未显式声明 upstream 的条目且请求实际走 OpenAI 网关、显式 `upstream = "anthropic"` 不被覆盖、缺省保持 claude/anthropic 网关）、超时与重试（上游 header 超时自动重试成功后客户端拿到正常回复、重试耗尽返回 502 + Anthropic error JSON envelope、流式上游中途停滞发 SSE `error` 事件终止、`/v1/chat/completions` 透传对 503 重试、超时配置默认值、`isRetryableError`/`isRetryableStatus` 分类）、上游 DNS 韧性（解析结果缓存复用与 TTL 过期后重新解析、解析故障时回退到最后可用地址并打 `[DNS]` 告警、故障期间按间隔退避重探、无缓存时解析错误上报且被判为可重试、地址字面量不经过解析器、解析失败消耗完整重试预算、自定义拨号钩子下 HTTP/2 不降级）、环境变量覆盖配置路径与密钥。
 
 Web 管理页面部分覆盖：用量提取（Anthropic/OpenAI 的非流式与流式 `usage`，缺失 usage 时不伪造精确值，尾部缓冲与有界缓冲的边界）、统计采集（请求/失败计数、失败率、别名分布、延迟均值与峰值、TPM/RPM 的 60 秒窗口边界、30 分钟分桶、模型数上限溢出、`warn` 不计请求数、每条请求只发布一次、reset）、保留标签的内存边界（模型桶键/别名表键/失败与 `warn` 明细的 `alias` 都不得指向客户端原字符串，用 `unsafe.StringData` 断言而非只看长度；覆盖首次插入与"已有别名被重复计数"两条路径；32 个 1MiB 模型名、32 个被重复计数的别名在 GC 后的保留堆内存）、请求路径埋点（Anthropic 非流式与流式、上游 5xx 与不可达、空响应、OpenAI 网关路由、`/v1/chat/completions` 透传、热重载后路由跟随变化）、管理端（未配置口令时 404、认证失败 401、环境变量口令优先、配置读接口密钥脱敏、保存落盘 + 备份 + 热重载生效、非法输入不落盘、密钥 keep/set/clear 三态、保存保留管理口令、口令三态、端口变更与未声明别名与未知顶层字段的告警、环境变量口令生效时 clear 告警不误称页面已关闭、保存失败提示不承诺配置未改动、重载失败回滚、生成 TOML 的往返解析）。
 
