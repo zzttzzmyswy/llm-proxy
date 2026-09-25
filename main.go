@@ -24,7 +24,7 @@ import (
 )
 
 // version is reported in the startup log and on the admin page.
-const version = "0.12.0"
+const version = "0.12.1"
 
 // Config represents /etc/llm-proxy/config.toml
 type Config struct {
@@ -859,17 +859,6 @@ func ensureThinkingPassBack(req map[string]interface{}) bool {
 	return changed
 }
 
-// lastAssistantIndex returns the index of the last assistant message in an
-// Anthropic (or OpenAI) message list, or -1 when there is none.
-func lastAssistantIndex(msgs []interface{}) int {
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if m, ok := msgs[i].(map[string]interface{}); ok && m["role"] == "assistant" {
-			return i
-		}
-	}
-	return -1
-}
-
 // hasContentBlockOfType reports whether an Anthropic content block array holds a
 // block of the given type.
 func hasContentBlockOfType(content []interface{}, want string) bool {
@@ -1637,26 +1626,44 @@ func anthropicToOpenAIRequest(req map[string]interface{}, openAIModel string) ma
 //
 //	The `reasoning_content` in the thinking mode must be passed back to the API.
 //
-// The upstream inspects only the last assistant message and rejects it when it
-// carries tool_calls without reasoning_content. The Anthropic history being
-// translated holds no OpenAI reasoning to replay (thinking blocks are not portable
-// to this gateway, and the gateway's own streamed reasoning is not translated back
-// into a thinking block), so the empty placeholder the upstream accepts is
-// supplied here. Reports whether the request was modified.
+// Every assistant message carrying tool_calls needs it, not just the last one:
+// the upstream rejects a history whose earlier tool_calls turns omit it just as
+// it rejects the final turn (verified against the live endpoint, which answers
+// 400 "the reasoning_content in the thinking mode must be passed back to the
+// API" when only the last turn carries it).
+//
+// The rule is deliberately a function of the message alone, never of its
+// position. The upstream caches on a token prefix, so a request only reuses the
+// previous turn's cache while every already-sent message still serializes the
+// same way. Patching the last assistant message only would mean a turn is sent
+// with the field while it is last and without it once superseded — the prefix
+// would then diverge at that message on every single turn, and the whole
+// accumulated tail would be re-billed as a cache miss. This mirrors
+// ensureThinkingPassBack on the Anthropic gateway, which likewise patches every
+// qualifying turn.
+//
+// The Anthropic history being translated holds no OpenAI reasoning to replay
+// (thinking blocks are not portable to this gateway, and the gateway's own
+// streamed reasoning is not translated back into a thinking block), so the empty
+// placeholder the upstream accepts is supplied here. Reports whether the request
+// was modified.
 func ensureReasoningPassBack(messages []interface{}) bool {
-	idx := lastAssistantIndex(messages)
-	if idx < 0 {
-		return false
+	changed := false
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]interface{})
+		if !ok || msg["role"] != "assistant" {
+			continue
+		}
+		if _, has := msg["tool_calls"]; !has {
+			continue
+		}
+		if _, has := msg["reasoning_content"]; has {
+			continue
+		}
+		msg["reasoning_content"] = ""
+		changed = true
 	}
-	msg := messages[idx].(map[string]interface{})
-	if _, has := msg["tool_calls"]; !has {
-		return false
-	}
-	if _, has := msg["reasoning_content"]; has {
-		return false
-	}
-	msg["reasoning_content"] = ""
-	return true
+	return changed
 }
 
 // anthropicTextFromBlocks concatenates the text of an Anthropic content block
