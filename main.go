@@ -24,7 +24,7 @@ import (
 )
 
 // version is reported in the startup log and on the admin page.
-const version = "0.12.1"
+const version = "0.12.2"
 
 // Config represents /etc/llm-proxy/config.toml
 type Config struct {
@@ -1954,6 +1954,12 @@ func openAIResponseToAnthropic(body []byte) ([]byte, error) {
 		Usage struct {
 			PromptTokens     int `json:"prompt_tokens"`
 			CompletionTokens int `json:"completion_tokens"`
+			// Cached tokens sit inside prompt_tokens; the client needs them
+			// broken out the same way the upstream reports them, or its own
+			// cost accounting reads every cached token as fresh input.
+			PromptTokensDetails struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
@@ -1986,8 +1992,10 @@ func openAIResponseToAnthropic(body []byte) ([]byte, error) {
 		"stop_reason":   stopReason,
 		"stop_sequence": nil,
 		"usage": map[string]interface{}{
-			"input_tokens":  resp.Usage.PromptTokens,
-			"output_tokens": resp.Usage.CompletionTokens,
+			"input_tokens":                freshPrompt(resp.Usage.PromptTokens, resp.Usage.PromptTokensDetails.CachedTokens),
+			"output_tokens":               resp.Usage.CompletionTokens,
+			"cache_read_input_tokens":     resp.Usage.PromptTokensDetails.CachedTokens,
+			"cache_creation_input_tokens": 0,
 		},
 	})
 }
@@ -2137,8 +2145,19 @@ type anthroSSE struct {
 // usage reports this stream's token counts. Without an upstream usage chunk the
 // output count is the translator's text-length estimate and the input count is
 // unknown, so the result is marked unreported rather than passed off as exact.
+//
+// Input is normalised the same way the non-streaming path normalises it:
+// OpenAI's prompt_tokens already counts the cached tokens, so the cached count
+// is subtracted out. Leaving it in double-counts every cached token — once as
+// fresh input and once as a cache read — which halves the reported cache hit
+// rate of a well-cached conversation and inflates its input token total.
 func (c *anthroSSE) usage() tokenUsage {
-	return tokenUsage{Input: c.promptTok, Output: c.outTok, CacheRead: c.cachedTok, Reported: c.usageSeen}
+	return tokenUsage{
+		Input:     freshPrompt(c.promptTok, c.cachedTok),
+		Output:    c.outTok,
+		CacheRead: c.cachedTok,
+		Reported:  c.usageSeen,
+	}
 }
 
 type anthroTool struct {
