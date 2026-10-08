@@ -789,19 +789,28 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		// so an oversized body still reaches the client whole — only its token
 		// accounting is lost.
 		captured := newLimitedBuffer(maxNonStreamBuffer)
-		if _, err := io.Copy(captured, io.LimitReader(respBody, int64(maxNonStreamBuffer)+1)); err != nil {
+		if _, err := io.Copy(captured, io.LimitReader(respBody, int64(maxNonStreamBuffer))); err != nil {
 			// Headers already committed; aborting the connection is the only option,
 			// which still unblocks the client instead of leaving it hanging.
 			log.Printf("[STREAM_END] error: %v\n", err)
 			tracker.failure(classifyError(err), resp.StatusCode, err.Error())
 			return
 		}
-		if captured.truncated {
-			if _, err := fw.Write(captured.Bytes()); err != nil {
-				log.Printf("[STREAM_END] write error: %v\n", err)
-				return
-			}
-			if _, err := io.Copy(fw, respBody); err != nil {
+		// Reading exactly the cap leaves respBody positioned right after it, so a
+		// single extra byte answers the only question the pass-through branch needs:
+		// did the reply fill the buffer, or overflow it? That byte has already been
+		// consumed from respBody, so it is forwarded on rather than dropped — the
+		// one-byte hole an off-by-one would otherwise punch in every oversized reply.
+		var probe [1]byte
+		probeN, err := io.ReadFull(respBody, probe[:])
+		if err != nil && !errors.Is(err, io.EOF) {
+			log.Printf("[STREAM_END] error: %v\n", err)
+			tracker.failure(classifyError(err), resp.StatusCode, err.Error())
+			return
+		}
+		if probeN > 0 {
+			rest := io.MultiReader(bytes.NewReader(captured.Bytes()), bytes.NewReader(probe[:probeN]), respBody)
+			if _, err := io.Copy(fw, rest); err != nil {
 				log.Printf("[STREAM_END] write error: %v\n", err)
 				return
 			}
