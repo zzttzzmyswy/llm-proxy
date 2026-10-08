@@ -24,7 +24,7 @@ import (
 )
 
 // version is reported in the startup log and on the admin page.
-const version = "0.12.3"
+const version = "0.12.4"
 
 // Config represents /etc/llm-proxy/config.toml
 type Config struct {
@@ -2465,13 +2465,24 @@ func (c *anthroSSE) finish(reason string) {
 			})
 		}
 	}
+	// Carry the upstream's real counts on the closing delta. message_start is
+	// emitted before the stream is read, so it cannot know them; a client that
+	// only reads message_start (as the DeepSeek Messages adapter does) would
+	// otherwise take the placeholder zero as the prompt size. Input is normalised
+	// the same way usage() and the non-streaming path normalise it, so the
+	// cached tokens are not counted twice.
 	c.emit("message_delta", map[string]interface{}{
 		"type": "message_delta",
 		"delta": map[string]interface{}{
 			"stop_reason":   mapStreamStopReason(reason),
 			"stop_sequence": nil,
 		},
-		"usage": map[string]interface{}{"output_tokens": c.outTok},
+		"usage": map[string]interface{}{
+			"input_tokens":                c.usage().Input,
+			"output_tokens":               c.outTok,
+			"cache_read_input_tokens":     c.cachedTok,
+			"cache_creation_input_tokens": 0,
+		},
 	})
 	c.emit("message_stop", map[string]interface{}{"type": "message_stop"})
 }
