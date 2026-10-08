@@ -337,7 +337,15 @@ func openTagKind(s string) string {
 
 // --- SSE 输出辅助 ---
 
+// writeSSE 是所有 SSE 事件的唯一出口（透传与重写路径都经此）。usage 计数在这里
+// 从上游的 OpenAI 口径改写成 Anthropic 口径后再发给客户端：带 billing_usage
+// semantic=openai 标记的块，其 input_tokens 是 OpenAI 的 prompt_tokens（内部已含
+// 缓存 token），Anthropic 客户端按约定把三个计数相加求 prompt 总量，会把缓存
+// token 算两遍，把全命中的会话读成 50% 命中。
 func writeSSE(pw io.Writer, event, data string) {
+	if rewritten, ok := normalizeAnthropicUsageEvent(event, data); ok {
+		data = rewritten
+	}
 	fmt.Fprintf(pw, "event: %s\ndata: %s\n\n", event, data)
 }
 

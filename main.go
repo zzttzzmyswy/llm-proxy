@@ -24,7 +24,7 @@ import (
 )
 
 // version is reported in the startup log and on the admin page.
-const version = "0.12.4"
+const version = "0.12.5"
 
 // Config represents /etc/llm-proxy/config.toml
 type Config struct {
@@ -782,11 +782,14 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 			tracker.success(extractAnthropicUsage(buf.Bytes(), true))
 		}
 	} else {
-		// The body is buffered so its trailing usage block can be read; the buffer
-		// is capped, and a body that exceeds the cap still reaches the client
-		// untouched — only its token accounting is lost.
+		// The body is buffered so its trailing usage block can be read and its
+		// counters normalised before the client sees them. The buffer is capped:
+		// a reply larger than the cap is passed through byte-for-byte (the
+		// buffered prefix, then the rest streamed straight from the upstream),
+		// so an oversized body still reaches the client whole — only its token
+		// accounting is lost.
 		captured := newLimitedBuffer(maxNonStreamBuffer)
-		if _, err := io.Copy(io.MultiWriter(fw, captured), respBody); err != nil {
+		if _, err := io.Copy(captured, io.LimitReader(respBody, int64(maxNonStreamBuffer)+1)); err != nil {
 			// Headers already committed; aborting the connection is the only option,
 			// which still unblocks the client instead of leaving it hanging.
 			log.Printf("[STREAM_END] error: %v\n", err)
@@ -794,11 +797,37 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if captured.truncated {
+			if _, err := fw.Write(captured.Bytes()); err != nil {
+				log.Printf("[STREAM_END] write error: %v\n", err)
+				return
+			}
+			if _, err := io.Copy(fw, respBody); err != nil {
+				log.Printf("[STREAM_END] write error: %v\n", err)
+				return
+			}
 			// The reply was too large to inspect: the token counts are unknown, so
 			// fall back to the request-side estimate rather than reporting zero.
 			tracker.success(tokenUsage{Input: estimateTokens(string(body))})
 		} else {
-			tracker.success(extractAnthropicUsage(captured.Bytes(), false))
+			// A reply the upstream marked "openai" carries OpenAI's prompt_tokens
+			// in input_tokens, cached tokens counted inside; normalise it exactly
+			// as the streaming path does, so a client that sums the counters gets
+			// the same prompt size and hit rate either way. The stats then read the
+			// normalised bytes — the marker is gone, so freshInput does not subtract
+			// the cached count a second time.
+			//
+			// An unmarked reply is passed through byte-for-byte: rebuilding it
+			// through a map would reorder its keys, and a body the proxy has no
+			// business rewriting should reach the client exactly as it arrived.
+			out := captured.Bytes()
+			if rewritten, ok := normalizeAnthropicUsageBody(out); ok {
+				out = rewritten
+			}
+			if _, err := fw.Write(out); err != nil {
+				log.Printf("[STREAM_END] write error: %v\n", err)
+				return
+			}
+			tracker.success(extractAnthropicUsage(out, false))
 		}
 		log.Printf("[STREAM_END] ok bytes=non-stream\n")
 	}

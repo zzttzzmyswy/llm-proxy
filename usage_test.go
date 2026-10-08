@@ -36,6 +36,53 @@ func TestExtractAnthropicUsageStream(t *testing.T) {
 	}
 }
 
+// The deployment's Anthropic endpoint serves OpenAI-backed models by wrapping an
+// OpenAI chat completion, and marks the block "openai": input_tokens then carries
+// OpenAI's prompt_tokens, with the cached tokens counted inside. Reading that as
+// Anthropic's exclusive input_tokens counts every cached token twice — once as
+// fresh input, once as a cache read — and reports a well-cached conversation as
+// roughly a 50% hit. dsh showed exactly this: 49% through the proxy against 99%
+// on the OpenAI gateway for the same upstream model.
+func TestExtractAnthropicUsageSubtractsCachedWhenTheUpstreamSaysOpenAI(t *testing.T) {
+	body := []byte(`{"type":"message","usage":{"input_tokens":10000,"output_tokens":8,` +
+		`"cache_read_input_tokens":9990,"cache_creation_input_tokens":0,` +
+		`"billing_usage":{"semantic":"openai","source":"oai_chat"}}}`)
+	got := extractAnthropicUsage(body, false)
+	if !got.Reported || got.Input != 10 || got.Output != 8 || got.CacheRead != 9990 {
+		t.Fatalf("an openai-semantic block must have its cached tokens subtracted from input, got %+v", got)
+	}
+	if rate := cacheHitRate(int64(got.CacheRead), int64(got.CacheCreation), int64(got.Input)); rate < 0.99 {
+		t.Fatalf("a fully cached conversation must report a hit rate near 1, got %.3f", rate)
+	}
+}
+
+// The same block arrives on the streaming path, where the real counts ride the
+// closing message_delta.
+func TestExtractAnthropicUsageStreamSubtractsCachedWhenTheUpstreamSaysOpenAI(t *testing.T) {
+	stream := strings.Join([]string{
+		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2175,\"output_tokens\":0}}}\n\n",
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":10000," +
+			"\"output_tokens\":8,\"cache_read_input_tokens\":9990,\"cache_creation_input_tokens\":0," +
+			"\"billing_usage\":{\"semantic\":\"openai\"}}}\n\n",
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	}, "")
+	got := extractAnthropicUsage([]byte(stream), true)
+	if !got.Reported || got.Input != 10 || got.Output != 8 || got.CacheRead != 9990 {
+		t.Fatalf("the closing delta's openai-semantic block must be normalised, got %+v", got)
+	}
+}
+
+// A genuine Anthropic-served block has no billing marker and already excludes
+// the cache counters, so it must pass through untouched.
+func TestExtractAnthropicUsageLeavesExclusiveInputAlone(t *testing.T) {
+	body := []byte(`{"type":"message","usage":{"input_tokens":328,"output_tokens":8,` +
+		`"cache_read_input_tokens":14336}}`)
+	got := extractAnthropicUsage(body, false)
+	if !got.Reported || got.Input != 328 || got.CacheRead != 14336 {
+		t.Fatalf("an unmarked block must keep its exclusive input count, got %+v", got)
+	}
+}
+
 func TestExtractOpenAIUsageNonStream(t *testing.T) {
 	body := []byte(`{"id":"c1","usage":{"prompt_tokens":11,"completion_tokens":22}}`)
 	got := extractOpenAIUsage(body, false)
