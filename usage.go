@@ -10,12 +10,13 @@ import (
 // when the upstream did not tell us and the caller had to fall back to a
 // length-based estimate, so the UI can label those numbers honestly.
 //
-// Input is the fresh, uncached prompt. The two gateways disagree about what
-// their prompt counter means — Anthropic's input_tokens excludes the cache
-// counters, OpenAI's prompt_tokens includes the cached ones — so the OpenAI
-// extractors subtract the cached count here, at the boundary. Everything
-// downstream (stats, the cache hit rate) then has one meaning to reason about,
-// and total() stays the same either way because it is a sum.
+// Input is the fresh, uncached prompt. The gateways disagree about what their
+// prompt counter means — Anthropic's input_tokens excludes the cache counters,
+// OpenAI's prompt_tokens includes the cached ones — so both the OpenAI
+// extractors and the Anthropic one subtract the cached count here, at the
+// boundary. Everything downstream (stats, the cache hit rate) then has one
+// meaning to reason about, and total() stays the same either way because it is a
+// sum.
 type tokenUsage struct {
 	Input         int
 	Output        int
@@ -239,6 +240,109 @@ type anthropicUsageFields struct {
 	// report them in message_start only, or repeat them in message_delta.
 	CacheCreationTokens int `json:"cache_creation_input_tokens"`
 	CacheReadTokens     int `json:"cache_read_input_tokens"`
+	// Billing carries the upstream's own statement of which convention the
+	// counters above follow. The deployment's Anthropic endpoint serves the
+	// models it backs with an OpenAI chat completion by wrapping that reply, and
+	// then puts OpenAI's prompt_tokens — which counts the cached tokens inside —
+	// into Anthropic's input_tokens slot, marking the block "openai". Anthropic
+	// itself excludes the cache counters from input_tokens, so the two cannot be
+	// read the same way; see freshInput.
+	Billing struct {
+		Semantic string `json:"semantic"`
+	} `json:"billing_usage"`
+}
+
+// freshInput is the fresh, uncached prompt this block reports.
+//
+// Anthropic's own input_tokens already excludes the cache counters, so it is
+// taken as-is. A block the upstream marked "openai" instead carries OpenAI's
+// prompt_tokens, cached tokens included; subtracting them is the same
+// normalisation the OpenAI extractors apply, and it is what keeps the reported
+// cache hit rate honest. Left inclusive, every cached token lands in the
+// denominator twice — once as fresh input, once as a cache read — which reports
+// a well-cached conversation as roughly a 50% hit.
+func (f anthropicUsageFields) freshInput() int {
+	if f.Billing.Semantic == "openai" {
+		return freshPrompt(f.InputTokens, f.CacheReadTokens)
+	}
+	return f.InputTokens
+}
+
+// normalizeAnthropicUsageEvent rewrites the usage block of a `message_start` or
+// `message_delta` payload into the Anthropic convention before it reaches the
+// client, and reports whether it changed anything.
+//
+// The deployment's Anthropic endpoint answers an OpenAI-backed model by wrapping
+// an OpenAI chat completion, so its input_tokens is OpenAI's prompt_tokens with
+// the cached tokens counted inside, and it marks the block "openai" to say so.
+// Anthropic's own contract is the opposite — input_tokens excludes the cache
+// counters — and the clients on this wire are Anthropic clients: one that adds
+// the counters up to get the prompt size (the DeepSeek Messages adapter dsh
+// uses does exactly that) reads every cached token twice and reports a fully
+// cached conversation as a 50% hit.
+//
+// The marker is dropped along with the rewrite: once input_tokens is exclusive,
+// the block no longer follows the OpenAI convention, and leaving a stale
+// "openai" marker behind would make the stats extractor (freshInput) subtract
+// the cached count a second time.
+func normalizeAnthropicUsageEvent(event, data string) (string, bool) {
+	if event != "message_start" && event != "message_delta" {
+		return "", false
+	}
+	var full map[string]interface{}
+	if json.Unmarshal([]byte(data), &full) != nil {
+		return "", false
+	}
+	owner := full
+	if event == "message_start" {
+		owner, _ = full["message"].(map[string]interface{})
+	}
+	usage, _ := owner["usage"].(map[string]interface{})
+	if !normalizeUsageBlock(usage) {
+		return "", false
+	}
+	rebuilt, err := json.Marshal(full)
+	if err != nil {
+		return "", false
+	}
+	return string(rebuilt), true
+}
+
+// normalizeAnthropicUsageBody applies the same rewrite to a non-streaming
+// Anthropic reply: its usage sits at the top level instead of inside an event.
+func normalizeAnthropicUsageBody(body []byte) ([]byte, bool) {
+	var full map[string]interface{}
+	if json.Unmarshal(body, &full) != nil {
+		return nil, false
+	}
+	usage, _ := full["usage"].(map[string]interface{})
+	if !normalizeUsageBlock(usage) {
+		return nil, false
+	}
+	rebuilt, err := json.Marshal(full)
+	if err != nil {
+		return nil, false
+	}
+	return rebuilt, true
+}
+
+// normalizeUsageBlock rewrites one usage object in place from the OpenAI
+// convention to Anthropic's, reporting whether it carried the marker. A nil or
+// unmarked block is left alone: an Anthropic-served model already reports an
+// exclusive input_tokens, and rewriting it would corrupt the count.
+func normalizeUsageBlock(usage map[string]interface{}) bool {
+	if usage == nil {
+		return false
+	}
+	billing, _ := usage["billing_usage"].(map[string]interface{})
+	if semantic, _ := billing["semantic"].(string); semantic != "openai" {
+		return false
+	}
+	input, _ := usage["input_tokens"].(float64)
+	cached, _ := usage["cache_read_input_tokens"].(float64)
+	usage["input_tokens"] = float64(freshPrompt(int(input), int(cached)))
+	delete(usage, "billing_usage")
+	return true
 }
 
 // extractAnthropicUsage reads token counts from an Anthropic response. A
@@ -258,7 +362,7 @@ func extractAnthropicUsage(body []byte, isSSE bool) tokenUsage {
 			return tokenUsage{}
 		}
 		return tokenUsage{
-			Input:         u.InputTokens,
+			Input:         u.freshInput(),
 			Output:        u.OutputTokens,
 			CacheRead:     u.CacheReadTokens,
 			CacheCreation: u.CacheCreationTokens,
@@ -293,7 +397,7 @@ func extractAnthropicUsage(body []byte, isSSE bool) tokenUsage {
 // already gave.
 func mergeAnthropicUsage(u tokenUsage, f anthropicUsageFields) tokenUsage {
 	if f.InputTokens > 0 {
-		u.Input = f.InputTokens
+		u.Input = f.freshInput()
 	}
 	if f.OutputTokens > 0 {
 		u.Output = f.OutputTokens
