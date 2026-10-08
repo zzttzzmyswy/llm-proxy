@@ -24,7 +24,7 @@ import (
 )
 
 // version is reported in the startup log and on the admin page.
-const version = "0.12.2"
+const version = "0.12.3"
 
 // Config represents /etc/llm-proxy/config.toml
 type Config struct {
@@ -1577,9 +1577,13 @@ func openAICompletionsURL() string {
 }
 
 // anthropicToOpenAIRequest translates an Anthropic /v1/messages request into an
-// OpenAI /v1/chat/completions request. Thinking blocks and the thinking param
-// are dropped (no equivalent on the OpenAI gateway); images become image_url
-// parts; tool_use/tool_result become tool_calls / role=tool messages.
+// OpenAI /v1/chat/completions request. Images become image_url parts;
+// tool_use/tool_result become tool_calls / role=tool messages.
+//
+// Claude Code's effort tier arrives as `output_config.effort` and is carried
+// over as `reasoning_effort` (see mapEffortToReasoningEffort). The `thinking`
+// block keeps its previous behaviour and is still dropped; the OpenAI gateway has
+// no portable equivalent, and the effort tier now travels as its own field.
 func anthropicToOpenAIRequest(req map[string]interface{}, openAIModel string) map[string]interface{} {
 	out := map[string]interface{}{"model": openAIModel}
 
@@ -1618,7 +1622,52 @@ func anthropicToOpenAIRequest(req map[string]interface{}, openAIModel string) ma
 			out["tool_choice"] = c
 		}
 	}
+	if eff, ok := mapEffortToReasoningEffort(req["output_config"]); ok {
+		out["reasoning_effort"] = eff
+	}
 	return out
+}
+
+// reasoningEffortValues is the set the upstream accepts for reasoning_effort,
+// in escalation order. Anything outside it is answered with HTTP 400
+//
+//	'reasoning_effort' must be one of: 'none', 'minimal', 'low', 'medium', 'high', 'xhigh'
+//
+// (verified against the live endpoint), so an unrecognized value must never be
+// forwarded verbatim.
+var reasoningEffortValues = map[string]bool{
+	"none": true, "minimal": true, "low": true,
+	"medium": true, "high": true, "xhigh": true,
+}
+
+// mapEffortToReasoningEffort translates Claude Code's `output_config.effort`
+// into the OpenAI gateway's `reasoning_effort`.
+//
+// The two vocabularies nearly coincide, but not completely: Claude Code's top
+// tier is "max", which the upstream rejects outright. It is clamped to "xhigh",
+// the highest value the deployment accepts, rather than dropped — silently
+// sending no effort at all would make the top two tiers indistinguishable,
+// which is exactly the bug this function exists to fix.
+//
+// An absent or unrecognized effort yields ok=false so the caller leaves the
+// field off entirely (the upstream's own default behaviour).
+func mapEffortToReasoningEffort(outputConfig interface{}) (string, bool) {
+	oc, ok := outputConfig.(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	raw, ok := oc["effort"].(string)
+	if !ok {
+		return "", false
+	}
+	eff := strings.ToLower(strings.TrimSpace(raw))
+	if eff == "max" {
+		eff = "xhigh"
+	}
+	if !reasoningEffortValues[eff] {
+		return "", false
+	}
+	return eff, true
 }
 
 // ensureReasoningPassBack mirrors ensureThinkingPassBack on the OpenAI gateway,

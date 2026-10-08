@@ -1191,3 +1191,103 @@ sonnet = "DeepSeek-V4-Flash-0731"
 		t.Fatalf("the translated openai request must carry the message, got: %s", openAIBody)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Effort / reasoning pass-through on the OpenAI gateway.
+//
+// Claude Code talks to this proxy over the Anthropic Messages API and expresses
+// its effort tier as `output_config.effort`. The OpenAI gateway has a first-class
+// parameter for exactly that (`reasoning_effort`), so the translation must carry
+// the tier across instead of dropping it — otherwise every Claude Code effort
+// setting collapses onto the same upstream request and the tiers are untestable.
+// ---------------------------------------------------------------------------
+
+// upstreamReasoningEfforts is the closed set the deployment's upstream accepts;
+// it rejects `max` with an invalid_params 400, so the mapping must clamp to it.
+var upstreamReasoningEfforts = []string{"none", "minimal", "low", "medium", "high", "xhigh"}
+
+func translateWithEffort(t *testing.T, raw string) map[string]interface{} {
+	t.Helper()
+	var req map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &req); err != nil {
+		t.Fatal(err)
+	}
+	return anthropicToOpenAIRequest(req, "DeepSeek-V3.2")
+}
+
+// Every effort spelling the upstream accepts must survive translation verbatim.
+func TestAnthropicToOpenAIRequestKeepsAcceptedEffort(t *testing.T) {
+	for _, effort := range upstreamReasoningEfforts {
+		out := translateWithEffort(t, `{
+			"model":"sonnet","max_tokens":16,
+			"output_config":{"effort":"`+effort+`"},
+			"messages":[{"role":"user","content":"hi"}]
+		}`)
+		if got := out["reasoning_effort"]; got != effort {
+			t.Fatalf("output_config.effort=%q must map to reasoning_effort=%q, got %v",
+				effort, effort, got)
+		}
+	}
+}
+
+// `max` is Claude Code's highest tier but the upstream rejects the wire value
+// `max` with a 400, so it clamps to the highest value the upstream does accept.
+func TestAnthropicToOpenAIRequestClampsMaxEffort(t *testing.T) {
+	out := translateWithEffort(t, `{
+		"model":"sonnet","max_tokens":16,
+		"output_config":{"effort":"max"},
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	if got := out["reasoning_effort"]; got != "xhigh" {
+		t.Fatalf("effort=max must clamp to xhigh (the highest accepted), got %v", got)
+	}
+}
+
+// An unknown or absent effort must not invent a value: the upstream applies its
+// own default, and fabricating a tier would silently change every plain request.
+func TestAnthropicToOpenAIRequestOmitsEffortWhenAbsent(t *testing.T) {
+	for name, raw := range map[string]string{
+		"no output_config": `{"model":"sonnet","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`,
+		"empty effort":     `{"model":"sonnet","max_tokens":16,"output_config":{"effort":""},"messages":[{"role":"user","content":"hi"}]}`,
+		"unknown effort":   `{"model":"sonnet","max_tokens":16,"output_config":{"effort":"turbo"},"messages":[{"role":"user","content":"hi"}]}`,
+	} {
+		out := translateWithEffort(t, raw)
+		if _, has := out["reasoning_effort"]; has {
+			t.Fatalf("%s: must not send reasoning_effort, got %v", name, out["reasoning_effort"])
+		}
+	}
+}
+
+// Claude Code sends `thinking:{type:"adaptive"}`, which this upstream rejects
+// ("'type' must be in [enabled, disabled, auto]"). It must never reach upstream
+// raw; the effort tier above is what carries the setting across.
+func TestAnthropicToOpenAIRequestDropsAdaptiveThinking(t *testing.T) {
+	out := translateWithEffort(t, `{
+		"model":"sonnet","max_tokens":16,
+		"thinking":{"type":"adaptive","display":"omitted"},
+		"output_config":{"effort":"xhigh"},
+		"messages":[{"role":"user","content":"hi"}]
+	}`)
+	if _, has := out["thinking"]; has {
+		t.Fatalf("adaptive thinking is rejected by the upstream and must be dropped, got %v", out["thinking"])
+	}
+	if out["reasoning_effort"] != "xhigh" {
+		t.Fatalf("the effort tier must still cross over, got %v", out["reasoning_effort"])
+	}
+}
+
+// The thinking block is never forwarded, whatever shape it takes: the OpenAI
+// gateway has no equivalent field, and Claude Code's `adaptive` form is one the
+// upstream actively rejects. The effort tier travels separately as
+// reasoning_effort, so dropping this costs no reasoning control.
+func TestAnthropicToOpenAIRequestDropsThinking(t *testing.T) {
+	for _, raw := range []string{
+		`{"model":"sonnet","max_tokens":1024,"thinking":{"type":"enabled","budget_tokens":8000},"messages":[{"role":"user","content":"hi"}]}`,
+		`{"model":"sonnet","max_tokens":1024,"thinking":{"type":"adaptive","display":"omitted"},"messages":[{"role":"user","content":"hi"}]}`,
+	} {
+		out := translateWithEffort(t, raw)
+		if v, has := out["thinking"]; has {
+			t.Fatalf("thinking must not be forwarded to the OpenAI gateway, got %v", v)
+		}
+	}
+}
