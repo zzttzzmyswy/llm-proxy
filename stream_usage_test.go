@@ -57,3 +57,39 @@ func TestStreamUsageWithoutCachedCountsAllInput(t *testing.T) {
 			usage.Input, usage.CacheRead)
 	}
 }
+
+// TestStreamCarriesRealUsageToTheClient pins the client-visible half of the same
+// accounting. The Anthropic framing reports usage twice: once in the opening
+// `message_start` and once in the closing `message_delta`. message_start is
+// emitted before the upstream stream has been read, so it cannot know the real
+// counts and carries placeholders. A client that reads only message_start — the
+// DeepSeek Messages adapter dsh uses does exactly that — therefore depends on
+// the closing delta carrying the real numbers.
+func TestStreamCarriesRealUsageToTheClient(t *testing.T) {
+	const prompt, cached, completion = 10000, 9990, 4
+	var buf strings.Builder
+	if _, err := translateOpenAIStream(strings.NewReader(openAISSEWithUsage(prompt, cached, completion)), &buf, "m"); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+
+	var deltaUsage string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "data:") && strings.Contains(line, `"message_delta"`) {
+			deltaUsage = line
+		}
+	}
+	if deltaUsage == "" {
+		t.Fatal("the stream must close with a message_delta event")
+	}
+	// Fresh input, normalised like every other reporting path.
+	if !strings.Contains(deltaUsage, `"input_tokens":`+strconv.Itoa(prompt-cached)) {
+		t.Fatalf("message_delta must carry the real fresh input count (%d), got: %s", prompt-cached, deltaUsage)
+	}
+	if !strings.Contains(deltaUsage, `"cache_read_input_tokens":`+strconv.Itoa(cached)) {
+		t.Fatalf("message_delta must carry the cached count (%d), got: %s", cached, deltaUsage)
+	}
+	if !strings.Contains(deltaUsage, `"output_tokens":`+strconv.Itoa(completion)) {
+		t.Fatalf("message_delta must carry the completion count (%d), got: %s", completion, deltaUsage)
+	}
+}
