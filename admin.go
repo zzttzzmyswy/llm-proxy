@@ -261,7 +261,11 @@ func handleAdminConfigSave(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "请求体不是合法 JSON: "+err.Error())
 		return
 	}
-	if err := validateConfigPayload(&payload); err != nil {
+	// The running config is read before validation: the save must be checked
+	// against the profiles that exist, and the [upstreams.*] tables the form does
+	// not edit are carried over from it.
+	oldConfig := currentConfig()
+	if err := validateConfigPayload(&payload, oldConfig.knownProfileNames()); err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -270,7 +274,6 @@ func handleAdminConfigSave(w http.ResponseWriter, r *http.Request) {
 	defer configSaveMu.Unlock()
 
 	path := configPathFromEnv()
-	oldConfig := currentConfig()
 
 	newKey := oldConfig.Keys.Sophnet
 	switch payload.Keys.Action {
@@ -290,7 +293,11 @@ func handleAdminConfigSave(w http.ResponseWriter, r *http.Request) {
 		newAdminTok = ""
 	}
 
-	rendered := renderConfigTOML(payload, newAdminTok, newKey)
+	rendered := renderConfigTOMLPreserving(payload, newAdminTok, newKey, preservedConfig{
+		Upstreams:    oldConfig.Upstreams,
+		VLMUpstream:  oldConfig.Proxy.VLMUpstream,
+		ChatUpstream: oldConfig.Proxy.ChatUpstream,
+	})
 
 	// Parse before writing: a config file that cannot be read would take the
 	// proxy down on its next restart.
@@ -384,8 +391,10 @@ func configWarnings(payload adminConfigPayload, old Config, droppedKeys []string
 }
 
 // validateConfigPayload rejects a save that would produce a config the proxy
-// cannot serve. Nothing is written when it fails.
-func validateConfigPayload(p *adminConfigPayload) error {
+// cannot serve. Nothing is written when it fails. profiles is the set of profile
+// names (lowercase) the save may reference — the running config's, since the
+// form does not edit [upstreams.*] yet.
+func validateConfigPayload(p *adminConfigPayload, profiles map[string]bool) error {
 	if p.Proxy.Port < 1 || p.Proxy.Port > 65535 {
 		return fmt.Errorf("端口 %d 超出范围（1-65535）", p.Proxy.Port)
 	}
@@ -398,8 +407,8 @@ func validateConfigPayload(p *adminConfigPayload) error {
 	if err := validateURL("openai_url", p.Upstream.OpenAIURL); err != nil {
 		return err
 	}
-	if !validUpstreamName(p.Upstream.DefaultUpstream) {
-		return fmt.Errorf("default_upstream 只能是 \"\"、\"claude\"、\"anthropic\" 或 \"openai\"")
+	if !validProfileSelector(p.Upstream.DefaultUpstream, profiles) {
+		return fmt.Errorf("default_upstream 只能是 \"\"、\"claude\"、\"anthropic\"、\"openai\" 或已定义的上游 profile 名")
 	}
 	if p.Upstream.HeaderTimeoutSeconds < 0 || p.Upstream.BodyIdleSeconds < 0 || p.Upstream.MaxRetries < 0 {
 		return fmt.Errorf("超时与重试次数不能为负数")
@@ -437,8 +446,8 @@ func validateConfigPayload(p *adminConfigPayload) error {
 		if strings.TrimSpace(e.Model) == "" {
 			return fmt.Errorf("路由 %q 的模型名不能为空", e.Alias)
 		}
-		if !validUpstreamName(e.Upstream) {
-			return fmt.Errorf("路由 %q 的 upstream 只能是 \"\"、\"claude\"、\"anthropic\" 或 \"openai\"", e.Alias)
+		if !validProfileSelector(e.Upstream, profiles) {
+			return fmt.Errorf("路由 %q 的 upstream 只能是 \"\"、\"claude\"、\"anthropic\"、\"openai\" 或已定义的上游 profile 名", e.Alias)
 		}
 		for _, field := range []struct{ name, value string }{
 			{"别名", e.Alias}, {"模型名", e.Model},
@@ -463,12 +472,42 @@ func validateConfigPayload(p *adminConfigPayload) error {
 	return nil
 }
 
+// validUpstreamName reports whether s is one of the gateway names the proxy has
+// always understood, ignoring case. It is the fallback half of
+// validProfileSelector and is kept separate so the meaning of the two builtin
+// names stays legible.
 func validUpstreamName(s string) bool {
-	switch strings.ToLower(s) {
-	case "", "claude", "anthropic", "openai":
+	switch normalizeUpstreamName(s) {
+	case "", "claude", profileNameAnthropic, profileNameOpenAI:
 		return true
 	}
 	return false
+}
+
+// validProfileSelector reports whether s may be written into a route's upstream
+// field or into default_upstream. An empty value, the builtin gateway names, and
+// any declared profile name are accepted; anything else would name a profile the
+// config cannot resolve, which the loader would silently skip — so the save is
+// rejected instead, at the one point where the operator can still fix it.
+func validProfileSelector(s string, profiles map[string]bool) bool {
+	if validUpstreamName(s) {
+		return true
+	}
+	return profiles[normalizeUpstreamName(s)]
+}
+
+// knownProfileNames returns the lowercase names of every profile the config
+// defines, including the two implicit ones. The admin validator checks a route's
+// upstream against this set, so a save can only reference a profile that exists.
+func (c Config) knownProfileNames() map[string]bool {
+	names := map[string]bool{
+		profileNameAnthropic: true,
+		profileNameOpenAI:    true,
+	}
+	for name := range c.Upstreams {
+		names[normalizeUpstreamName(name)] = true
+	}
+	return names
 }
 
 func validateURL(field, raw string) error {
@@ -508,10 +547,37 @@ func tomlKey(s string) string {
 
 func tomlString(s string) string { return strconv.Quote(s) }
 
-// renderConfigTOML writes the config file the admin page produces. Hand-written
-// comments in the previous file are not preserved; the backup taken before each
-// save is the recovery path for anything the rewrite drops.
+// preservedConfig carries the config sections a save must not lose but the form
+// does not yet edit. The page's save rewrites the whole file, so anything the
+// payload does not model has to be written back from the running config.
+//
+// The [upstreams.*] profiles and the two [proxy] profile selectors are in this
+// category: the form gains editors for them in a later task, and until then a
+// save from the current page must leave them exactly as they were.
+type preservedConfig struct {
+	Upstreams    map[string]UpstreamProfile
+	VLMUpstream  string
+	ChatUpstream string
+}
+
+// renderConfigTOML writes the config file the admin page produces from the form
+// fields alone, dropping the sections the form does not model. A save goes
+// through renderConfigTOMLPreserving instead, which writes those back.
 func renderConfigTOML(p adminConfigPayload, adminTok, sophnetKey string) string {
+	return renderConfigTOMLWithProfiles(p, adminTok, sophnetKey, preservedConfig{})
+}
+
+// renderConfigTOMLPreserving renders the form's fields plus the sections the form
+// does not model yet — [upstreams.*] and the two [proxy] profile selectors — so
+// a save from the profile-unaware page leaves them exactly as they were.
+func renderConfigTOMLPreserving(p adminConfigPayload, adminTok, sophnetKey string, keep preservedConfig) string {
+	return renderConfigTOMLWithProfiles(p, adminTok, sophnetKey, keep)
+}
+
+// renderConfigTOMLWithProfiles writes the config file the admin page produces.
+// Hand-written comments in the previous file are not preserved; the backup taken
+// before each save is the recovery path for anything the rewrite drops.
+func renderConfigTOMLWithProfiles(p adminConfigPayload, adminTok, sophnetKey string, keep preservedConfig) string {
 	var b strings.Builder
 
 	b.WriteString("# llm-proxy configuration.\n")
@@ -524,7 +590,9 @@ func renderConfigTOML(p adminConfigPayload, adminTok, sophnetKey string) string 
 	b.WriteString("# the text model. Routes marked supports_image = true skip this pass.\n")
 	fmt.Fprintf(&b, "vlm_model = %s\n", tomlString(p.Proxy.VLMModel))
 	b.WriteString("# Max output tokens for each image-description call.\n")
-	fmt.Fprintf(&b, "vlm_max_tokens = %d\n\n", p.Proxy.VLMMaxTokens)
+	fmt.Fprintf(&b, "vlm_max_tokens = %d\n", p.Proxy.VLMMaxTokens)
+	writeProxyProfileSelectors(&b, keep)
+	b.WriteString("\n")
 
 	b.WriteString("[upstream]\n")
 	fmt.Fprintf(&b, "anthropic_url = %s\n", tomlString(p.Upstream.AnthropicURL))
@@ -539,6 +607,8 @@ func renderConfigTOML(p adminConfigPayload, adminTok, sophnetKey string) string 
 	fmt.Fprintf(&b, "body_idle_seconds = %d\n", p.Upstream.BodyIdleSeconds)
 	b.WriteString("# Extra attempts after a transient upstream error or a 429/5xx.\n")
 	fmt.Fprintf(&b, "max_retries = %d\n\n", p.Upstream.MaxRetries)
+
+	writeUpstreamProfiles(&b, keep.Upstreams)
 
 	b.WriteString("[keys]\n")
 	b.WriteString("# Alternative: export SOPHNET_API_KEY=... and leave this empty.\n")
@@ -568,6 +638,62 @@ func renderConfigTOML(p adminConfigPayload, adminTok, sophnetKey string) string 
 		fmt.Fprintf(&b, "%s = { %s }\n", key, strings.Join(parts, ", "))
 	}
 	return b.String()
+}
+
+// writeProxyProfileSelectors writes the two [proxy] selectors that name an
+// upstream profile. They are omitted when unset, so a config that never used
+// profiles keeps the file it had.
+func writeProxyProfileSelectors(b *strings.Builder, keep preservedConfig) {
+	if keep.VLMUpstream != "" {
+		b.WriteString("# Upstream profile the builtin image-description calls go through (must speak\n")
+		b.WriteString("# the anthropic protocol). Empty means the implicit \"anthropic\" profile.\n")
+		fmt.Fprintf(b, "vlm_upstream = %s\n", tomlString(keep.VLMUpstream))
+	}
+	if keep.ChatUpstream != "" {
+		b.WriteString("# Upstream profile /v1/chat/completions forwards to (must speak the openai\n")
+		b.WriteString("# protocol). Empty means the implicit \"openai\" profile.\n")
+		fmt.Fprintf(b, "chat_upstream = %s\n", tomlString(keep.ChatUpstream))
+	}
+}
+
+// writeUpstreamProfiles writes the [upstreams.<name>] tables back. The admin
+// form does not edit them yet, so a save must reproduce exactly what the running
+// config holds — a dropped profile would leave every route that names it
+// unroutable.
+//
+// Keys are written in sorted order so a save is reproducible, and the plaintext
+// key is written back only when one is configured: the page never receives it, so
+// it is carried over from the config the proxy is running, never from the form.
+func writeUpstreamProfiles(b *strings.Builder, profiles map[string]UpstreamProfile) {
+	if len(profiles) == 0 {
+		return
+	}
+	names := make([]string, 0, len(profiles))
+	for name := range profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		p := profiles[name]
+		fmt.Fprintf(b, "[upstreams.%s]\n", tomlKey(name))
+		fmt.Fprintf(b, "protocol = %s\n", tomlString(p.Protocol))
+		fmt.Fprintf(b, "url = %s\n", tomlString(p.URL))
+		fmt.Fprintf(b, "key = %s\n", tomlString(p.Key))
+		if p.KeyEnv != "" {
+			fmt.Fprintf(b, "key_env = %s\n", tomlString(p.KeyEnv))
+		}
+		if p.HeaderTimeoutSeconds > 0 {
+			fmt.Fprintf(b, "header_timeout_seconds = %d\n", p.HeaderTimeoutSeconds)
+		}
+		if p.BodyIdleSeconds > 0 {
+			fmt.Fprintf(b, "body_idle_seconds = %d\n", p.BodyIdleSeconds)
+		}
+		if p.MaxRetries > 0 {
+			fmt.Fprintf(b, "max_retries = %d\n", p.MaxRetries)
+		}
+		b.WriteString("\n")
+	}
 }
 
 // backupConfigFile copies the current config aside and returns its contents plus
@@ -656,7 +782,7 @@ func unknownConfigKeys(path string) []string {
 	if toml.Unmarshal(data, &raw) != nil {
 		return nil
 	}
-	known := map[string]bool{"proxy": true, "upstream": true, "keys": true, "admin": true, "routing": true}
+	known := map[string]bool{"proxy": true, "upstream": true, "upstreams": true, "keys": true, "admin": true, "routing": true}
 	var unknown []string
 	for k := range raw {
 		if !known[k] {
