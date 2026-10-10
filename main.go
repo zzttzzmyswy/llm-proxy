@@ -14,6 +14,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -29,11 +30,17 @@ const version = "0.12.6"
 
 // Config represents /etc/llm-proxy/config.toml
 type Config struct {
-	Proxy    ProxyConfig               `toml:"proxy"`
-	Upstream UpstreamConfig            `toml:"upstream"`
-	Keys     KeysConfig                `toml:"keys"`
-	Admin    AdminConfig               `toml:"admin"`
-	Routing  map[string]toml.Primitive `toml:"routing"`
+	Proxy    ProxyConfig    `toml:"proxy"`
+	Upstream UpstreamConfig `toml:"upstream"`
+	// Upstreams holds the named upstream profiles: [upstreams.<name>] tables a
+	// routing entry references by name. The map is normalised to lowercase names
+	// and stripped of unusable tables at load (normalizeUpstreamProfiles), so
+	// every key here resolves. Empty for a config that predates profiles, in
+	// which case the two builtin profiles below stand in for it.
+	Upstreams map[string]UpstreamProfile `toml:"upstreams"`
+	Keys      KeysConfig                 `toml:"keys"`
+	Admin     AdminConfig                `toml:"admin"`
+	Routing   map[string]toml.Primitive  `toml:"routing"`
 }
 
 // AdminConfig configures the web admin page. An empty Token disables the whole
@@ -48,7 +55,75 @@ type ProxyConfig struct {
 	Port         int    `toml:"port"`
 	VLMModel     string `toml:"vlm_model"`
 	VLMMaxTokens int    `toml:"vlm_max_tokens"`
+	// VLMUpstream names the profile the builtin image-description calls go
+	// through (the describe pass and the describe-failed fallback). It must be an
+	// anthropic-protocol profile; "" means the implicit "anthropic" profile.
+	VLMUpstream string `toml:"vlm_upstream"`
+	// ChatUpstream names the profile the /v1/chat/completions passthrough
+	// forwards to. It must be an openai-protocol profile; "" means the implicit
+	// "openai" profile.
+	ChatUpstream string `toml:"chat_upstream"`
 }
+
+// UpstreamProfile is one [upstreams.<name>] table: a named upstream a routing
+// entry can reference by name. Protocol picks how a request is framed for it
+// (anthropic /v1/messages, or OpenAI chat-completions with translation), and the
+// three timeout/retry fields override the [upstream] globals when set.
+type UpstreamProfile struct {
+	// Protocol is "anthropic" or "openai" and is required: exactly one framing
+	// per profile, so a profile never guesses how to talk to its upstream.
+	Protocol string `toml:"protocol"`
+	// URL is the upstream base or endpoint, http(s). For the openai protocol it
+	// follows the same rule as [upstream].openai_url: a base URL gets
+	// /v1/chat/completions appended, a URL already ending in /chat/completions is
+	// used as-is.
+	URL string `toml:"url"`
+	// Key is the plaintext key. KeyEnv names an environment variable that wins
+	// over it when non-empty, so a key can stay out of the file.
+	Key    string `toml:"key"`
+	KeyEnv string `toml:"key_env"`
+	// Zero means "inherit the corresponding [upstream] global".
+	HeaderTimeoutSeconds int `toml:"header_timeout_seconds"`
+	BodyIdleSeconds      int `toml:"body_idle_seconds"`
+	MaxRetries           int `toml:"max_retries"`
+}
+
+// Upstream is one resolved profile: everything needed to send a request to a
+// named upstream, with the [upstream] globals already folded in and the key
+// resolved. Requests carry it instead of reading the config field by field, so
+// one request cannot mix two versions of a profile.
+type Upstream struct {
+	Name          string
+	Protocol      string
+	URL           string
+	Key           string
+	HeaderTimeout time.Duration
+	BodyIdle      time.Duration
+	MaxRetries    int
+}
+
+const (
+	protocolAnthropic = "anthropic"
+	protocolOpenAI    = "openai"
+)
+
+// Every config has these two profiles even when it declares no [upstreams] table:
+// they are synthesised from [upstream].anthropic_url / openai_url with
+// [keys].sophnet (overridden by SOPHNET_API_KEY), which is exactly what the
+// pre-profile proxy used for every request. A config that defines
+// [upstreams.anthropic] or [upstreams.openai] overwrites the matching implicit
+// profile.
+const (
+	profileNameAnthropic = "anthropic"
+	profileNameOpenAI    = "openai"
+	// legacyKeyEnv supplies the implicit profiles' key, matching the one key the
+	// proxy used before profiles existed.
+	legacyKeyEnv = "SOPHNET_API_KEY"
+)
+
+// maxProfileNameLen bounds a profile name, so a malformed config cannot create
+// an unbounded table name.
+const maxProfileNameLen = 32
 
 type UpstreamConfig struct {
 	AnthropicURL string `toml:"anthropic_url"`
@@ -138,6 +213,10 @@ func currentDeclaredRoutes() map[string]RouteEntry {
 type reqConfig struct {
 	cfg    Config
 	routes map[string]RouteEntry
+	// up is the upstream profile this request is bound to. A handler binds it
+	// once routing has picked the profile (see forUpstream); the URL, key,
+	// timeout and retry helpers below then read that one profile.
+	up Upstream
 }
 
 // snapshotConfig captures the running config and its routing table under a single
@@ -148,47 +227,117 @@ func snapshotConfig() reqConfig {
 	return reqConfig{cfg: cfg, routes: routeTargets}
 }
 
-func (rc reqConfig) apiKey() string {
-	if k := os.Getenv("SOPHNET_API_KEY"); k != "" {
-		return k
+// forUpstream binds rc to one resolved profile, so every helper below answers
+// from that profile rather than from the [upstream] globals. Handlers call it as
+// soon as routing has chosen the target, and pass the result down, so a single
+// request cannot send with one profile's key and another's timeout.
+func (rc reqConfig) forUpstream(up Upstream) reqConfig {
+	rc.up = up
+	return rc
+}
+
+// profile resolves a routing entry's upstream name — or the [proxy]
+// vlm_upstream / chat_upstream selector — into the profile a request goes
+// through. Resolution happens inside the request snapshot, so a config save
+// mid-request cannot pair the target chosen before it with a profile read after.
+//
+// "" means the default profile (the implicit "anthropic") and "claude" is its
+// long-standing alias; names are case-folded, so "DeepSeek" finds
+// [upstreams.deepseek]. ok is false when nothing defines the name, which is how
+// a route referring to a profile the config does not have is reported.
+func (rc reqConfig) profile(name string) (Upstream, bool) {
+	return rc.cfg.profileByName(name)
+}
+
+// vlmConfig binds rc to the profile the builtin image-description calls go
+// through: [proxy] vlm_upstream, or the implicit "anthropic" profile when unset.
+// validateProfileSelectors has already folded an unusable selector to "", so a
+// lookup cannot fail here; if one somehow did, the implicit profile is the same
+// fallback the load-time check chose.
+func (rc reqConfig) vlmConfig() reqConfig {
+	up, ok := rc.profile(rc.cfg.Proxy.VLMUpstream)
+	if !ok || up.Protocol != protocolAnthropic {
+		up, _ = rc.profile(profileNameAnthropic)
 	}
-	return rc.cfg.Keys.Sophnet
+	return rc.forUpstream(up)
+}
+
+// chatConfig binds rc to the profile the /v1/chat/completions passthrough
+// forwards to: [proxy] chat_upstream, or the implicit "openai" profile when
+// unset.
+func (rc reqConfig) chatConfig() reqConfig {
+	name := rc.cfg.Proxy.ChatUpstream
+	if normalizeUpstreamName(name) == "" {
+		name = profileNameOpenAI
+	}
+	up, ok := rc.profile(name)
+	if !ok || up.Protocol != protocolOpenAI {
+		up, _ = rc.profile(profileNameOpenAI)
+	}
+	return rc.forUpstream(up)
+}
+
+// apiKey returns the key of the bound profile. An unbound reqConfig falls back
+// to the single legacy key, which is the same resolution the implicit profiles
+// use.
+func (rc reqConfig) apiKey() string {
+	if rc.up.Name != "" {
+		return rc.up.Key
+	}
+	return rc.cfg.profileKey(UpstreamProfile{}, true)
 }
 
 func (rc reqConfig) headerTimeout() time.Duration {
-	if s := rc.cfg.Upstream.HeaderTimeoutSeconds; s > 0 {
-		return time.Duration(s) * time.Second
+	if rc.up.Name != "" {
+		return rc.up.HeaderTimeout
 	}
-	return 120 * time.Second
+	return rc.cfg.headerTimeout()
 }
 
 func (rc reqConfig) bodyIdle() time.Duration {
-	if s := rc.cfg.Upstream.BodyIdleSeconds; s > 0 {
-		return time.Duration(s) * time.Second
+	if rc.up.Name != "" {
+		return rc.up.BodyIdle
 	}
-	return 90 * time.Second
+	return rc.cfg.bodyIdle()
 }
 
 func (rc reqConfig) maxRetries() int {
-	if n := rc.cfg.Upstream.MaxRetries; n > 0 {
-		return n
+	if rc.up.Name != "" {
+		return rc.up.MaxRetries
 	}
-	return 2
+	return rc.cfg.maxRetries()
 }
 
+// anthropicMessagesURL returns the bound profile's Anthropic /v1/messages
+// endpoint.
 func (rc reqConfig) anthropicMessagesURL() string {
-	return rc.cfg.Upstream.AnthropicURL + "/v1/messages"
+	return anthropicMessagesEndpoint(rc.boundBase(protocolAnthropic))
 }
 
 // openAICompletionsURL returns the OpenAI chat-completions endpoint. The
-// configured openai_url may be a base URL (path appended) or already carry the
-// full /chat/completions endpoint.
+// configured URL may be a base URL (path appended) or already carry the full
+// /chat/completions endpoint.
 func (rc reqConfig) openAICompletionsURL() string {
-	base := strings.TrimSuffix(rc.cfg.Upstream.OpenAIURL, "/")
-	if strings.HasSuffix(base, "/chat/completions") {
-		return base
+	return openAICompletionsEndpoint(rc.boundBase(protocolOpenAI))
+}
+
+// boundBase returns the base URL of the bound profile. An unbound reqConfig (a
+// zero value, or one built straight from a Config in a test) falls back to the
+// matching [upstream] global, answering exactly as the pre-profile proxy did.
+//
+// A bound profile is never second-guessed: its URL is the answer regardless of
+// proto. Substituting the global URL when the protocol disagreed would send the
+// request to a gateway the caller did not choose, which is exactly the silent
+// misroute profiles exist to prevent — the callers already select the method
+// that matches the bound protocol.
+func (rc reqConfig) boundBase(proto string) string {
+	if rc.up.Name != "" {
+		return rc.up.URL
 	}
-	return base + "/v1/chat/completions"
+	if proto == protocolOpenAI {
+		return rc.cfg.Upstream.OpenAIURL
+	}
+	return rc.cfg.Upstream.AnthropicURL
 }
 
 func (rc reqConfig) httpClient() *http.Client {
@@ -328,20 +477,240 @@ func parseConfig() (Config, map[string]RouteEntry, map[string]RouteEntry, error)
 	}
 
 	applyDefaults(&c)
+	normalizeUpstreamProfiles(&c)
 
 	declared := buildRouteTargets(c.Routing)
 	routes := make(map[string]RouteEntry, len(declared)+3)
 	for alias, e := range declared {
 		routes[alias] = e
 	}
+	// Drop entries naming an undefined profile before the builtin fallbacks are
+	// applied, so a dropped builtin alias (sonnet/opus/haiku) still gets its
+	// builtin default target instead of disappearing entirely.
+	dropUnknownProfileRoutes(&c, routes)
 	ensureRoute(routes, "sonnet", "DeepSeek-V4-Pro")
 	ensureRoute(routes, "opus", "GLM-5.2")
 	if _, ok := routes["haiku"]; !ok {
 		routes["haiku"] = routes["sonnet"]
 	}
 	applyDefaultUpstream(&c, routes)
+	validateProfileSelectors(&c)
 
+	// The declared table keeps its entries even when one names a profile the
+	// config lacks: the admin page edits what the file says, and re-saving must
+	// not silently delete a route the operator wrote.
 	return c, routes, declared, nil
+}
+
+// normalizeUpstreamProfiles validates the [upstreams] tables and folds them into
+// the form the router and the request path read: lowercase names, a known
+// protocol, a usable URL, and the [upstream] globals resolved into the
+// timeout/retry fields.
+//
+// A table that cannot be served is dropped with a warning rather than aborting
+// the load: one typo must not take the whole proxy down. A routing entry naming a
+// dropped profile is skipped later, by the same per-entry tolerance the [routing]
+// table already has.
+func normalizeUpstreamProfiles(c *Config) {
+	if len(c.Upstreams) == 0 {
+		c.Upstreams = nil
+		return
+	}
+	cleaned := make(map[string]UpstreamProfile, len(c.Upstreams))
+	for rawName, p := range c.Upstreams {
+		name := normalizeUpstreamName(rawName)
+		if name == "" || len(name) > maxProfileNameLen {
+			log.Printf("config: upstream profile %q has an invalid name (%d chars, max %d), skipped\n",
+				rawName, len(name), maxProfileNameLen)
+			continue
+		}
+		if !validProfileName(name) {
+			log.Printf("config: upstream profile %q may only contain a-z, 0-9, '-' and '_', skipped\n", name)
+			continue
+		}
+		// A duplicated name differs only by case, so the fold above collides them.
+		// Keeping the first is deterministic; the config is already ambiguous.
+		if _, dup := cleaned[name]; dup {
+			log.Printf("config: upstream profile %q is defined more than once (names are case-insensitive), keeping the first\n", name)
+			continue
+		}
+		p.Protocol = strings.ToLower(strings.TrimSpace(p.Protocol))
+		if p.Protocol != protocolAnthropic && p.Protocol != protocolOpenAI {
+			log.Printf("config: upstream profile %q has protocol %q, must be %q or %q (profile skipped)\n",
+				name, p.Protocol, protocolAnthropic, protocolOpenAI)
+			continue
+		}
+		if err := validateProfileURL(p.URL); err != nil {
+			log.Printf("config: upstream profile %q: %v (profile skipped)\n", name, err)
+			continue
+		}
+		cleaned[name] = p
+	}
+	if len(cleaned) == 0 {
+		c.Upstreams = nil
+		return
+	}
+	c.Upstreams = cleaned
+}
+
+// validProfileName reports whether a (already lowercase) profile name uses only
+// the characters the documented format allows. tomlKey would quote anything else,
+// but a name reaches the router through a routing entry's upstream field, where
+// quoting rules do not apply — so the restriction is enforced at load.
+func validProfileName(name string) bool {
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validateProfileURL checks a profile URL the same way the admin page checks the
+// [upstream] URLs, so a config the proxy accepts by hand is one the page would
+// also accept.
+func validateProfileURL(raw string) error {
+	if strings.TrimSpace(raw) == "" {
+		return fmt.Errorf("url 不能为空")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("url 不是合法 URL: %v", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("url 必须以 http:// 或 https:// 开头")
+	}
+	if u.Host == "" {
+		return fmt.Errorf("url 缺少主机名")
+	}
+	return nil
+}
+
+// profileByName resolves a name to the profile it refers to, including the two
+// implicit profiles every config has. Names are case-folded; "" is the default
+// profile and "claude" its long-standing alias.
+func (c Config) profileByName(name string) (Upstream, bool) {
+	switch normalizeUpstreamName(name) {
+	case "", "claude", profileNameAnthropic:
+		// An explicit [upstreams.anthropic] replaces the implicit profile built
+		// from [upstream].anthropic_url, so a config can move the default gateway
+		// without a second name for it.
+		if p, ok := c.Upstreams[profileNameAnthropic]; ok {
+			return c.resolvedProfile(profileNameAnthropic, p), true
+		}
+		return c.resolvedProfile(profileNameAnthropic, UpstreamProfile{
+			Protocol: protocolAnthropic,
+			URL:      c.Upstream.AnthropicURL,
+		}), true
+	case profileNameOpenAI:
+		if p, ok := c.Upstreams[profileNameOpenAI]; ok {
+			return c.resolvedProfile(profileNameOpenAI, p), true
+		}
+		return c.resolvedProfile(profileNameOpenAI, UpstreamProfile{
+			Protocol: protocolOpenAI,
+			URL:      c.Upstream.OpenAIURL,
+		}), true
+	}
+	p, ok := c.Upstreams[normalizeUpstreamName(name)]
+	if !ok {
+		return Upstream{}, false
+	}
+	return c.resolvedProfile(normalizeUpstreamName(name), p), true
+}
+
+// resolvedProfile folds the [upstream] globals into a declared profile: an
+// unset per-profile timeout/retry inherits the global, and the key falls back to
+// the legacy key resolution when the profile declares none.
+func (c Config) resolvedProfile(name string, p UpstreamProfile) Upstream {
+	up := Upstream{
+		Name:          name,
+		Protocol:      p.Protocol,
+		URL:           strings.TrimSuffix(p.URL, "/"),
+		HeaderTimeout: c.headerTimeout(),
+		BodyIdle:      c.bodyIdle(),
+		MaxRetries:    c.maxRetries(),
+	}
+	if p.HeaderTimeoutSeconds > 0 {
+		up.HeaderTimeout = time.Duration(p.HeaderTimeoutSeconds) * time.Second
+	}
+	if p.BodyIdleSeconds > 0 {
+		up.BodyIdle = time.Duration(p.BodyIdleSeconds) * time.Second
+	}
+	if p.MaxRetries > 0 {
+		up.MaxRetries = p.MaxRetries
+	}
+	up.Key = c.profileKey(p, name == profileNameAnthropic || name == profileNameOpenAI)
+	return up
+}
+
+// profileKey resolves a profile's key. A non-empty key_env wins over the
+// plaintext key — that precedence is what lets a deployment keep the secret out
+// of the file. Failing that a declared key is used; failing both, only a profile
+// carrying one of the two builtin gateway names falls back to the legacy
+// SOPHNET_API_KEY-over-[keys].sophnet resolution, so an existing config keeps
+// authenticating exactly as before.
+//
+// That fallback covers a hand-written [upstreams.anthropic] as well as the
+// implicit profile it replaces: such a table is still the anthropic gateway, so
+// an operator who only moved its URL must not silently lose the key. A profile
+// with any other name gets an empty key rather than the legacy secret, which
+// would send the default gateway's credential to a third party.
+func (c Config) profileKey(p UpstreamProfile, builtinGatewayName bool) string {
+	if env := strings.TrimSpace(p.KeyEnv); env != "" {
+		if v := os.Getenv(env); v != "" {
+			return v
+		}
+	}
+	if p.Key != "" {
+		return p.Key
+	}
+	if !builtinGatewayName {
+		return ""
+	}
+	if k := os.Getenv(legacyKeyEnv); k != "" {
+		return k
+	}
+	return c.Keys.Sophnet
+}
+
+func (c Config) headerTimeout() time.Duration {
+	if s := c.Upstream.HeaderTimeoutSeconds; s > 0 {
+		return time.Duration(s) * time.Second
+	}
+	return 120 * time.Second
+}
+
+func (c Config) bodyIdle() time.Duration {
+	if s := c.Upstream.BodyIdleSeconds; s > 0 {
+		return time.Duration(s) * time.Second
+	}
+	return 90 * time.Second
+}
+
+func (c Config) maxRetries() int {
+	if n := c.Upstream.MaxRetries; n > 0 {
+		return n
+	}
+	return 2
+}
+
+// anthropicMessagesEndpoint appends the Anthropic messages path to a profile base
+// URL.
+func anthropicMessagesEndpoint(base string) string {
+	return strings.TrimSuffix(base, "/") + "/v1/messages"
+}
+
+// openAICompletionsEndpoint returns the OpenAI chat-completions endpoint for a
+// profile URL that may be a base URL (path appended) or already carry the full
+// /chat/completions endpoint.
+func openAICompletionsEndpoint(base string) string {
+	base = strings.TrimSuffix(base, "/")
+	if strings.HasSuffix(base, "/chat/completions") {
+		return base
+	}
+	return base + "/v1/chat/completions"
 }
 
 // applyDefaults fills every unset field with the value the proxy documents.
@@ -372,19 +741,76 @@ func applyDefaults(c *Config) {
 	}
 }
 
-// applyDefaultUpstream fills the configured default gateway into every routing
-// entry that did not declare an upstream explicitly. ""/"claude"/"anthropic"
-// keep the default anthropic (claude-format) gateway; "openai" routes all
-// upstream-less entries (including the builtin fallback targets) through the
-// OpenAI gateway. Explicit per-entry upstream values are left untouched.
+// applyDefaultUpstream fills the default upstream profile into every routing
+// entry that did not name one explicitly. default_upstream accepts any profile
+// name; ""/"claude"/"anthropic" all mean the anthropic profile, which is also
+// what an unfilled "" entry already resolves to — so those spellings leave the
+// entry untouched rather than rewriting it, keeping the config the operator
+// wrote and the admin form's "inherited, not declared" reading intact.
 func applyDefaultUpstream(c *Config, routes map[string]RouteEntry) {
-	switch strings.ToLower(c.Upstream.DefaultUpstream) {
-	case "openai":
-		for alias, e := range routes {
-			if e.Upstream == "" {
-				e.Upstream = "openai"
-				routes[alias] = e
-			}
+	def := normalizeUpstreamName(c.Upstream.DefaultUpstream)
+	if def == "" || def == "claude" {
+		def = profileNameAnthropic
+	}
+	if def == profileNameAnthropic {
+		return
+	}
+	if _, ok := c.profileByName(def); !ok {
+		log.Printf("config: default_upstream %q is not a defined upstream profile, keeping %q\n",
+			c.Upstream.DefaultUpstream, profileNameAnthropic)
+		return
+	}
+	for alias, e := range routes {
+		if e.Upstream == "" {
+			e.Upstream = def
+			routes[alias] = e
+		}
+	}
+}
+
+// dropUnknownProfileRoutes removes routing entries that name an upstream profile
+// the config does not define. A route to a profile that does not exist has no
+// URL, key or protocol to send with, so serving it would mean silently picking
+// some other gateway; the [routing] table's existing tolerance applies instead —
+// drop the entry with a warning and let the builtin fallback cover a builtin
+// alias. An entry naming no profile at all resolves to the implicit anthropic
+// one, so it is never dropped here.
+func dropUnknownProfileRoutes(c *Config, routes map[string]RouteEntry) {
+	for alias, e := range routes {
+		if _, ok := c.profileByName(e.Upstream); ok {
+			continue
+		}
+		log.Printf("config: routing entry %q names upstream %q, which is not defined (entry skipped)\n",
+			alias, e.Upstream)
+		delete(routes, alias)
+	}
+}
+
+// validateProfileSelectors checks the two [proxy] profile selectors at load, so a
+// typo is reported once at startup instead of on every request that happens to
+// need the VLM or the chat passthrough. An unusable selector falls back to the
+// profile the pre-profile proxy used, keeping the request served.
+func validateProfileSelectors(c *Config) {
+	if name := normalizeUpstreamName(c.Proxy.VLMUpstream); name != "" {
+		up, ok := c.profileByName(name)
+		switch {
+		case !ok:
+			log.Printf("config: proxy.vlm_upstream %q is not a defined upstream profile, falling back to %q\n",
+				c.Proxy.VLMUpstream, profileNameAnthropic)
+		case up.Protocol != protocolAnthropic:
+			log.Printf("config: proxy.vlm_upstream %q has protocol %q, but the VLM describe calls speak %q, falling back to %q\n",
+				name, up.Protocol, protocolAnthropic, profileNameAnthropic)
+		}
+	}
+	if name := normalizeUpstreamName(c.Proxy.ChatUpstream); name != "" {
+		up, ok := c.profileByName(name)
+		switch {
+		case !ok:
+			log.Printf("config: proxy.chat_upstream %q is not a defined upstream profile, falling back to %q\n",
+				c.Proxy.ChatUpstream, profileNameOpenAI)
+		case up.Protocol != protocolOpenAI:
+			log.Printf("config: proxy.chat_upstream %q has protocol %q, but the chat passthrough speaks %q, falling back to %q\n",
+				name, up.Protocol, protocolOpenAI, profileNameOpenAI)
 		}
 	}
 }
@@ -691,6 +1117,25 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	// text-only openai models ("model ... do not support image params").
 	target := rc.routeTarget(model)
 	newModel := target.Model
+	// The profile the target route resolves to. A route naming a profile the
+	// config does not define cannot be served: dropUnknownProfileRoutes removes it
+	// at load, so the only way to get here is a route injected after load (a test,
+	// or a hand-edited published table). Treat it as unroutable and report the
+	// failure rather than silently picking another gateway and billing it.
+	targetUp, haveTarget := rc.profile(target.Upstream)
+	if !haveTarget {
+		log.Printf("[RESP] route %q names undefined upstream %q\n", model, target.Upstream)
+		tracker := stats.beginReqAt(startedAt, model, newModel, protocolAnthropic)
+		tracker.failure(catUpstream4xx, 0, "路由指向的上游 profile 不存在: "+target.Upstream)
+		respondUpstreamError(w, fmt.Errorf("route %q names undefined upstream profile %q", model, target.Upstream))
+		return
+	}
+	// The route's own profile drives the request. vlmRC is the separate profile
+	// [proxy] vlm_upstream names: the VLM may live on a different upstream than the
+	// text model, so the describe pass and the VLM fallbacks must not borrow the
+	// route's URL and key.
+	rc = rc.forUpstream(targetUp)
+	vlmRC := rc.vlmConfig()
 	// vlmFallback is set when the describe pass failed: the original (still
 	// image-carrying) request must be routed to the VLM model via the anthropic
 	// gateway. An openai-route request in this state must NOT be translated to
@@ -702,7 +1147,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	// forwarded to the model as-is (image blocks intact; openai routes translate
 	// them to image_url parts).
 	if containsImage(req) && rc.cfg.Proxy.VLMModel != "" && !target.SupportsImage {
-		if describeImages(req, rc) {
+		// The describe calls go through [proxy] vlm_upstream, not the route's own
+		// profile.
+		if describeImages(req, vlmRC) {
 			body, _ = json.Marshal(req)
 		} else {
 			// Describe failed partway (some images replaced, some not): restore the
@@ -710,7 +1157,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 			json.Unmarshal(body, &req)
 			newModel = rc.cfg.Proxy.VLMModel
 			vlmFallback = true
-			stats.warn(model, rc.cfg.Proxy.VLMModel, "anthropic", catVLMDescribeFailed,
+			stats.warn(model, rc.cfg.Proxy.VLMModel, vlmRC.up.Protocol, catVLMDescribeFailed,
 				"VLM 图片描述失败，整个请求已回退路由到 VLM")
 		}
 	}
@@ -719,15 +1166,17 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		body, _ = json.Marshal(req)
 	}
 
-	// A route marked upstream="openai" leaves this pipeline unless the describe
-	// pass failed, in which case the request must stay on the anthropic gateway.
-	gateway := "anthropic"
-	if target.Upstream == "openai" && !vlmFallback {
-		gateway = "openai"
+	// A route whose profile speaks the OpenAI protocol leaves this pipeline unless
+	// the describe pass failed, in which case the request must stay on the
+	// anthropic profile the VLM lives on.
+	gateway := targetUp.Protocol
+	if vlmFallback {
+		gateway = vlmRC.up.Protocol
+		rc = vlmRC
 	}
 	tracker := stats.beginReqAt(startedAt, model, newModel, gateway)
 
-	if gateway == "openai" {
+	if gateway == protocolOpenAI {
 		handleOpenAIRequest(w, r, req, target.Model, tracker, rc)
 		return
 	}
@@ -760,8 +1209,10 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[RETRY] image 400 -> vlm %s\n", rc.cfg.Proxy.VLMModel)
 			req["model"] = rc.cfg.Proxy.VLMModel
 			body, _ = json.Marshal(req)
-			// The retry goes to the VLM, so the request is accounted against it.
+			// The retry goes to the VLM, so it runs on the VLM profile and is
+			// accounted against the VLM model.
 			tracker.model = rc.cfg.Proxy.VLMModel
+			rc = vlmRC
 			resp, err = doUpstreamRequest(body, r, rc)
 			if err != nil {
 				log.Printf("[RESP] retry error: %v\n", err)
@@ -1729,17 +2180,6 @@ func describeImageWithVLM(block map[string]interface{}, ctx string, rc reqConfig
 		log.Printf("[VLM] described image (uncacheable): %s\n", truncate(desc, 200))
 	}
 	return desc, true
-}
-
-// openAICompletionsURL returns the OpenAI chat completions endpoint. The
-// configured openai_url may be a base URL (path appended) or already carry the
-// full /chat/completions endpoint.
-func openAICompletionsURL() string {
-	base := strings.TrimSuffix(currentConfig().Upstream.OpenAIURL, "/")
-	if strings.HasSuffix(base, "/chat/completions") {
-		return base
-	}
-	return base + "/v1/chat/completions"
 }
 
 // anthropicToOpenAIRequest translates an Anthropic /v1/messages request into an
@@ -2905,9 +3345,12 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var req map[string]interface{}
 	json.Unmarshal(body, &req)
 	model, _ := req["model"].(string)
-	tracker := stats.beginReqAt(startedAt, model, model, "openai")
+	tracker := stats.beginReqAt(startedAt, model, model, protocolOpenAI)
 
-	rc := snapshotConfig()
+	// [proxy] chat_upstream picks the profile this passthrough forwards to; it
+	// must speak the OpenAI protocol, which validateProfileSelectors enforces at
+	// load.
+	rc := snapshotConfig().chatConfig()
 	resp, err := postUpstream(r.Context(), rc.openAICompletionsURL(), body, map[string]string{
 		"Content-Type":  "application/json",
 		"Authorization": "Bearer " + rc.apiKey(),
