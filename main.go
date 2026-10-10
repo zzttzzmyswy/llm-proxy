@@ -731,12 +731,10 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Copy headers
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
+	// Copy headers, minus the framing headers: the body below is re-framed (the
+	// SSE stream is rewritten, the usage block normalised), so the upstream's own
+	// Content-Length describes a body the client will never see.
+	copyUpstreamHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
 	flusher, _ := w.(http.Flusher)
@@ -839,6 +837,44 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 			tracker.success(extractAnthropicUsage(out, false))
 		}
 		log.Printf("[STREAM_END] ok bytes=non-stream\n")
+	}
+}
+
+// isHopByHopHeader reports whether an upstream response header describes how that
+// upstream connection framed its body rather than what the body means.
+//
+// Such a header must never be copied onto the downstream reply, because the proxy
+// re-frames the body it forwards: it rewrites the SSE event stream, normalises the
+// usage block (which shortens a JSON reply), wraps a non-streaming reply into SSE,
+// or appends a missing message_stop. A forwarded Content-Length then describes the
+// upstream's body, not the one the client is about to read.
+//
+// The live Anthropic gateway makes this concrete: it answers a streaming request
+// with `Content-Length: 0` next to `Content-Type: text/event-stream`. Copying that
+// header onto a rewritten stream makes net/http reject every subsequent write
+// ("wrote more than the declared Content-Length"), so the client receives a 200
+// with a zero-length body — the whole reply silently vanishes, stream and
+// non-stream alike.
+func isHopByHopHeader(name string) bool {
+	switch http.CanonicalHeaderKey(name) {
+	case "Content-Length", "Transfer-Encoding", "Connection", "Keep-Alive",
+		"Proxy-Connection", "Upgrade", "Te", "Trailer":
+		return true
+	}
+	return false
+}
+
+// copyUpstreamHeaders forwards an upstream reply's headers onto the client
+// response, minus the framing headers net/http has to decide for itself (see
+// isHopByHopHeader).
+func copyUpstreamHeaders(dst, src http.Header) {
+	for k, vv := range src {
+		if isHopByHopHeader(k) {
+			continue
+		}
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
 	}
 }
 
@@ -2799,11 +2835,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		tracker.failure(cat, resp.StatusCode, "上游返回 HTTP "+strconv.Itoa(resp.StatusCode))
 	}
 
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
+	// Framing headers are dropped for the same reason as on /v1/messages: this
+	// body is forwarded through an idle-bounded reader, never as the upstream
+	// framed it.
+	copyUpstreamHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
 	isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
