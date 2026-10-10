@@ -1495,23 +1495,33 @@ func (c *imageDescCache) get(key string) string {
 	if !ok {
 		return ""
 	}
-	// Move to front (LRU).
-	if e != c.head {
-		if e.prev != nil {
-			e.prev.next = e.next
-		}
-		if e.next != nil {
-			e.next.prev = e.prev
-		}
-		if e == c.tail {
-			c.tail = e.prev
-		}
-		e.prev = nil
-		e.next = c.head
-		c.head.prev = e
-		c.head = e
-	}
+	c.moveToFrontLocked(e)
 	return e.desc
+}
+
+// moveToFrontLocked promotes e to the head of the LRU list. Caller holds the lock.
+func (c *imageDescCache) moveToFrontLocked(e *imgCacheEntry) {
+	if e == c.head {
+		return
+	}
+	if e.prev != nil {
+		e.prev.next = e.next
+	}
+	if e.next != nil {
+		e.next.prev = e.prev
+	}
+	if e == c.tail {
+		c.tail = e.prev
+	}
+	e.prev = nil
+	e.next = c.head
+	if c.head != nil {
+		c.head.prev = e
+	}
+	c.head = e
+	if c.tail == nil {
+		c.tail = e
+	}
 }
 
 // put stores desc under key, evicting least-recently-used entries while total size
@@ -1522,23 +1532,29 @@ func (c *imageDescCache) put(key, desc string, size int) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if e, ok := c.entries[key]; ok {
-		e.desc = desc
-		e.size = size
-		c.size = c.size - e.size + size
-		return
+	e, ok := c.entries[key]
+	if !ok {
+		e = &imgCacheEntry{key: key}
+		c.entries[key] = e
 	}
-	e := &imgCacheEntry{key: key, desc: desc, size: size}
-	c.entries[key] = e
-	if c.head == nil {
-		c.head, c.tail = e, e
-	} else {
-		e.next = c.head
-		c.head.prev = e
-		c.head = e
-	}
-	c.size += size
-	for c.size > c.max && c.tail != nil {
+	// Adjust the total before overwriting e.size: reading it back after the
+	// assignment would subtract the new size instead of the old one, leaving
+	// c.size unchanged and the cap silently unenforced. Re-describing a cached
+	// image is the normal path (the same image with new context), so the
+	// accounting error compounds on its own.
+	c.size += size - e.size
+	e.desc = desc
+	e.size = size
+	// Refresh the entry's LRU position: it was just used.
+	c.moveToFrontLocked(e)
+	c.evictLocked()
+}
+
+// evictLocked drops least-recently-used entries until the total is back under
+// the cap. Caller holds the lock. A newly written entry is at the head, so it is
+// never the one evicted first.
+func (c *imageDescCache) evictLocked() {
+	for c.size > c.max && c.tail != nil && c.tail != c.head {
 		c.removeLocked(c.tail)
 	}
 }
