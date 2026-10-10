@@ -191,7 +191,50 @@ func (rc reqConfig) openAICompletionsURL() string {
 }
 
 func (rc reqConfig) httpClient() *http.Client {
-	return &http.Client{Transport: newUpstreamTransport(rc.headerTimeout()), Timeout: 0}
+	return &http.Client{Transport: upstreamTransport(rc.headerTimeout()), Timeout: 0}
+}
+
+// maxUpstreamTransports bounds how many transport pools are retained. Only a
+// config save that changes header_timeout_seconds introduces a new one, so the
+// bound is never reached in practice; it exists so that a pathological sequence
+// of edits cannot grow the map without limit.
+const maxUpstreamTransports = 8
+
+// upstreamTransports caches one transport per header timeout. A transport owns a
+// connection pool, and a fresh one per request strands every connection it
+// opened: nothing closes an abandoned transport's idle connections, so the
+// process accumulates open sockets to the upstream until it runs out of file
+// descriptors. Production showed 1046 ESTABLISHED sockets after two days, all to
+// the upstream, with the count only ever rising.
+//
+// The cache is keyed by the header timeout because that is the only per-config
+// field of the transport. Reusing it across requests — and across a config save
+// that leaves the timeout alone — is what keeps the idle pool from being
+// orphaned. Transports are safe for concurrent use, so one per timeout is all
+// that is needed.
+var (
+	upstreamTransportsMu sync.Mutex
+	upstreamTransports   = map[time.Duration]*http.Transport{}
+)
+
+// upstreamTransport returns the shared transport for a header timeout.
+func upstreamTransport(headerTimeout time.Duration) *http.Transport {
+	upstreamTransportsMu.Lock()
+	defer upstreamTransportsMu.Unlock()
+	if t, ok := upstreamTransports[headerTimeout]; ok {
+		return t
+	}
+	if len(upstreamTransports) >= maxUpstreamTransports {
+		// Retire the whole set rather than let it grow. Closing each pool's idle
+		// connections is the step the per-request transports never took.
+		for _, stale := range upstreamTransports {
+			stale.CloseIdleConnections()
+		}
+		clear(upstreamTransports)
+	}
+	t := newUpstreamTransport(headerTimeout)
+	upstreamTransports[headerTimeout] = t
+	return t
 }
 
 // newUpstreamTransport builds the transport every upstream call goes through.
