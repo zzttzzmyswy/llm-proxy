@@ -153,8 +153,13 @@ type historySnapshot struct {
 // bumpHistory records one finished request into the current minute of the model's
 // history ring. It runs under the collector lock, next to the second-ring write.
 func (m *modelStats) bumpHistory(now time.Time, tokens int64, failed bool, latency time.Duration, input, cacheRead, cacheCreation int64) {
-	min := now.Unix() / 60 * 60
-	b := &m.history[min%historyRingMinutes]
+	// The slot is the minute NUMBER modulo the ring size, never the second-aligned
+	// minute timestamp. min is a multiple of 60 and gcd(60, 1440) = 60, so indexing
+	// by min directly visited only 24 of the 1440 slots: the "24 hour" chart kept
+	// the last 24 minutes and overwrote the same 24 slots every hour.
+	minNum := now.Unix() / 60
+	min := minNum * 60
+	b := &m.history[minNum%historyRingMinutes]
 	if b.min != min {
 		*b = historyMinute{min: min}
 	}

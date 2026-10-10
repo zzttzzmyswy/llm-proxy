@@ -55,7 +55,6 @@ type leakRewriter struct {
 	textIndex int
 	state     int
 	buf       strings.Builder
-	leakOpen  string // "<invoke" 或 "<tool_call"
 }
 
 // newLeakRewriter 从请求体里提取工具名白名单。请求未声明 tools 时 hasTools=false，
@@ -130,8 +129,10 @@ func (lr *leakRewriter) handleDelta(pw io.Writer, data string) {
 		lr.buf.WriteString(ev.Delta.Text)
 		lr.probe(pw)
 	case stLeak:
+		// Keep buffering and emit nothing: whether this block is a leaked call is a
+		// property of the block as a whole, not of the bytes seen so far, so the
+		// decision waits until the block ends.
 		lr.buf.WriteString(ev.Delta.Text)
-		lr.tryCloseLeak(pw)
 	case stPassthrough:
 		writeTextDelta(pw, lr.textIndex, ev.Delta.Text)
 	}
@@ -143,11 +144,10 @@ func (lr *leakRewriter) handleBlockStop(pw io.Writer, data string) {
 	}
 	json.Unmarshal([]byte(data), &ev)
 	if lr.inText && ev.Index == lr.textIndex && lr.state != stPassthrough {
-		// text block 结束但仍处于探测/泄漏状态：缓冲内容不是完整泄漏，当正常文本补发。
-		writeTextBlockStart(pw, lr.textIndex)
-		if lr.buf.Len() > 0 {
-			writeTextDelta(pw, lr.textIndex, lr.buf.String())
-		}
+		// The block ends while still buffered: this is the first moment the whole
+		// text block is known, so it is where the text-or-tool_use decision is
+		// made. A block that is not exactly one leaked call is replayed as text.
+		lr.finishBlock(pw)
 	}
 	lr.inText = false
 	lr.state = stPassthrough
@@ -155,15 +155,17 @@ func (lr *leakRewriter) handleBlockStop(pw io.Writer, data string) {
 	writeSSE(pw, "content_block_stop", data)
 }
 
-// probe 在探测窗口内判断当前 text block 是否为泄漏。
+// probe 在探测窗口内判断 text block 的开头是否像一段泄漏 XML。
+//
+// 这里只决定"要不要继续缓冲"，不决定最终是否转换：泄漏调用要求整个 text block
+// 就是那段 XML，而这个条件只有 block 结束（或 message_stop）时才能判断。曾经的
+// 实现在闭合标签出现的那一刻就下结论，于是把"正文+XML"或"XML+正文"这类混合
+// block 误判成纯泄漏，前半段正文被直接丢弃。
 func (lr *leakRewriter) probe(pw io.Writer) {
 	s := lr.buf.String()
 	if pos := indexOfOpenTag(s); pos >= 0 && pos < probeWindow {
 		lr.state = stLeak
-		lr.leakOpen = openTagKind(s[pos:])
-		lr.buf.Reset()
-		lr.buf.WriteString(s[pos:])
-		lr.tryCloseLeak(pw)
+		// 开标签之前的前缀是正文，不能丢弃；整段继续缓冲，由 finishBlock 决定。
 		return
 	}
 	if len(s) > probeWindow {
@@ -174,51 +176,59 @@ func (lr *leakRewriter) probe(pw io.Writer) {
 	}
 }
 
-// tryCloseLeak 检查泄漏缓冲是否已含完整闭合标签；闭合则尝试解析并转换。
-func (lr *leakRewriter) tryCloseLeak(pw io.Writer) {
+// finishBlock 在 text block 结束时决定这段缓冲内容的去向。
+//
+// 仅当整个 block 恰好就是一段命中工具白名单的泄漏 XML 时才改写为 tool_use；
+// 其余情况（正文在 XML 之前/之后、未命中白名单、解析失败、半截 XML）一律原样
+// 当作 text 补发，保证内容不丢失、也不会把 text_delta 塞进 tool_use block。
+func (lr *leakRewriter) finishBlock(pw io.Writer) {
 	s := lr.buf.String()
-	closeTag := "</invoke>"
-	if lr.leakOpen == "<tool_call" {
-		closeTag = "</tool_call>"
-	}
-	idx := strings.Index(s, closeTag)
-	if idx < 0 {
-		return // 尚未闭合，继续累积
-	}
-	end := idx + len(closeTag)
-	xmlStr := s[:end]
-	rest := s[end:]
-
-	call, ok := parseLeakedXML(xmlStr)
-	// 仅当"整个 text block 就是这段 XML"（rest 为空）且命中工具白名单时才转换，
-	// 避免混合场景下的 index 冲突与误判。
-	if ok && lr.hasTools && lr.allowed[call.name] && rest == "" {
-		lr.emitToolUse(pw, call)
-		lr.state = stPassthrough
-		lr.buf.Reset()
+	if s == "" {
+		writeTextBlockStart(pw, lr.textIndex)
 		return
 	}
-
-	// 不能转换（未命中白名单 / 解析失败 / 正文+XML 混合）→ 全部当正常文本直通。
-	lr.state = stPassthrough
-	lr.buf.Reset()
-	writeTextBlockStart(pw, lr.textIndex)
-	writeTextDelta(pw, lr.textIndex, xmlStr)
-	if rest != "" {
-		writeTextDelta(pw, lr.textIndex, rest)
+	if call, ok := lr.parseWholeBlockLeak(s); ok {
+		lr.emitToolUse(pw, call)
+		return
 	}
+	// 不能转换 → 整段当正常文本补发。
+	writeTextBlockStart(pw, lr.textIndex)
+	writeTextDelta(pw, lr.textIndex, s)
 }
 
-// flush 在 message_stop 前兜底：若仍处于探测/泄漏状态（半截 XML 被截断），
-// 把缓冲内容当正常文本补发，避免丢内容或让客户端卡住。
+// parseWholeBlockLeak 判断整段文本是否恰好是一个完整的、命中白名单的泄漏调用。
+//
+// "恰好"是硬条件：parser 的正则不做锚定，XML 前后有别的字符同样能匹配，所以这里
+// 必须显式比对匹配区间与整段文本，否则"hello <invoke .../> world"也会被当成工具
+// 调用，正文的一部分就丢了。
+func (lr *leakRewriter) parseWholeBlockLeak(s string) (*leakedCall, bool) {
+	if !lr.hasTools {
+		return nil, false
+	}
+	trimmed := strings.TrimSpace(s)
+	call, start, end, ok := parseLeakedXMLSpan(trimmed)
+	if !ok {
+		return nil, false
+	}
+	// 允许 XML 前后只有空白（上游常在块首尾带换行）。
+	if strings.TrimSpace(trimmed[:start]) != "" || strings.TrimSpace(trimmed[end:]) != "" {
+		return nil, false
+	}
+	if !lr.allowed[call.name] {
+		return nil, false
+	}
+	return call, true
+}
+
+// flush 在 message_stop 前兜底：若 text block 始终没有收到 content_block_stop，
+// 先把缓冲内容补发为 text，再补一个 content_block_stop，避免丢内容或让客户端卡在
+// 未闭合的 block 上。
 func (lr *leakRewriter) flush(pw io.Writer) {
 	if !lr.inText || lr.state == stPassthrough {
 		return
 	}
-	writeTextBlockStart(pw, lr.textIndex)
-	if lr.buf.Len() > 0 {
-		writeTextDelta(pw, lr.textIndex, lr.buf.String())
-	}
+	lr.finishBlock(pw)
+	writeSSE(pw, "content_block_stop", fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, lr.textIndex))
 	lr.inText = false
 	lr.state = stPassthrough
 	lr.buf.Reset()
@@ -250,6 +260,44 @@ func (lr *leakRewriter) emitToolUse(pw io.Writer, call *leakedCall) {
 			"partial_json": string(argsJSON),
 		},
 	})
+}
+
+// parseLeakedXMLSpan 与 parseLeakedXML 解析同两种形态，额外返回匹配区间 [start,end)。
+//
+// 区间是判断"整段文本是否恰好就是一个泄漏调用"的依据：正则用 FindStringSubmatch
+// 匹配，不做锚定，所以 "hello <invoke .../> world" 同样能匹配；只有把匹配区间与
+// 整段文本比对，才能把这类"正文混 XML"的块正确地当正文处理。
+func parseLeakedXMLSpan(s string) (*leakedCall, int, int, bool) {
+	if loc := reInvoke.FindStringSubmatchIndex(s); loc != nil {
+		m := reInvoke.FindStringSubmatch(s)
+		args := map[string]interface{}{}
+		for _, p := range reParam.FindAllStringSubmatch(m[2], -1) {
+			args[p[1]] = parseJSONish(p[2])
+		}
+		return &leakedCall{name: m[1], args: args}, loc[0], loc[1], true
+	}
+	if loc := reToolCall.FindStringSubmatchIndex(s); loc != nil {
+		m := reToolCall.FindStringSubmatch(s)
+		var call *leakedCall
+		if nm := reNameAttr.FindStringSubmatch(m[0]); nm != nil {
+			call = &leakedCall{name: nm[1], args: parseArgsFromJSON(m[1])}
+		} else {
+			var obj map[string]interface{}
+			if json.Unmarshal([]byte(strings.TrimSpace(m[1])), &obj) == nil {
+				if name, _ := obj["name"].(string); name != "" {
+					args, _ := obj["arguments"].(map[string]interface{})
+					if args == nil {
+						args = map[string]interface{}{}
+					}
+					call = &leakedCall{name: name, args: args}
+				}
+			}
+		}
+		if call != nil {
+			return call, loc[0], loc[1], true
+		}
+	}
+	return nil, 0, 0, false
 }
 
 // --- 解析辅助 ---
@@ -323,16 +371,6 @@ func indexOfOpenTag(s string) int {
 		return a
 	}
 	return b
-}
-
-func openTagKind(s string) string {
-	if strings.HasPrefix(s, "<invoke") {
-		return "<invoke"
-	}
-	if strings.HasPrefix(s, "<tool_call") {
-		return "<tool_call"
-	}
-	return ""
 }
 
 // --- SSE 输出辅助 ---

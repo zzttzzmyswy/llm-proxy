@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,7 +25,7 @@ import (
 )
 
 // version is reported in the startup log and on the admin page.
-const version = "0.12.5"
+const version = "0.12.6"
 
 // Config represents /etc/llm-proxy/config.toml
 type Config struct {
@@ -191,7 +192,50 @@ func (rc reqConfig) openAICompletionsURL() string {
 }
 
 func (rc reqConfig) httpClient() *http.Client {
-	return &http.Client{Transport: newUpstreamTransport(rc.headerTimeout()), Timeout: 0}
+	return &http.Client{Transport: upstreamTransport(rc.headerTimeout()), Timeout: 0}
+}
+
+// maxUpstreamTransports bounds how many transport pools are retained. Only a
+// config save that changes header_timeout_seconds introduces a new one, so the
+// bound is never reached in practice; it exists so that a pathological sequence
+// of edits cannot grow the map without limit.
+const maxUpstreamTransports = 8
+
+// upstreamTransports caches one transport per header timeout. A transport owns a
+// connection pool, and a fresh one per request strands every connection it
+// opened: nothing closes an abandoned transport's idle connections, so the
+// process accumulates open sockets to the upstream until it runs out of file
+// descriptors. Production showed 1046 ESTABLISHED sockets after two days, all to
+// the upstream, with the count only ever rising.
+//
+// The cache is keyed by the header timeout because that is the only per-config
+// field of the transport. Reusing it across requests — and across a config save
+// that leaves the timeout alone — is what keeps the idle pool from being
+// orphaned. Transports are safe for concurrent use, so one per timeout is all
+// that is needed.
+var (
+	upstreamTransportsMu sync.Mutex
+	upstreamTransports   = map[time.Duration]*http.Transport{}
+)
+
+// upstreamTransport returns the shared transport for a header timeout.
+func upstreamTransport(headerTimeout time.Duration) *http.Transport {
+	upstreamTransportsMu.Lock()
+	defer upstreamTransportsMu.Unlock()
+	if t, ok := upstreamTransports[headerTimeout]; ok {
+		return t
+	}
+	if len(upstreamTransports) >= maxUpstreamTransports {
+		// Retire the whole set rather than let it grow. Closing each pool's idle
+		// connections is the step the per-request transports never took.
+		for _, stale := range upstreamTransports {
+			stale.CloseIdleConnections()
+		}
+		clear(upstreamTransports)
+	}
+	t := newUpstreamTransport(headerTimeout)
+	upstreamTransports[headerTimeout] = t
+	return t
 }
 
 // newUpstreamTransport builds the transport every upstream call goes through.
@@ -370,6 +414,23 @@ func ensureRoute(routes map[string]RouteEntry, alias, defaultModel string) {
 	}
 }
 
+// normalizeUpstreamName canonicalises the case of a configured gateway name,
+// keeping its meaning. Every spelling the admin validator accepts is folded to the
+// lowercase form the router and the default-gateway pass compare against.
+//
+// Only the case is rewritten, never the value itself: "" means "unset" (so
+// default_upstream may fill it in) and is distinct from an explicit "anthropic",
+// which must stay non-empty to survive that same pass. Collapsing the two would
+// silently reroute a route the operator pinned to the Anthropic gateway.
+//
+// The admin validator already compares case-insensitively (validUpstreamName
+// lowercases before matching), so a value like "OpenAI" is accepted and written to
+// the config. The router compared the raw string against "openai" and silently sent
+// such a route to the Anthropic gateway — the wrong upstream, with no error.
+func normalizeUpstreamName(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
 // decodeRouteEntry turns one [routing] value into a RouteEntry. A plain string is
 // the legacy form (Anthropic gateway). A table must carry at least "model".
 func decodeRouteEntry(p toml.Primitive) (RouteEntry, error) {
@@ -382,8 +443,13 @@ func decodeRouteEntry(p toml.Primitive) (RouteEntry, error) {
 		Upstream      string `toml:"upstream"`
 		SupportsImage bool   `toml:"supports_image"`
 	}
+	// The gateway name is normalised at the one place it enters the process. The
+	// admin validator accepts it case-insensitively (validUpstreamName lowercases
+	// before comparing), so a config carrying "OpenAI" is accepted and saved — but
+	// the router compares the raw value against "openai", which sent an
+	// OpenAI-intended route to the Anthropic gateway instead.
 	if err := toml.PrimitiveDecode(p, &t); err == nil && t.Model != "" {
-		return RouteEntry{Model: t.Model, Upstream: t.Upstream, SupportsImage: t.SupportsImage}, nil
+		return RouteEntry{Model: t.Model, Upstream: normalizeUpstreamName(t.Upstream), SupportsImage: t.SupportsImage}, nil
 	}
 	return RouteEntry{}, fmt.Errorf("must be a model string or { model = \"...\", upstream = \"...\" }")
 }
@@ -731,12 +797,10 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Copy headers
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
+	// Copy headers, minus the framing headers: the body below is re-framed (the
+	// SSE stream is rewritten, the usage block normalised), so the upstream's own
+	// Content-Length describes a body the client will never see.
+	copyUpstreamHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
 	flusher, _ := w.(http.Flusher)
@@ -839,6 +903,43 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 			tracker.success(extractAnthropicUsage(out, false))
 		}
 		log.Printf("[STREAM_END] ok bytes=non-stream\n")
+	}
+}
+
+// isHopByHopHeader reports whether an upstream response header describes how that
+// upstream connection framed its body rather than what the body means.
+//
+// Such a header must never be copied onto the downstream reply, because the proxy
+// re-frames the body it forwards: it rewrites the SSE event stream, normalises the
+// usage block (which shortens a JSON reply), wraps a non-streaming reply into SSE,
+// or appends a missing message_stop. A forwarded Content-Length then describes the
+// upstream's body, not the one the client is about to read.
+//
+// Any upstream that declares a Content-Length (ordinary HTTP/1.1) triggers it:
+// copying that header onto a rewritten stream makes net/http reject the later
+// writes ("wrote more than the declared Content-Length"), so the client gets a
+// 200 with a truncated or empty body. The two live gateways currently frame
+// their replies with HTTP/2 / chunked and so do not trip it.
+func isHopByHopHeader(name string) bool {
+	switch http.CanonicalHeaderKey(name) {
+	case "Content-Length", "Transfer-Encoding", "Connection", "Keep-Alive",
+		"Proxy-Connection", "Upgrade", "Te", "Trailer":
+		return true
+	}
+	return false
+}
+
+// copyUpstreamHeaders forwards an upstream reply's headers onto the client
+// response, minus the framing headers net/http has to decide for itself (see
+// isHopByHopHeader).
+func copyUpstreamHeaders(dst, src http.Header) {
+	for k, vv := range src {
+		if isHopByHopHeader(k) {
+			continue
+		}
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
 	}
 }
 
@@ -1248,8 +1349,19 @@ func collectMessageParts(v interface{}, toolUses map[string]toolUseInfo, parts *
 }
 
 // jsonString renders a tool_use input as compact JSON, truncated to bound the
-// context sent to the VLM.
+// context sent to the VLM. Truncating is safe here and nowhere else: the result
+// only ever goes into a log line or a VLM prompt, never onto a wire format a
+// client parses.
 func jsonString(v interface{}) string {
+	return truncate(jsonStringExact(v), 500)
+}
+
+// jsonStringExact renders a value as compact JSON with nothing cut off. Anything
+// that travels as JSON on a wire format — an OpenAI tool call's `arguments`, an
+// Anthropic `input_json_delta` — must use this: a truncated JSON document is
+// invalid, so the receiver either fails to parse the call or rejects the whole
+// request.
+func jsonStringExact(v interface{}) string {
 	if v == nil {
 		return ""
 	}
@@ -1257,7 +1369,7 @@ func jsonString(v interface{}) string {
 	if err != nil {
 		return ""
 	}
-	return truncate(string(b), 500)
+	return string(b)
 }
 
 func isImageBlock(b map[string]interface{}) bool {
@@ -1405,23 +1517,33 @@ func (c *imageDescCache) get(key string) string {
 	if !ok {
 		return ""
 	}
-	// Move to front (LRU).
-	if e != c.head {
-		if e.prev != nil {
-			e.prev.next = e.next
-		}
-		if e.next != nil {
-			e.next.prev = e.prev
-		}
-		if e == c.tail {
-			c.tail = e.prev
-		}
-		e.prev = nil
-		e.next = c.head
-		c.head.prev = e
-		c.head = e
-	}
+	c.moveToFrontLocked(e)
 	return e.desc
+}
+
+// moveToFrontLocked promotes e to the head of the LRU list. Caller holds the lock.
+func (c *imageDescCache) moveToFrontLocked(e *imgCacheEntry) {
+	if e == c.head {
+		return
+	}
+	if e.prev != nil {
+		e.prev.next = e.next
+	}
+	if e.next != nil {
+		e.next.prev = e.prev
+	}
+	if e == c.tail {
+		c.tail = e.prev
+	}
+	e.prev = nil
+	e.next = c.head
+	if c.head != nil {
+		c.head.prev = e
+	}
+	c.head = e
+	if c.tail == nil {
+		c.tail = e
+	}
 }
 
 // put stores desc under key, evicting least-recently-used entries while total size
@@ -1432,23 +1554,29 @@ func (c *imageDescCache) put(key, desc string, size int) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if e, ok := c.entries[key]; ok {
-		e.desc = desc
-		e.size = size
-		c.size = c.size - e.size + size
-		return
+	e, ok := c.entries[key]
+	if !ok {
+		e = &imgCacheEntry{key: key}
+		c.entries[key] = e
 	}
-	e := &imgCacheEntry{key: key, desc: desc, size: size}
-	c.entries[key] = e
-	if c.head == nil {
-		c.head, c.tail = e, e
-	} else {
-		e.next = c.head
-		c.head.prev = e
-		c.head = e
-	}
-	c.size += size
-	for c.size > c.max && c.tail != nil {
+	// Adjust the total before overwriting e.size: reading it back after the
+	// assignment would subtract the new size instead of the old one, leaving
+	// c.size unchanged and the cap silently unenforced. Re-describing a cached
+	// image is the normal path (the same image with new context), so the
+	// accounting error compounds on its own.
+	c.size += size - e.size
+	e.desc = desc
+	e.size = size
+	// Refresh the entry's LRU position: it was just used.
+	c.moveToFrontLocked(e)
+	c.evictLocked()
+}
+
+// evictLocked drops least-recently-used entries until the total is back under
+// the cap. Caller holds the lock. A newly written entry is at the head, so it is
+// never the one evicted first.
+func (c *imageDescCache) evictLocked() {
+	for c.size > c.max && c.tail != nil && c.tail != c.head {
 		c.removeLocked(c.tail)
 	}
 }
@@ -1915,8 +2043,12 @@ func convertAssistantMessage(msg map[string]interface{}) map[string]interface{} 
 					"id":   id,
 					"type": "function",
 					"function": map[string]interface{}{
-						"name":      name,
-						"arguments": jsonString(b["input"]),
+						"name": name,
+						// Exact, never truncated: this string is the OpenAI
+						// wire format's arguments field, and the upstream parses
+						// it as JSON. A cut-off document makes the tool call
+						// unparseable.
+						"arguments": jsonStringExact(b["input"]),
 					},
 				})
 			case "thinking":
@@ -2495,8 +2627,18 @@ func (c *anthroSSE) finish(reason string) {
 		})
 		c.textOpen = false
 	}
-	for _, acc := range c.tools {
-		if acc.started {
+	// Close the open tool blocks in INDEX order, not map order. Anthropic's
+	// streaming contract numbers every content block with `index`, and a client
+	// that builds the message from those indexes expects the blocks to close in
+	// that same order. Ranging over the map made the order depend on Go's
+	// randomised iteration, so the same reply could close block 2 before block 1.
+	order := make([]int, 0, len(c.tools))
+	for i := range c.tools {
+		order = append(order, i)
+	}
+	sort.Ints(order)
+	for _, i := range order {
+		if acc := c.tools[i]; acc.started {
 			c.emit("content_block_stop", map[string]interface{}{
 				"type":  "content_block_stop",
 				"index": acc.idx,
@@ -2727,9 +2869,11 @@ func anthropicMessageToSSE(translated []byte, model string) ([]byte, error) {
 			}
 		case "tool_use":
 			if input, ok := b["input"]; ok {
+				// Exact, never truncated: a cut-off partial_json is not
+				// parseable, so the client drops the tool call.
 				write(&buf, "content_block_delta", map[string]interface{}{
 					"type": "content_block_delta", "index": i,
-					"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": jsonString(input)},
+					"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": jsonStringExact(input)},
 				})
 			}
 		}
@@ -2782,11 +2926,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		tracker.failure(cat, resp.StatusCode, "上游返回 HTTP "+strconv.Itoa(resp.StatusCode))
 	}
 
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
+	// Framing headers are dropped for the same reason as on /v1/messages: this
+	// body is forwarded through an idle-bounded reader, never as the upstream
+	// framed it.
+	copyUpstreamHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
 	isSSE := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
