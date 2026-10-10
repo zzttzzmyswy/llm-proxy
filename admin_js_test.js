@@ -269,3 +269,158 @@ test("formatBucketLabel widens with the bucket", () => {
   assert.equal(admin.formatBucketLabel(ts, 3600), "09-21 14:00");
   assert.equal(admin.formatBucketLabel(ts, 86400), "09-21");
 });
+
+// ---- config form: profile options and the key three-state ----
+
+// The profile list a save submits is built entirely from these helpers, so a
+// filtering bug here shows up as a rejected save rather than as a silent no-op.
+const PROFILES = [
+  { name: "anthropic", protocol: "anthropic", url: "https://a.example/api", builtin: true },
+  { name: "openai", protocol: "openai", url: "https://o.example/v1", builtin: true },
+  { name: "deepseek", protocol: "anthropic", url: "https://api.deepseek.com/anthropic" },
+  { name: "local", protocol: "openai", url: "http://127.0.0.1:9000/v1" },
+];
+
+test("upstreamOptions keeps the empty default choice first", () => {
+  const opts = admin.upstreamOptions(PROFILES);
+  assert.equal(opts[0].value, "");
+  assert.deepEqual(
+    opts.slice(1).map((o) => o.value),
+    ["anthropic", "openai", "deepseek", "local"],
+  );
+});
+
+// An empty selector is not the same as naming "anthropic": it means "inherit
+// default_upstream", and collapsing the two would freeze an inherited value into
+// the file on the next save.
+test("upstreamOptions lists every profile including the builtin ones", () => {
+  const opts = admin.upstreamOptions(PROFILES);
+  assert.equal(opts.length, PROFILES.length + 1);
+  assert.ok(opts.some((o) => o.value === "anthropic"));
+  assert.ok(opts.some((o) => o.value === "deepseek"));
+});
+
+test("upstreamOptions marks the builtin profiles in the label", () => {
+  const opts = admin.upstreamOptions(PROFILES);
+  const byValue = Object.fromEntries(opts.map((o) => [o.value, o]));
+  assert.match(byValue["anthropic"].label, /内置/);
+  assert.doesNotMatch(byValue["deepseek"].label, /内置/);
+  // The URL is surfaced as the option's tooltip, so two profiles on the same
+  // protocol are still tellable apart.
+  assert.equal(byValue["deepseek"].title, "https://api.deepseek.com/anthropic");
+});
+
+test("upstreamOptions tolerates a missing profile list", () => {
+  assert.equal(admin.upstreamOptions(undefined).length, 1);
+  assert.equal(admin.upstreamOptions(null)[0].value, "");
+});
+
+// The VLM describe pass speaks anthropic and the chat passthrough openai, so each
+// selector may only offer profiles of its own protocol — anything else is a save
+// the server would reject.
+test("proxySelectorOptions filters to the caller's protocol", () => {
+  const vlm = admin.proxySelectorOptions(PROFILES, "anthropic").map((o) => o.value);
+  assert.deepEqual(vlm, ["", "anthropic", "deepseek"]);
+
+  const chat = admin.proxySelectorOptions(PROFILES, "openai").map((o) => o.value);
+  assert.deepEqual(chat, ["", "openai", "local"]);
+});
+
+test("proxySelectorOptions offers the implicit profile when nothing matches", () => {
+  const only = admin.proxySelectorOptions([{ name: "d", protocol: "anthropic" }], "openai");
+  assert.deepEqual(only.map((o) => o.value), [""]);
+});
+
+test("profileOptions with no protocol keeps every profile", () => {
+  assert.equal(admin.profileOptions(PROFILES).length, PROFILES.length);
+  assert.deepEqual(admin.profileOptions(undefined).length, 0);
+});
+
+// The key field is keep/set/clear, and blank has to mean "keep": the stored key is
+// never sent to the page, so reading blank as "no key" would wipe it on every save.
+test("keyActionOf reads blank as keep", () => {
+  assert.equal(admin.keyActionOf("", false), "keep");
+});
+
+test("keyActionOf reads a typed value as set", () => {
+  assert.equal(admin.keyActionOf("sk-new", false), "set");
+});
+
+test("keyActionOf reads the clear box as clear", () => {
+  assert.equal(admin.keyActionOf("", true), "clear");
+  // clear wins over a leftover typed value, matching the UI, which empties the
+  // field as soon as the box is ticked.
+  assert.equal(admin.keyActionOf("sk-typed", true), "clear");
+});
+
+// ---- config form: the payload the save posts ----
+
+// A blank key field must read as "keep": the page never receives a stored key, so
+// anything else would either wipe it or force the operator to retype it.
+test("profilePayloadFromRow reads a blank key as keep", () => {
+  const row = admin.profilePayloadFromRow({
+    name: "  deepseek  ",
+    protocol: "anthropic",
+    url: "  https://api.deepseek.com/anthropic  ",
+    key: "",
+    keyCleared: false,
+    keyEnv: "  DEEPSEEK_API_KEY  ",
+    headerTimeout: "30",
+    bodyIdle: "",
+    maxRetries: "4",
+  });
+  assert.deepEqual(row, {
+    name: "deepseek",
+    protocol: "anthropic",
+    url: "https://api.deepseek.com/anthropic",
+    key_action: "keep",
+    key: "",
+    key_env: "DEEPSEEK_API_KEY",
+    header_timeout_seconds: 30,
+    body_idle_seconds: 0,
+    max_retries: 4,
+  });
+});
+
+test("profilePayloadFromRow reads a typed key as set", () => {
+  const row = admin.profilePayloadFromRow({ name: "p", protocol: "openai", url: "http://x/y", key: "sk-new" });
+  assert.equal(row.key_action, "set");
+  assert.equal(row.key, "sk-new");
+});
+
+test("profilePayloadFromRow lets the clear box win over a typed key", () => {
+  const row = admin.profilePayloadFromRow({ name: "p", key: "sk-typed", keyCleared: true });
+  assert.equal(row.key_action, "clear");
+});
+
+// The validator rejects a negative timeout, so a field the browser reports as
+// empty or unparsable has to become 0 rather than NaN or a negative.
+test("profilePayloadFromRow normalises unparsable numbers to zero", () => {
+  const row = admin.profilePayloadFromRow({ name: "p", headerTimeout: "", bodyIdle: "abc", maxRetries: "-5" });
+  assert.equal(row.header_timeout_seconds, 0);
+  assert.equal(row.body_idle_seconds, 0);
+  assert.equal(row.max_retries, -5, "a negative value is passed through for the server to reject");
+});
+
+test("profilePayloadFromRow tolerates absent fields", () => {
+  const row = admin.profilePayloadFromRow({});
+  assert.equal(row.name, "");
+  assert.equal(row.key_action, "keep");
+  assert.equal(row.key, "");
+  assert.equal(row.header_timeout_seconds, 0);
+});
+
+// An empty routing row is a line the operator left behind; submitting it would be
+// rejected as an empty alias, so it has to be dropped instead.
+test("routePayloadFromRow drops an empty row", () => {
+  assert.equal(admin.routePayloadFromRow({ alias: "  ", model: "  " }), null);
+  assert.equal(admin.routePayloadFromRow({}), null);
+});
+
+test("routePayloadFromRow trims and keeps a filled row", () => {
+  assert.deepEqual(
+    admin.routePayloadFromRow({ alias: " sonnet ", model: " deepseek-chat ", upstream: "deepseek", supportsImage: true }),
+    { alias: "sonnet", model: "deepseek-chat", upstream: "deepseek", supports_image: true },
+  );
+  assert.equal(admin.routePayloadFromRow({ alias: "x", model: "y" }).supports_image, false);
+});
