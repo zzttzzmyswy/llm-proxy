@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2605,8 +2606,18 @@ func (c *anthroSSE) finish(reason string) {
 		})
 		c.textOpen = false
 	}
-	for _, acc := range c.tools {
-		if acc.started {
+	// Close the open tool blocks in INDEX order, not map order. Anthropic's
+	// streaming contract numbers every content block with `index`, and a client
+	// that builds the message from those indexes expects the blocks to close in
+	// that same order. Ranging over the map made the order depend on Go's
+	// randomised iteration, so the same reply could close block 2 before block 1.
+	order := make([]int, 0, len(c.tools))
+	for i := range c.tools {
+		order = append(order, i)
+	}
+	sort.Ints(order)
+	for _, i := range order {
+		if acc := c.tools[i]; acc.started {
 			c.emit("content_block_stop", map[string]interface{}{
 				"type":  "content_block_stop",
 				"index": acc.idx,
