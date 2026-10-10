@@ -826,13 +826,15 @@ flash = { model = "local-glm", upstream = "local" }
 	anthroAfter := atomic.LoadInt64(&anthroConns)
 	openAIAfter := atomic.LoadInt64(&openAIConns)
 
-	if anthroAfter >= int64(perProfile) {
-		t.Fatalf("%d concurrent anthropic requests opened %d connections; each request stranded its own socket",
-			perProfile, anthroAfter)
+	// A burst may legitimately open one socket per in-flight request, so the burst
+	// count itself proves nothing about reuse (asserting it below perProfile fails
+	// whenever every request dials before any connection returns to the pool). It
+	// can only be bounded from above: more than one dial per request is a leak.
+	if anthroAfter > int64(perProfile) {
+		t.Fatalf("%d concurrent anthropic requests opened %d connections", perProfile, anthroAfter)
 	}
-	if openAIAfter >= int64(perProfile) {
-		t.Fatalf("%d concurrent openai requests opened %d connections; each request stranded its own socket",
-			perProfile, openAIAfter)
+	if openAIAfter > int64(perProfile) {
+		t.Fatalf("%d concurrent openai requests opened %d connections", perProfile, openAIAfter)
 	}
 
 	const sequential = 20
