@@ -414,6 +414,23 @@ func ensureRoute(routes map[string]RouteEntry, alias, defaultModel string) {
 	}
 }
 
+// normalizeUpstreamName canonicalises the case of a configured gateway name,
+// keeping its meaning. Every spelling the admin validator accepts is folded to the
+// lowercase form the router and the default-gateway pass compare against.
+//
+// Only the case is rewritten, never the value itself: "" means "unset" (so
+// default_upstream may fill it in) and is distinct from an explicit "anthropic",
+// which must stay non-empty to survive that same pass. Collapsing the two would
+// silently reroute a route the operator pinned to the Anthropic gateway.
+//
+// The admin validator already compares case-insensitively (validUpstreamName
+// lowercases before matching), so a value like "OpenAI" is accepted and written to
+// the config. The router compared the raw string against "openai" and silently sent
+// such a route to the Anthropic gateway — the wrong upstream, with no error.
+func normalizeUpstreamName(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
 // decodeRouteEntry turns one [routing] value into a RouteEntry. A plain string is
 // the legacy form (Anthropic gateway). A table must carry at least "model".
 func decodeRouteEntry(p toml.Primitive) (RouteEntry, error) {
@@ -426,8 +443,13 @@ func decodeRouteEntry(p toml.Primitive) (RouteEntry, error) {
 		Upstream      string `toml:"upstream"`
 		SupportsImage bool   `toml:"supports_image"`
 	}
+	// The gateway name is normalised at the one place it enters the process. The
+	// admin validator accepts it case-insensitively (validUpstreamName lowercases
+	// before comparing), so a config carrying "OpenAI" is accepted and saved — but
+	// the router compares the raw value against "openai", which sent an
+	// OpenAI-intended route to the Anthropic gateway instead.
 	if err := toml.PrimitiveDecode(p, &t); err == nil && t.Model != "" {
-		return RouteEntry{Model: t.Model, Upstream: t.Upstream, SupportsImage: t.SupportsImage}, nil
+		return RouteEntry{Model: t.Model, Upstream: normalizeUpstreamName(t.Upstream), SupportsImage: t.SupportsImage}, nil
 	}
 	return RouteEntry{}, fmt.Errorf("must be a model string or { model = \"...\", upstream = \"...\" }")
 }
