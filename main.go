@@ -1248,8 +1248,19 @@ func collectMessageParts(v interface{}, toolUses map[string]toolUseInfo, parts *
 }
 
 // jsonString renders a tool_use input as compact JSON, truncated to bound the
-// context sent to the VLM.
+// context sent to the VLM. Truncating is safe here and nowhere else: the result
+// only ever goes into a log line or a VLM prompt, never onto a wire format a
+// client parses.
 func jsonString(v interface{}) string {
+	return truncate(jsonStringExact(v), 500)
+}
+
+// jsonStringExact renders a value as compact JSON with nothing cut off. Anything
+// that travels as JSON on a wire format — an OpenAI tool call's `arguments`, an
+// Anthropic `input_json_delta` — must use this: a truncated JSON document is
+// invalid, so the receiver either fails to parse the call or rejects the whole
+// request.
+func jsonStringExact(v interface{}) string {
 	if v == nil {
 		return ""
 	}
@@ -1257,7 +1268,7 @@ func jsonString(v interface{}) string {
 	if err != nil {
 		return ""
 	}
-	return truncate(string(b), 500)
+	return string(b)
 }
 
 func isImageBlock(b map[string]interface{}) bool {
@@ -1915,8 +1926,12 @@ func convertAssistantMessage(msg map[string]interface{}) map[string]interface{} 
 					"id":   id,
 					"type": "function",
 					"function": map[string]interface{}{
-						"name":      name,
-						"arguments": jsonString(b["input"]),
+						"name": name,
+						// Exact, never truncated: this string is the OpenAI
+						// wire format's arguments field, and the upstream parses
+						// it as JSON. A cut-off document makes the tool call
+						// unparseable.
+						"arguments": jsonStringExact(b["input"]),
 					},
 				})
 			case "thinking":
@@ -2727,9 +2742,11 @@ func anthropicMessageToSSE(translated []byte, model string) ([]byte, error) {
 			}
 		case "tool_use":
 			if input, ok := b["input"]; ok {
+				// Exact, never truncated: a cut-off partial_json is not
+				// parseable, so the client drops the tool call.
 				write(&buf, "content_block_delta", map[string]interface{}{
 					"type": "content_block_delta", "index": i,
-					"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": jsonString(input)},
+					"delta": map[string]interface{}{"type": "input_json_delta", "partial_json": jsonStringExact(input)},
 				})
 			}
 		}
