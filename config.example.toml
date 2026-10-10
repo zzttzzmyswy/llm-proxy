@@ -10,6 +10,13 @@ port = 8088
 vlm_model = "MiniMax-M3"
 # Max output tokens for each image-description call.
 vlm_max_tokens = 8000
+# 图片描述调用走哪个上游 profile（必须为 anthropic 协议）。缺省 = 隐式
+# "anthropic" profile（即 [upstream].anthropic_url）。当 VLM 与文本模型不在同一个
+# 上游时，在这里指向一个 [upstreams.*] profile。
+# vlm_upstream = "anthropic"
+# /v1/chat/completions 透传端点走哪个上游 profile（必须为 openai 协议）。缺省 =
+# 隐式 "openai" profile（即 [upstream].openai_url）。
+# chat_upstream = "openai"
 
 [upstream]
 anthropic_url = "https://www.sophnet.com/api/open-apis/anthropic"
@@ -28,8 +35,37 @@ openai_url = "https://www.sophnet.com/api/open-apis/openai"
 # 默认网关：routing 条目没有显式声明 upstream 时走哪个。
 #   "" / "claude" / "anthropic" → Anthropic（claude 格式）网关（默认）
 #   "openai"                     → OpenAI 网关（请求翻译为 OpenAI 协议转发）
+#   其他值                        → 下方 [upstreams.<名字>] 中定义的 profile
 # 显式声明 upstream 的条目不受影响。
 # default_upstream = "openai"
+
+# ---- 命名上游 profile（可选，多上游模式）----
+# 每个 [upstreams.<名字>] 是一份独立的上游定义，routing 条目用 upstream = "<名字>"
+# 引用。名字只能用 a-z 0-9 - _，1~32 字符，大小写不敏感。
+# 旧配置（只写 [upstream] anthropic_url/openai_url）无需任何修改即行为不变：解析时
+# 会自动合成两个隐式 profile —— "anthropic"（协议 anthropic，URL 取
+# anthropic_url）与 "openai"（协议 openai，URL 取 openai_url），密钥同为
+# SOPHNET_API_KEY 环境变量 > [keys].sophnet。
+# 需要时可用 [upstreams.anthropic] / [upstreams.openai] 覆盖这两个隐式 profile。
+#
+# [upstreams.deepseek]
+# # 必填：anthropic | openai，只能选一种协议。
+# protocol = "anthropic"
+# # 必填，http(s)。openai 协议下与 openai_url 同规则：可以是 base URL，也可以
+# # 直接写完整的 /chat/completions。
+# url = "https://api.deepseek.com/anthropic"
+# # 可选明文密钥。key_env 指向的环境变量非空时优先于 key，便于密钥不落盘。
+# key = ""
+# key_env = "DEEPSEEK_API_KEY"
+# # 以下可选，缺省（或 0）沿用 [upstream] 的全局值。
+# # header_timeout_seconds = 120
+# # body_idle_seconds = 90
+# # max_retries = 2
+#
+# [upstreams.local-glm]
+# protocol = "openai"
+# url = "http://127.0.0.1:9000/v1/chat/completions"
+# key = "sk-local"
 
 [keys]
 # Alternative: export SOPHNET_API_KEY=... and leave this empty.
@@ -62,8 +98,12 @@ opus = "DeepSeek-V4-Flash-0731"
 # - upstream：缺省 ""/claude/anthropic 走 Anthropic 网关（默认）；"openai" 将请求翻译为
 #   OpenAI 协议转发到 upstream.openai_url，再把回复翻译回 Anthropic 格式。
 #   适合只在 OpenAI 网关注册、Anthropic 网关不支持的模型（如 glm-5.3-flash）。
+#   也可以填任意已定义的 [upstreams.<名字>] profile 名，协议由该 profile 的
+#   protocol 决定：anthropic 走 /v1/messages，openai 走协议翻译。
 # - supports_image：可选布尔值。true 表示该模型原生支持图片，带图请求跳过 VLM
 #   描述直接转给该模型（openai 网关下图片会翻译为 image_url）。
 # plain-string 形式（如上面的 sonnet）等价于 upstream 缺省。
 # flash = { model = "glm-5.3-flash", upstream = "openai" }
 # vision = { model = "gpt-4o", supports_image = true }
+# # 引用命名 profile（见上方 [upstreams.*]），协议由 profile 决定：
+# sonnet = { model = "deepseek-chat", upstream = "deepseek" }
