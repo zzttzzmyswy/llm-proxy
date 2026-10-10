@@ -25,7 +25,7 @@ import (
 )
 
 // version is reported in the startup log and on the admin page.
-const version = "0.12.5"
+const version = "0.12.6"
 
 // Config represents /etc/llm-proxy/config.toml
 type Config struct {
@@ -915,12 +915,11 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 // or appends a missing message_stop. A forwarded Content-Length then describes the
 // upstream's body, not the one the client is about to read.
 //
-// The live Anthropic gateway makes this concrete: it answers a streaming request
-// with `Content-Length: 0` next to `Content-Type: text/event-stream`. Copying that
-// header onto a rewritten stream makes net/http reject every subsequent write
-// ("wrote more than the declared Content-Length"), so the client receives a 200
-// with a zero-length body — the whole reply silently vanishes, stream and
-// non-stream alike.
+// Any upstream that declares a Content-Length (ordinary HTTP/1.1) triggers it:
+// copying that header onto a rewritten stream makes net/http reject the later
+// writes ("wrote more than the declared Content-Length"), so the client gets a
+// 200 with a truncated or empty body. The two live gateways currently frame
+// their replies with HTTP/2 / chunked and so do not trip it.
 func isHopByHopHeader(name string) bool {
 	switch http.CanonicalHeaderKey(name) {
 	case "Content-Length", "Transfer-Encoding", "Connection", "Keep-Alive",
