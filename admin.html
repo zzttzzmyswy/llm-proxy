@@ -71,6 +71,12 @@
   .route-row { display: grid; grid-template-columns: 1.2fr 1.6fr 1fr auto auto auto; gap: 10px; align-items: end; padding: 10px 16px; border-bottom: 1px solid var(--border); }
   .route-row:last-child { border-bottom: none; }
   .route-row input[type=checkbox] { width: auto; }
+  /* A profile row carries more fields than a route row, so it gets its own
+     template; the shared bits are inherited from .route-row above. */
+  .profile-row { grid-template-columns: 1fr 0.9fr 1.6fr 1fr 1.1fr auto 0.7fr 0.7fr 0.7fr auto; }
+  .profile-row.is-builtin { background: #fafbfc; }
+  .profile-row .hint { margin-top: 4px; }
+  .profile-list-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; padding: 0 16px 8px; }
   .chk { display: flex; align-items: center; gap: 6px; padding-bottom: 8px; font-size: 13px; }
   .chk label { margin: 0; color: var(--text); }
   .banner { padding: 10px 14px; border-radius: 6px; margin-bottom: 12px; font-size: 13px; display: none; white-space: pre-wrap; }
@@ -161,6 +167,16 @@
           <div><label>监听端口</label><input type="number" id="cfg-port" min="1" max="65535"></div>
           <div><label>VLM 模型（图片描述）</label><input type="text" id="cfg-vlm-model"></div>
           <div><label>VLM 最大输出 token</label><input type="number" id="cfg-vlm-max-tokens" min="0"></div>
+          <div>
+            <label>VLM 上游 profile</label>
+            <select id="cfg-vlm-upstream"></select>
+            <div class="hint">图片描述调用走哪个上游，只列 anthropic 协议的 profile。</div>
+          </div>
+          <div>
+            <label>chat 透传上游 profile</label>
+            <select id="cfg-chat-upstream"></select>
+            <div class="hint">/v1/chat/completions 走哪个上游，只列 openai 协议的 profile。</div>
+          </div>
         </div>
       </div>
       <div class="form-body" style="border-top:1px solid var(--border)">
@@ -169,10 +185,8 @@
           <div><label>OpenAI 上游地址</label><input type="text" id="cfg-openai-url"></div>
           <div>
             <label>默认网关</label>
-            <select id="cfg-default-upstream">
-              <option value="">Anthropic（默认）</option>
-              <option value="openai">OpenAI（协议自动翻译）</option>
-            </select>
+            <select id="cfg-default-upstream"></select>
+            <div class="hint">路由条目未显式声明 upstream 时走哪个 profile。</div>
           </div>
           <div><label>响应头超时（秒）</label><input type="number" id="cfg-header-timeout" min="0"></div>
           <div><label>响应体静默上限（秒）</label><input type="number" id="cfg-body-idle" min="0"></div>
@@ -187,6 +201,17 @@
             <div class="hint" id="cfg-key-hint"></div>
           </div>
           <div class="chk"><input type="checkbox" id="cfg-key-clear"><label for="cfg-key-clear">清除已保存的密钥</label></div>
+        </div>
+      </div>
+      <div style="border-top:1px solid var(--border)">
+        <div class="form-body" style="padding-bottom:8px; display:flex; align-items:center;">
+          <strong style="font-size:13px">上游 profile</strong>
+          <span class="hint" style="margin:0 0 0 10px">每个 profile 是一份独立上游（地址 + 单一协议 + 密钥 + 超时）。路由与 proxy 选择器按名字引用。标注「内置」的两个来自上面的 [upstream] 地址，同名新增即覆盖它们。</span>
+        </div>
+        <div id="profiles"></div>
+        <div class="form-body" style="border-top:1px solid var(--border)">
+          <button id="btn-add-profile">添加上游 profile</button>
+          <span class="hint" style="margin-left:10px">新增后须填写密钥并选「设置」；删除仍被路由引用的 profile 会被拒绝。</span>
         </div>
       </div>
       <div class="form-body" style="border-top:1px solid var(--border)">

@@ -661,7 +661,7 @@ func TestRenderConfigTOMLRoundTrip(t *testing.T) {
 		},
 	}
 
-	rendered := renderConfigTOML(p, "tok", "sk-x")
+	rendered := renderConfigTOML(p, "tok", "sk-x", nil)
 
 	var got Config
 	if err := toml.Unmarshal([]byte(rendered), &got); err != nil {
