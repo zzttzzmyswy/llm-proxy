@@ -838,21 +838,6 @@
     return { alias: a, model: m, upstream: "", supports_image: !!supportsImage };
   }
 
-  // routePayloadFromRow is the same idea for a routing row. A row with neither an
-  // alias nor a model is an empty line the operator left behind, so it is dropped
-  // rather than submitted as an invalid entry.
-  function routePayloadFromRow(r) {
-    var alias = String(r.alias == null ? "" : r.alias).trim();
-    var model = String(r.model == null ? "" : r.model).trim();
-    if (!alias && !model) return null;
-    return {
-      alias: alias,
-      model: model,
-      upstream: r.upstream,
-      supports_image: !!r.supportsImage
-    };
-  }
-
   // A key field is a three-state choice, the same one [keys].sophnet uses: blank
   // means "keep whatever is stored" (a stored key is never sent to the page, so
   // this is the only way to leave it alone), the clear box means "clear", and a
@@ -949,7 +934,7 @@
       '<div class="p-routes-wrap">' +
         '<div class="p-routes-head">' +
           '<span class="p-vlm-label">本方案的模型表</span>' +
-          '<span class="hint">这些别名只路由到本 profile；与全局 [routing] 同名时全局优先。</span>' +
+          '<span class="hint">这些别名只路由到本 profile。别名在整个配置里必须唯一：两个 profile 声明同一个别名时，按 profile 名排序取第一个并记日志。</span>' +
           '<button type="button" class="p-route-add">添加别名</button>' +
         "</div>" +
         '<div class="p-routes"></div>' +
@@ -1034,24 +1019,6 @@
     return row;
   }
 
-  function routeRow(entry, profiles) {
-    var row = document.createElement("div");
-    row.className = "route-row";
-    row.innerHTML =
-      '<div><label>别名</label><input type="text" class="r-alias"></div>' +
-      '<div><label>上游模型名</label><input type="text" class="r-model"></div>' +
-      '<div><label>上游 profile</label><select class="r-upstream"></select></div>' +
-      '<div class="chk"><input type="checkbox" class="r-image"><label>supports_image</label></div>' +
-      '<div><button class="danger r-del">删除</button></div>';
-    row.querySelector(".r-alias").value = entry.alias || "";
-    row.querySelector(".r-model").value = entry.model || "";
-    fillSelect(row.querySelector(".r-upstream"), upstreamOptions(profiles));
-    row.querySelector(".r-upstream").value = entry.upstream || "";
-    row.querySelector(".r-image").checked = !!entry.supports_image;
-    row.querySelector(".r-del").addEventListener("click", function () { row.remove(); });
-    return row;
-  }
-
   // editableProfiles is the profile list the page edits: the ones the file
   // declares. A save submits exactly these, so the builtin rows are filtered out
   // rather than written as [upstreams.*] tables.
@@ -1108,10 +1075,9 @@
     fillSelect(document.getElementById("cfg-chat-upstream"), proxySelectorOptions(profiles, "openai"));
     document.getElementById("cfg-chat-upstream").value = cfg.proxy.chat_upstream || "";
 
-    var host = document.getElementById("routes");
-    host.innerHTML = "";
-    (cfg.routing || []).forEach(function (e) { host.appendChild(routeRow(e, profiles)); });
-
+    // There is no global routing table to render: every alias is edited inside
+    // the card of the upstream profile that serves it. This summary is the
+    // read-only overview of what the proxy will actually answer.
     var eff = cfg.effective_routing || {};
     var names = Object.keys(eff).sort();
     document.getElementById("effective-routes").innerHTML = names.length
@@ -1143,19 +1109,9 @@
   }
 
   function collectPayload() {
-    var routing = [];
-    document.querySelectorAll("#routes .route-row").forEach(function (row) {
-      var entry = routePayloadFromRow({
-        alias: row.querySelector(".r-alias").value,
-        model: row.querySelector(".r-model").value,
-        upstream: row.querySelector(".r-upstream").value,
-        supportsImage: row.querySelector(".r-image").checked
-      });
-      if (entry) routing.push(entry);
-    });
-
     // Every editable profile row is submitted, so a row the operator deleted is
-    // simply absent — which is what makes the deletion take effect.
+    // simply absent — which is what makes the deletion take effect. Each profile
+    // carries its own model table, so there is no top-level routing list to send.
     var upstreams = editableProfileRows().map(function (row) {
       return profilePayloadFromRow(readsOf(row));
     });
@@ -1178,8 +1134,7 @@
       },
       keys: { sophnet_action: keyActionOf(document.getElementById("cfg-sophnet").value, document.getElementById("cfg-key-clear").checked), sophnet: document.getElementById("cfg-sophnet").value },
       admin: { token_action: keyActionOf(document.getElementById("cfg-admin-token").value, document.getElementById("cfg-admin-clear").checked), token: document.getElementById("cfg-admin-token").value },
-      upstreams: upstreams,
-      routing: routing
+      upstreams: upstreams
     };
   }
 
@@ -1297,9 +1252,6 @@
       banner("banner", "err", "清零失败：" + err.message);
     }
   });
-  document.getElementById("btn-add-route").addEventListener("click", function () {
-    document.getElementById("routes").appendChild(routeRow({}, config ? config.upstreams : []));
-  });
   // A new profile starts on the anthropic protocol with no stored key: its row
   // reports key_action "set" (or "clear"), which is exactly what the validator
   // needs for a name the running config does not carry a key for.
@@ -1380,7 +1332,6 @@
       profileOptions: profileOptions,
       profilePayloadFromRow: profilePayloadFromRow,
       schemeRoutePayload: schemeRoutePayload,
-      routePayloadFromRow: routePayloadFromRow
     };
     return;
   }

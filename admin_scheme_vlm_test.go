@@ -17,20 +17,18 @@ func configTOMLForTest(t *testing.T, content string) string {
 	return withProfiles(t, content)
 }
 
-// payloadFromViewWithProfiles is payloadFromView plus the profile list, which is
-// what the page actually posts. payloadFromView deliberately omits it (an older
-// page shape), so the scheme tests need their own builder.
-func payloadFromViewWithProfiles(t *testing.T, view adminConfigView) adminConfigPayload {
+// profilesPayloadFromView builds the profile list the page submits: each declared
+// profile with its whole scheme, including its own model table. Builtin rows are
+// filtered out, because the page filters them too — sending one would write an
+// [upstreams.anthropic] table that shadows the implicit profile.
+func profilesPayloadFromView(t *testing.T, view adminConfigView) []adminUpstreamProfilePayload {
 	t.Helper()
-	p := payloadFromView(t, view)
+	var out []adminUpstreamProfilePayload
 	for _, prof := range view.Upstreams {
 		if prof.Builtin {
-			// The page filters builtin rows out of the submit, so a save writes
-			// only the declared profiles. Sending them would create
-			// [upstreams.anthropic] tables that shadow the implicit profile.
 			continue
 		}
-		p.Upstreams = append(p.Upstreams, adminUpstreamProfilePayload{
+		out = append(out, adminUpstreamProfilePayload{
 			Name:                 prof.Name,
 			Protocol:             prof.Protocol,
 			URL:                  prof.URL,
@@ -42,8 +40,19 @@ func payloadFromViewWithProfiles(t *testing.T, view adminConfigView) adminConfig
 			VLMModel:             prof.VLMModel,
 			VLMMaxTokens:         prof.VLMMaxTokens,
 			VLMUpstream:          prof.VLMUpstream,
+			Routing:              prof.Routing,
 		})
 	}
+	return out
+}
+
+// payloadFromViewWithProfiles is payloadFromView plus that profile list, which is
+// what the page actually posts. payloadFromView deliberately omits it (an older
+// page shape), so the scheme tests need their own builder.
+func payloadFromViewWithProfiles(t *testing.T, view adminConfigView) adminConfigPayload {
+	t.Helper()
+	p := payloadFromView(t, view)
+	p.Upstreams = profilesPayloadFromView(t, view)
 	return p
 }
 
@@ -103,8 +112,9 @@ protocol = "anthropic"
 url = "https://gamma.example/api"
 key = "sk-gamma"
 
-[routing]
-sonnet = { model = "alpha-text", upstream = "alpha" }
+[upstreams.alpha.routing]
+sonnet = { model = "alpha-text"}
+
 `)
 
 	view := currentConfigView()
@@ -176,8 +186,9 @@ protocol = "anthropic"
 url = "https://plain.example/api"
 key = "sk-plain"
 
-[routing]
-sonnet = { model = "m", upstream = "plain" }
+[upstreams.plain.routing]
+sonnet = { model = "m"}
+
 `)
 
 	w := postConfig(t, payloadFromViewWithProfiles(t, currentConfigView()), "s3cret")
@@ -222,8 +233,9 @@ protocol = "openai"
 url = "https://chat.example/v1"
 key = "sk-chat"
 
-[routing]
-sonnet = { model = "m", upstream = "alpha" }
+[upstreams.alpha.routing]
+sonnet = { model = "m"}
+
 `)
 
 	p := payloadFromViewWithProfiles(t, currentConfigView())
@@ -256,8 +268,9 @@ protocol = "anthropic"
 url = "https://alpha.example/api"
 key = "sk-alpha"
 
-[routing]
-sonnet = { model = "m", upstream = "alpha" }
+[upstreams.alpha.routing]
+sonnet = { model = "m"}
+
 `)
 
 	p := payloadFromViewWithProfiles(t, currentConfigView())
@@ -288,8 +301,9 @@ protocol = "anthropic"
 url = "https://alpha.example/api"
 key = "sk-alpha"
 
-[routing]
-sonnet = { model = "m", upstream = "alpha" }
+[upstreams.alpha.routing]
+sonnet = { model = "m"}
+
 `)
 
 	p := payloadFromViewWithProfiles(t, currentConfigView())
@@ -351,8 +365,6 @@ key = "sk-a"
 alpha-fast = { model = "alpha-fast-model" }
 alpha-vision = { model = "alpha-vl", supports_image = true }
 
-[routing]
-sonnet = { model = "m", upstream = "alpha" }
 `)
 
 	view := currentConfigView()
@@ -369,7 +381,6 @@ sonnet = { model = "m", upstream = "alpha" }
 	p := adminConfigPayload{
 		Proxy: view.Proxy, Upstream: view.Upstream,
 		Keys: adminKeysPayload{Action: "keep"}, Admin: adminAuthPayload{Action: "keep"},
-		Routing: view.Routing,
 		Upstreams: []adminUpstreamProfilePayload{{
 			Name: "alpha", Protocol: "anthropic", URL: "https://alpha.example/api",
 			KeyAction: "keep", Routing: alpha.Routing,
@@ -426,7 +437,6 @@ alpha-fast = { model = "alpha-fast-model" }
 	p := adminConfigPayload{
 		Proxy: view.Proxy, Upstream: view.Upstream,
 		Keys: adminKeysPayload{Action: "keep"}, Admin: adminAuthPayload{Action: "keep"},
-		Routing: view.Routing,
 		Upstreams: []adminUpstreamProfilePayload{{
 			Name: "alpha", Protocol: "anthropic", URL: "https://alpha.example/api", KeyAction: "keep",
 		}},
@@ -475,7 +485,6 @@ alpha-fast = { model = "alpha-fast-model" }
 	p := adminConfigPayload{
 		Proxy: view.Proxy, Upstream: view.Upstream,
 		Keys: adminKeysPayload{Action: "keep"}, Admin: adminAuthPayload{Action: "keep"},
-		Routing: view.Routing,
 		Upstreams: []adminUpstreamProfilePayload{{
 			Name: "alpha", Protocol: "anthropic", URL: "https://alpha.example/api",
 			KeyAction: "keep", Routing: []adminRoutingEntry{},

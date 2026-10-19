@@ -129,9 +129,11 @@ openai_url = "https://openai.example/v1"
 [keys]
 sophnet = "legacy-key"
 
-[routing]
+[upstreams.anthropic.routing]
 sonnet = "DeepSeek-V4-Flash-0731"
-flash = { model = "glm-5.3-flash", upstream = "openai" }
+
+[upstreams.openai.routing]
+flash = { model = "glm-5.3-flash" }
 `)
 
 	rc := snapshotConfig()
@@ -156,8 +158,8 @@ flash = { model = "glm-5.3-flash", upstream = "openai" }
 
 	// The routing table is unchanged: a plain string stays on "" (the implicit
 	// anthropic profile) and an explicit "openai" keeps its name.
-	if e := rc.routes["sonnet"]; e.Model != "DeepSeek-V4-Flash-0731" || e.Upstream != "" {
-		t.Fatalf("a legacy plain-string route must stay on the default profile, got %+v", e)
+	if e := rc.routes["sonnet"]; e.Model != "DeepSeek-V4-Flash-0731" || e.Upstream != profileNameAnthropic {
+		t.Fatalf("a route in the anthropic table must resolve to it, got %+v", e)
 	}
 	if e := rc.routes["flash"]; e.Upstream != "openai" {
 		t.Fatalf("a legacy upstream=\"openai\" route must keep its name, got %+v", e)
@@ -205,9 +207,12 @@ protocol = "openai"
 url = "`+oai.URL+`"
 key = "key-local"
 
-[routing]
-sonnet = { model = "deepseek-chat", upstream = "deepseek" }
-flash = { model = "local-glm", upstream = "local" }
+[upstreams.deepseek.routing]
+sonnet = { model = "deepseek-chat"}
+
+[upstreams.local.routing]
+flash = { model = "local-glm"}
+
 `)
 
 	sonnetResp := callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
@@ -267,8 +272,9 @@ url = "`+up.URL+`"
 key = "key-from-file"
 key_env = "DEEPSEEK_API_KEY"
 
-[routing]
-sonnet = { model = "m", upstream = "deepseek" }
+[upstreams.deepseek.routing]
+sonnet = { model = "m"}
+
 `)
 
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
@@ -294,8 +300,9 @@ url = "`+up.URL+`"
 key = "key-from-file"
 key_env = "DEEPSEEK_API_KEY"
 
-[routing]
-sonnet = { model = "m", upstream = "deepseek" }
+[upstreams.deepseek.routing]
+sonnet = { model = "m"}
+
 `)
 
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
@@ -318,8 +325,9 @@ func TestDeclaredProfileWithoutKeyDoesNotBorrowLegacySecret(t *testing.T) {
 protocol = "anthropic"
 url = "`+up.URL+`"
 
-[routing]
-sonnet = { model = "m", upstream = "thirdparty" }
+[upstreams.thirdparty.routing]
+sonnet = { model = "m"}
+
 `)
 
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
@@ -375,9 +383,12 @@ max_retries = 5
 protocol = "anthropic"
 url = "https://inherits.example/api"
 
-[routing]
-sonnet = { model = "m", upstream = "slow" }
-opus = { model = "m", upstream = "inherits" }
+[upstreams.slow.routing]
+sonnet = { model = "m"}
+
+[upstreams.inherits.routing]
+opus = { model = "m"}
+
 `)
 
 	rc := snapshotConfig()
@@ -429,8 +440,9 @@ protocol = "anthropic"
 url = "`+dead.URL+`"
 max_retries = 1
 
-[routing]
-sonnet = { model = "m", upstream = "flaky" }
+[upstreams.flaky.routing]
+sonnet = { model = "m"}
+
 `)
 	// Keep the retry backoff from dominating the test.
 	old := retryBackoffs
@@ -462,8 +474,9 @@ key = "k"
 [upstream]
 default_upstream = "deepseek"
 
-[routing]
+[upstreams.deepseek.routing]
 sonnet = "deepseek-chat"
+
 `)
 
 	if e := currentRoutes()["sonnet"]; e.Upstream != "deepseek" {
@@ -479,7 +492,6 @@ sonnet = "deepseek-chat"
 }
 
 // A routing entry naming a profile the config does not define is skipped with a
-// warning rather than aborting the load or silently picking another gateway.
 func TestUnknownProfileRouteIsSkippedWithAWarning(t *testing.T) {
 	withCleanStats(t)
 	t.Setenv("SOPHNET_API_KEY", "")
@@ -489,40 +501,39 @@ func TestUnknownProfileRouteIsSkippedWithAWarning(t *testing.T) {
 	log.SetOutput(&logged)
 	defer log.SetOutput(oldOut)
 
-	withProfiles(t, `[routing]
+	withProfiles(t, `[upstreams.anthropic.routing]
 ghost = { model = "m", upstream = "nonexistent" }
 sonnet = "DeepSeek-V4-Flash-0731"
 `)
 
 	if _, ok := currentRoutes()["ghost"]; ok {
-		t.Fatal("a route naming an undefined profile must be dropped from the served table")
+		t.Fatal("a route naming a foreign profile must be dropped from the served table")
 	}
 	if !strings.Contains(logged.String(), "nonexistent") {
 		t.Fatalf("the dropped route must be reported, log was: %q", logged.String())
 	}
-	// The healthy route is untouched, so one typo does not disable the proxy.
+	// The healthy sibling is untouched, so one typo does not disable the profile.
 	if e := currentRoutes()["sonnet"]; e.Model != "DeepSeek-V4-Flash-0731" {
 		t.Fatalf("a valid route must survive a sibling typo, got %+v", e)
 	}
-	// A dropped builtin alias still gets its builtin fallback target.
-	if e, ok := currentRoutes()["ghost"]; ok {
-		t.Fatalf("the dropped alias must not reappear, got %+v", e)
-	}
 }
 
-// A builtin alias whose declared upstream does not exist must fall back to the
-// builtin default target rather than vanishing from the served table.
-func TestBuiltinAliasWithUnknownProfileFallsBack(t *testing.T) {
+// A builtin alias declared in a profile's table with a typo'd model is still
+// served: the typo affects that entry only, not the alias itself.
+//
+// (The old behaviour this replaced — a route naming a profile that does not
+// exist falling back to the builtin target — cannot happen any more: an entry
+// belongs to the profile whose table declares it.)
+func TestBuiltinAliasWithAForeignProfileIsSkipped(t *testing.T) {
 	t.Setenv("SOPHNET_API_KEY", "")
-	withProfiles(t, `[routing]
+	withProfiles(t, `[upstreams.anthropic.routing]
 sonnet = { model = "m", upstream = "typo-profile" }
 `)
+	// The entry named a foreign profile, so it is skipped and sonnet falls back to
+	// its builtin default target rather than vanishing.
 	e, ok := currentRoutes()["sonnet"]
 	if !ok || e.Model == "" {
-		t.Fatalf("sonnet must still be served after its profile is dropped, got %+v ok=%v", e, ok)
-	}
-	if e.Upstream != "" {
-		t.Fatalf("the fallback must use the default profile, got upstream %q", e.Upstream)
+		t.Fatalf("sonnet must still be served, got %+v ok=%v", e, ok)
 	}
 }
 
@@ -555,8 +566,9 @@ protocol = "anthropic"
 url = "`+text.URL+`"
 key = "text-key"
 
-[routing]
-sonnet = { model = "deepseek-chat", upstream = "text-profile" }
+[upstreams.text-profile.routing]
+sonnet = { model = "deepseek-chat"}
+
 `)
 
 	resp := callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"what is this"}]}]}`)
@@ -627,8 +639,9 @@ url = "`+vlm.URL+`"
 protocol = "anthropic"
 url = "`+textUp.URL+`"
 
-[routing]
-sonnet = { model = "deepseek-chat", upstream = "text-profile" }
+[upstreams.text-profile.routing]
+sonnet = { model = "deepseek-chat"}
+
 `)
 
 	resp := callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"BBBB"}},{"type":"text","text":"what is this"}]}]}`)
@@ -769,9 +782,12 @@ protocol = "openai"
 url = "`+oaiSrv.URL+`"
 key = "key-local"
 
-[routing]
-sonnet = { model = "deepseek-chat", upstream = "deepseek" }
-flash = { model = "local-glm", upstream = "local" }
+[upstreams.deepseek.routing]
+sonnet = { model = "deepseek-chat"}
+
+[upstreams.local.routing]
+flash = { model = "local-glm"}
+
 `)
 
 	var wg sync.WaitGroup
@@ -889,8 +905,9 @@ sophnet = "sk-original"
 [admin]
 token = "s3cret"
 
-[routing]
-sonnet = { model = "deepseek-chat", upstream = "deepseek" }
+[upstreams.deepseek.routing]
+sonnet = { model = "deepseek-chat"}
+
 `)
 
 	t.Setenv("LLM_PROXY_ADMIN_TOKEN", "s3cret")
@@ -947,7 +964,11 @@ sonnet = { model = "deepseek-chat", upstream = "deepseek" }
 }
 
 // A save that references a profile the config does not define is rejected, so the
-// page cannot write a route to a gateway that does not exist.
+// page cannot write a selector pointing at a gateway that does not exist.
+//
+// A profile's own model table needs no such check: its entries belong to the
+// profile that declares them, so there is no way to write an alias that names a
+// different one.
 func TestAdminSaveRejectsUnknownProfileReference(t *testing.T) {
 	t.Setenv("SOPHNET_API_KEY", "")
 	withProfiles(t, `
@@ -958,7 +979,7 @@ openai_url = "https://openai.example/v1"
 [admin]
 token = "s3cret"
 
-[routing]
+[upstreams.anthropic.routing]
 sonnet = "Model-A"
 `)
 	t.Setenv("LLM_PROXY_ADMIN_TOKEN", "s3cret")
@@ -967,22 +988,25 @@ sonnet = "Model-A"
 	var view adminConfigView
 	decodeBody(t, w, &view)
 
+	// default_upstream naming an undefined profile.
 	p := payloadFromView(t, view)
-	p.Routing[0].Upstream = "ghost-profile"
-	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusBadRequest {
-		t.Fatalf("a save naming an undefined profile must be rejected, got %d %s", res.Code, res.Body.String())
-	}
-
-	// default_upstream is checked the same way.
-	p = payloadFromView(t, view)
 	p.Upstream.DefaultUpstream = "ghost-profile"
 	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusBadRequest {
 		t.Fatalf("default_upstream naming an undefined profile must be rejected, got %d %s", res.Code, res.Body.String())
 	}
 
+	// A scheme's vlm_upstream is checked the same way.
+	p = payloadFromViewWithProfiles(t, view)
+	for i := range p.Upstreams {
+		p.Upstreams[i].VLMUpstream = "ghost-profile"
+	}
+	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusBadRequest {
+		t.Fatalf("an undefined vlm_upstream must be rejected, got %d %s", res.Code, res.Body.String())
+	}
+
 	// A defined profile name is accepted.
 	p = payloadFromView(t, view)
-	p.Routing[0].Upstream = "openai"
+	p.Upstream.DefaultUpstream = "openai"
 	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
 		t.Fatalf("the builtin profile names must still be accepted, got %d %s", res.Code, res.Body.String())
 	}
@@ -1025,9 +1049,12 @@ key_env = "PROFILE_KEY_ENV"
 [upstream]
 anthropic_url = "`+up.URL+`"
 
-[routing]
-sonnet = { model = "deepseek-chat", upstream = "deepseek" }
-opus = { model = "m", upstream = "envkey" }
+[upstreams.deepseek.routing]
+sonnet = { model = "deepseek-chat"}
+
+[upstreams.envkey.routing]
+opus = { model = "m"}
+
 `)
 
 	// Exercise the routes, the VLM describe pass (which also fails once, so the
@@ -1064,8 +1091,9 @@ key = "sk-must-not-be-returned"
 [admin]
 token = "s3cret"
 
-[routing]
-sonnet = { model = "deepseek-chat", upstream = "deepseek" }
+[upstreams.deepseek.routing]
+sonnet = { model = "deepseek-chat"}
+
 `)
 	t.Setenv("LLM_PROXY_ADMIN_TOKEN", "s3cret")
 

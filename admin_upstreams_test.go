@@ -42,8 +42,8 @@ sophnet = "sk-original"
 [admin]
 token = "s3cret"
 
-[routing]
-sonnet = { model = "deepseek-chat", upstream = "deepseek" }
+[upstreams.deepseek.routing]
+sonnet = { model = "deepseek-chat" }
 `
 
 // profilePayloadFromView turns the view's editable profiles into the payload the
@@ -65,6 +65,10 @@ func profilePayloadFromView(view adminConfigView) []adminUpstreamProfilePayload 
 			HeaderTimeoutSeconds: p.HeaderTimeoutSeconds,
 			BodyIdleSeconds:      p.BodyIdleSeconds,
 			MaxRetries:           p.MaxRetries,
+			VLMModel:             p.VLMModel,
+			VLMMaxTokens:         p.VLMMaxTokens,
+			VLMUpstream:          p.VLMUpstream,
+			Routing:              p.Routing,
 		})
 	}
 	return out
@@ -164,11 +168,24 @@ token = "s3cret"
 	}
 }
 
-// The two profiles synthesised from [upstream] are listed, flagged builtin, and
-// carry the state the request path actually resolves.
+// The two profiles synthesised from [upstream] are listed and flagged builtin
+// when the config declares neither, and carry the state the request path
+// actually resolves.
+//
+// A config that puts aliases in [upstreams.anthropic.routing] does declare that
+// profile, so it becomes editable — which is exactly how an operator pins a model
+// to the anthropic gateway now that there is no global [routing].
 func TestAdminViewListsBuiltinProfiles(t *testing.T) {
 	t.Setenv("SOPHNET_API_KEY", "")
-	withTempConfig(t, testConfigTOML)
+	withTempConfig(t, strings.Replace(testConfigTOML, `
+# Every alias lives in the model table of the upstream profile that serves it;
+# there is no top-level [routing] any more.
+[upstreams.anthropic.routing]
+sonnet = { model = "DeepSeek-Flash", supports_image = true }
+
+[upstreams.openai.routing]
+haiku = { model = "glm-5.3-flash" }
+`, "", 1))
 
 	view, _ := loadConfigView(t)
 	if len(view.Upstreams) != 2 {
@@ -240,7 +257,9 @@ func TestAdminSaveAddsProfile(t *testing.T) {
 
 	view, _ := loadConfigView(t)
 	p := fullPayloadFromView(t, view)
-	p.Upstreams = append(p.Upstreams, adminUpstreamProfilePayload{
+	// The alias goes into the new profile's own model table, which is where every
+	// alias lives now.
+	newProf := adminUpstreamProfilePayload{
 		Name:                 "newglm",
 		Protocol:             "openai",
 		URL:                  "http://127.0.0.1:9100/v1",
@@ -248,10 +267,11 @@ func TestAdminSaveAddsProfile(t *testing.T) {
 		Key:                  "sk-new",
 		HeaderTimeoutSeconds: 45,
 		MaxRetries:           4,
-	})
-	p.Routing = append(p.Routing, adminRoutingEntry{
-		Alias: "glm", Model: "glm-5.3-flash", Upstream: "newglm",
-	})
+		Routing: []adminRoutingEntry{
+			{Alias: "glm", Model: "glm-5.3-flash"},
+		},
+	}
+	p.Upstreams = append(p.Upstreams, newProf)
 
 	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
 		t.Fatalf("save failed: %d %s", res.Code, res.Body.String())
@@ -628,7 +648,9 @@ func TestAdminSaveRejectsBadProfilesWithoutWriting(t *testing.T) {
 			p.Upstreams = kept
 		}},
 		{"route naming an undefined profile", func(p *adminConfigPayload) {
-			p.Routing[0].Upstream = "ghost"
+			// A profile's own table cannot name another profile at all, so the
+			// equivalent mistake now is a *selector* naming one that does not exist.
+			p.Upstreams[0].VLMUpstream = "ghost"
 		}},
 		{"default_upstream naming an undefined profile", func(p *adminConfigPayload) {
 			p.Upstream.DefaultUpstream = "ghost"
@@ -675,18 +697,23 @@ func TestAdminSaveRefusesToDeleteAReferencedProfile(t *testing.T) {
 	before, _ := os.ReadFile(path)
 
 	// Each referrer kind is exercised on its own, so the message has to name it.
+	// A profile's model table is no longer a referrer: its entries belong to that
+	// profile, so they go away with it. What still points at a profile from
+	// outside are the three selectors.
 	cases := []struct {
 		name      string
 		mutate    func(*adminConfigPayload)
 		wantInMsg string
 	}{
-		{"a route", func(p *adminConfigPayload) {}, "sonnet"},
 		{"default_upstream", func(p *adminConfigPayload) {
-			p.Routing[0].Upstream = "local"
+			p.Upstream.DefaultUpstream = "deepseek"
 		}, "default_upstream"},
 		{"vlm_upstream", func(p *adminConfigPayload) {
-			p.Routing[0].Upstream = "local"
+			p.Proxy.VLMUpstream = "deepseek"
 		}, "vlm_upstream"},
+		{"chat_upstream", func(p *adminConfigPayload) {
+			p.Proxy.ChatUpstream = "deepseek"
+		}, "chat_upstream"},
 	}
 
 	for _, tc := range cases {
@@ -759,7 +786,6 @@ func TestAdminSaveWithEmptyProfileListDeletesThem(t *testing.T) {
 	p.Proxy.VLMUpstream = ""
 	p.Proxy.ChatUpstream = ""
 	p.Upstream.DefaultUpstream = ""
-	p.Routing[0].Upstream = ""
 
 	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
 		t.Fatalf("save failed: %d %s", res.Code, res.Body.String())
@@ -816,8 +842,16 @@ func TestRenderConfigTOMLWritesProfiles(t *testing.T) {
 			OpenAIURL:       "https://openai.example/v1",
 			DefaultUpstream: "vlm-prof",
 		},
-		Routing: []adminRoutingEntry{
-			{Alias: "sonnet", Model: "deepseek-chat", Upstream: "vlm-prof"},
+		Upstreams: []adminUpstreamProfilePayload{
+			{
+				Name: "vlm-prof", Protocol: protocolAnthropic, URL: "https://vlm.example/api",
+				KeyAction: "set", Key: "sk-vlm", KeyEnv: "VLM_KEY", HeaderTimeoutSeconds: 30,
+				Routing: []adminRoutingEntry{{Alias: "sonnet", Model: "deepseek-chat"}},
+			},
+			{
+				Name: "chat-prof", Protocol: protocolOpenAI, URL: "http://127.0.0.1:9000/v1",
+				KeyAction: "set", Key: "sk-chat", BodyIdleSeconds: 15, MaxRetries: 5,
+			},
 		},
 	}
 
@@ -825,6 +859,9 @@ func TestRenderConfigTOMLWritesProfiles(t *testing.T) {
 		"vlm-prof": {
 			Protocol: protocolAnthropic, URL: "https://vlm.example/api",
 			Key: "sk-vlm", KeyEnv: "VLM_KEY", HeaderTimeoutSeconds: 30,
+			Routing: map[string]toml.Primitive{
+				"sonnet": mustTOMLPrimitive(t, `"deepseek-chat"`),
+			},
 		},
 		"chat-prof": {
 			Protocol: protocolOpenAI, URL: "http://127.0.0.1:9000/v1",
@@ -858,12 +895,23 @@ func TestRenderConfigTOMLWritesProfiles(t *testing.T) {
 		}
 	}
 	// The route, the default gateway and the selectors all resolve to a profile.
-	routes := buildRouteTargets(got.Routing)
-	applyDefaultUpstream(&got, routes)
-	dropUnknownProfileRoutes(&got, routes)
+	routes, _ := buildProfileRoutes(&got)
 	if up, ok := got.profileByName(routes["sonnet"].Upstream); !ok || up.Key != "sk-vlm" {
 		t.Fatalf("the round-tripped route must resolve to its profile: %+v (ok=%v)", up, ok)
 	}
+}
+
+// mustTOMLPrimitive parses a TOML value into the primitive the config structs
+// hold, so a test can build an UpstreamProfile by hand.
+func mustTOMLPrimitive(t *testing.T, value string) toml.Primitive {
+	t.Helper()
+	var wrapper struct {
+		V map[string]toml.Primitive `toml:"v"`
+	}
+	if _, err := toml.Decode("v = { x = "+value+" }", &wrapper); err != nil {
+		t.Fatalf("primitive %q: %v", value, err)
+	}
+	return wrapper.V["x"]
 }
 
 // A profile JSON round trip is what the page's save actually posts, so the payload

@@ -313,7 +313,7 @@
           <div>
             <label>默认网关</label>
             <select id="cfg-default-upstream"></select>
-            <div class="hint">路由条目未显式声明 upstream 时走哪个 profile。</div>
+            <div class="hint">sonnet / opus / haiku 这三个内置别名没有任何 profile 的模型表声明时，走哪个 profile。</div>
           </div>
           <div><label>响应头超时（秒）</label><input type="number" id="cfg-header-timeout" min="0"></div>
           <div><label>响应体静默上限（秒）</label><input type="number" id="cfg-body-idle" min="0"></div>
@@ -353,15 +353,10 @@
       </div>
       <div style="border-top:1px solid var(--border)">
         <div class="form-body" style="padding-bottom:8px; display:flex; align-items:center;">
-          <strong style="font-size:13px">模型路由表</strong>
-          <span class="hint" style="margin:0 0 0 10px">别名即 Claude Code 请求的模型名；supports_image 表示该上游模型原生支持图片，跳过 VLM 描述。</span>
+          <strong style="font-size:13px">生效路由</strong>
+          <span class="hint" style="margin:0 0 0 10px">每个别名都定义在它所属上游 profile 的「本方案的模型表」里，请到上方的 profile 卡片中编辑。</span>
         </div>
-        <div id="routes"></div>
-        <div class="form-body" style="border-top:1px solid var(--border)">
-          <button id="btn-add-route">添加路由</button>
-        </div>
-        <div class="form-body" style="border-top:1px solid var(--border)">
-          <label style="margin-bottom:6px">生效路由（只读）</label>
+        <div class="form-body">
           <div class="hint" style="margin:0 0 8px">经过默认网关与内置兜底之后，每个别名实际走哪个模型。这里的内容不会被保存。</div>
           <div id="effective-routes"></div>
         </div>

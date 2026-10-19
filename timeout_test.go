@@ -232,8 +232,9 @@ func TestTimeoutConfigDefaults(t *testing.T) {
 	content := `[proxy]
 port = 8088
 
-[routing]
+[upstreams.anthropic.routing]
 sonnet = "DeepSeek-V4-Flash-0731"
+
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)

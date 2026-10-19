@@ -98,30 +98,36 @@ sophnet = ""
 # 页面上修改口令不会生效。
 token = ""
 
-[routing]
-# 内置别名同样支持表值:`{ model = "...", upstream = "openai" }` 表示命中该
-# 别名的请求翻译为 OpenAI 协议转发给 openai_url(适用于 Anthropic 网关不支持
-# 的模型,如 glm-5.3-flash)。upstream 缺省时使用 [upstream] default_upstream
-# (缺省为 claude/anthropic 网关,协议不变,仅换模型)。
-# 表值还可声明 supports_image = true:上游模型原生支持图片输入时,带图请求
-# 直接发给该模型,不经内置 VLM 描述(含 image 400 重试)。
+# ---- 模型映射表：每个上游方案自带一份 ----
+# 没有顶层 [routing]。别名即 Claude Code 请求的模型名，它定义在**负责该别名的
+# 上游 profile** 的 [upstreams.<名字>.routing] 表里，这样几套方案互不影响。
+#
+# 表里只能写 model 与可选的 supports_image；所属 profile 由表的表名决定，
+# 不需要（也不允许）再写 upstream。
+
+[upstreams.anthropic.routing]
+# 纯字符串 = 转发给该上游的这个模型名。
 sonnet = "DeepSeek-V4-Flash-0731"
 opus = "DeepSeek-V4-Flash-0731"
-# haiku defaults to sonnet when omitted
+# haiku 未声明时沿用 sonnet 的目标。
 # haiku = "DeepSeek-V4-Flash-0731"
-
-# 任意别名可配置为表值并指定网关：
-#   flash = { model = "glm-5.3-flash", upstream = "openai" }
-# - model：转发给上游的模型名
-# - upstream：缺省 ""/claude/anthropic 走 Anthropic 网关（默认）；"openai" 将请求翻译为
-#   OpenAI 协议转发到 upstream.openai_url，再把回复翻译回 Anthropic 格式。
-#   适合只在 OpenAI 网关注册、Anthropic 网关不支持的模型（如 glm-5.3-flash）。
-#   也可以填任意已定义的 [upstreams.<名字>] profile 名，协议由该 profile 的
-#   protocol 决定：anthropic 走 /v1/messages，openai 走协议翻译。
-# - supports_image：可选布尔值。true 表示该模型原生支持图片，带图请求跳过 VLM
-#   描述直接转给该模型（openai 网关下图片会翻译为 image_url）。
-# plain-string 形式（如上面的 sonnet）等价于 upstream 缺省。
-# flash = { model = "glm-5.3-flash", upstream = "openai" }
+# 表值可声明 supports_image = true：上游模型原生支持图片时，带图请求直接发给
+# 该模型，不经内置 VLM 描述（含 image 400 重试）。
 # vision = { model = "gpt-4o", supports_image = true }
-# # 引用命名 profile（见上方 [upstreams.*]），协议由 profile 决定：
-# sonnet = { model = "deepseek-chat", upstream = "deepseek" }
+
+# 只有表、不写 protocol/url 也合法——这正是把别名挂到内置网关的简写：
+# 该 profile 的协议与 URL 从 [upstream] 的两个地址补齐。
+# [upstreams.openai.routing]
+# flash = { model = "glm-5.3-flash" }
+
+# 命名 profile 的表（见上方 [upstreams.deepseek] 示例）：
+# [upstreams.deepseek.routing]
+# sonnet = { model = "deepseek-chat" }
+
+# 规则：
+#   - 别名必须全局唯一。两个 profile 声明同一个别名时，按 profile 名排序取第一个
+#     并打 warning；同一个 profile 内重复则是配置错误。
+#   - [upstream] default_upstream 只决定**没有任何 profile 声明**的
+#     sonnet/opus/haiku 走哪个网关，不再影响已声明的别名。
+#   - 顶层 [routing] 已不再支持：加载时会被忽略并打 warning（会列出被丢弃的
+#     别名），请把每个别名搬到它所属 profile 的 .routing 表里。

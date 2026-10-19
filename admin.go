@@ -183,7 +183,7 @@ type adminRoutingEntry struct {
 
 // adminEffectiveRoute is the gateway and model an alias actually resolves to
 // after the default gateway and the builtin fallbacks are applied. It is shown
-// read-only: the form edits what the file declares, so a value inherited from
+// read-only: the form edits the per-profile tables, so a value inherited from
 // default_upstream is not frozen into the file by a save.
 type adminEffectiveRoute struct {
 	Model    string `json:"model"`
@@ -198,10 +198,10 @@ type adminConfigView struct {
 	Upstream   adminUpstreamView `json:"upstream"`
 	// Upstreams lists every profile the page may select: the declared
 	// [upstreams.*] tables plus the two builtin ones, each flagged so the page can
-	// render the builtin entries read-only.
+	// render the builtin entries read-only. Each entry carries that profile's own
+	// model table, because there is no global one.
 	Upstreams []adminUpstreamProfileView `json:"upstreams"`
 	Keys      adminKeysView              `json:"keys"`
-	Routing   []adminRoutingEntry        `json:"routing"`
 	// EffectiveRouting covers every alias the proxy will serve, including the
 	// builtin fallbacks that are not written in the file.
 	EffectiveRouting map[string]adminEffectiveRoute `json:"effective_routing"`
@@ -252,49 +252,32 @@ type adminUpstreamProfilePayload struct {
 }
 
 type adminConfigPayload struct {
-	Proxy    adminProxyView      `json:"proxy"`
-	Upstream adminUpstreamView   `json:"upstream"`
-	Keys     adminKeysPayload    `json:"keys"`
-	Admin    adminAuthPayload    `json:"admin"`
-	Routing  []adminRoutingEntry `json:"routing"`
+	Proxy    adminProxyView    `json:"proxy"`
+	Upstream adminUpstreamView `json:"upstream"`
+	Keys     adminKeysPayload  `json:"keys"`
+	Admin    adminAuthPayload  `json:"admin"`
 	// Upstreams is the complete profile list the save should write, so a profile
 	// the operator deleted is one that is simply absent here. A nil list means the
 	// request does not model profiles at all (an older page), and the running
 	// config's profiles are carried over instead of being read as a deletion.
+	//
+	// Each profile carries its own model table. There is no top-level routing list
+	// to submit: a json "routing" field from an older page is ignored, which is
+	// safe because that page also sends the profiles, and each one's table rides
+	// along inside it.
 	Upstreams []adminUpstreamProfilePayload `json:"upstreams"`
 }
 
 // currentConfigView renders the running config for the page. The upstream key is
 // never returned — only whether one is configured and where it comes from.
 //
-// routing lists the aliases as declared in the file, which is what the form
-// edits; effective_routing reports where each alias actually goes once the
-// default gateway and the builtin fallbacks are applied.
+// Each upstream profile carries its own model table, so there is no top-level
+// routing list here; effective_routing still reports where every alias actually
+// goes once the default gateway and the builtin fallbacks are applied.
 func currentConfigView() adminConfigView {
 	c := currentConfig()
 	declared := currentDeclaredRoutes()
 	resolved := currentRoutes()
-
-	aliases := make([]string, 0, len(declared))
-	for alias := range declared {
-		aliases = append(aliases, alias)
-	}
-	sort.Strings(aliases)
-
-	entries := make([]adminRoutingEntry, 0, len(aliases))
-	for _, alias := range aliases {
-		e := declared[alias]
-		entries = append(entries, adminRoutingEntry{
-			Alias: alias,
-			Model: e.Model,
-			// "claude" is an accepted spelling of the anthropic profile, but the
-			// form's select offers profile names, so a row carrying the alias would
-			// show as the first option and an untouched save would silently reroute
-			// it. Report the canonical name the select actually offers.
-			Upstream:      canonicalSelector(e.Upstream),
-			SupportsImage: e.SupportsImage,
-		})
-	}
 
 	effective := make(map[string]adminEffectiveRoute, len(resolved))
 	for alias, e := range resolved {
@@ -332,7 +315,6 @@ func currentConfigView() adminConfigView {
 			SophnetSet:     c.Keys.Sophnet != "",
 			SophnetFromEnv: os.Getenv("SOPHNET_API_KEY") != "",
 		},
-		Routing:          entries,
 		EffectiveRouting: effective,
 	}
 }
@@ -577,12 +559,14 @@ func configWarnings(payload adminConfigPayload, old Config, droppedKeys []string
 			old.Proxy.Port, payload.Proxy.Port))
 	}
 	declared := map[string]bool{}
-	for _, e := range payload.Routing {
-		declared[e.Alias] = true
+	for _, prof := range payload.Upstreams {
+		for _, e := range prof.Routing {
+			declared[e.Alias] = true
+		}
 	}
 	for _, alias := range []string{"sonnet", "opus", "haiku"} {
 		if !declared[alias] {
-			warnings = append(warnings, fmt.Sprintf("未声明 %s 路由，将回落到内置默认目标。", alias))
+			warnings = append(warnings, fmt.Sprintf("未在任何上游 profile 的模型表里声明 %s，将回落到内置默认目标。", alias))
 		}
 	}
 	if len(droppedKeys) > 0 {
@@ -706,26 +690,24 @@ func validateConfigPayload(p *adminConfigPayload, oldProfiles map[string]Upstrea
 		return nil, fmt.Errorf("管理口令含非法控制字符")
 	}
 
-	seen := map[string]bool{}
-	for _, e := range p.Routing {
-		if strings.TrimSpace(e.Alias) == "" {
-			return nil, fmt.Errorf("路由别名不能为空")
-		}
-		if seen[e.Alias] {
-			return nil, fmt.Errorf("路由别名 %q 重复", e.Alias)
-		}
-		seen[e.Alias] = true
-		if strings.TrimSpace(e.Model) == "" {
-			return nil, fmt.Errorf("路由 %q 的模型名不能为空", e.Alias)
-		}
-		if !validProfileSelector(e.Upstream, known) {
-			return nil, fmt.Errorf("路由 %q 的 upstream 必须是已定义的上游 profile 名（或 \"\"、\"claude\"、\"anthropic\"、\"openai\"）", e.Alias)
-		}
-		for _, field := range []struct{ name, value string }{
-			{"别名", e.Alias}, {"模型名", e.Model},
-		} {
-			if hasControlChars(field.value) {
-				return nil, fmt.Errorf("路由 %q 的%s含非法控制字符", e.Alias, field.name)
+	// Each profile's own model table is validated as part of that profile: an
+	// alias belongs to exactly one upstream, so there is no global table to check
+	// here and no cross-profile uniqueness rule beyond "one alias, one profile",
+	// which encodeSchemeRouting and buildProfileRoutes enforce.
+	for _, prof := range p.Upstreams {
+		for _, e := range prof.Routing {
+			if strings.TrimSpace(e.Alias) == "" {
+				return nil, fmt.Errorf("上游 profile %q 的路由别名不能为空", prof.Name)
+			}
+			if strings.TrimSpace(e.Model) == "" {
+				return nil, fmt.Errorf("上游 profile %q 的路由 %q 的模型名不能为空", prof.Name, e.Alias)
+			}
+			for _, field := range []struct{ name, value string }{
+				{"别名", e.Alias}, {"模型名", e.Model},
+			} {
+				if hasControlChars(field.value) {
+					return nil, fmt.Errorf("上游 profile %q 的路由 %q 的%s含非法控制字符", prof.Name, e.Alias, field.name)
+				}
 			}
 		}
 	}
@@ -976,11 +958,9 @@ func rejectRemovedProfiles(p *adminConfigPayload, old, next map[string]UpstreamP
 		if selectorRefersTo(p.Proxy.ChatUpstream, name) {
 			refs = append(refs, "chat_upstream")
 		}
-		for _, e := range p.Routing {
-			if selectorRefersTo(e.Upstream, name) {
-				refs = append(refs, "路由 "+e.Alias)
-			}
-		}
+		// A profile's model table needs no check here: those entries belong to the
+		// profile that declares them, so deleting that profile deletes them too, and
+		// an entry can no longer name some other profile.
 		if len(refs) > 0 {
 			return fmt.Errorf("上游 profile %q 仍被引用，无法删除：%s", name, strings.Join(refs, "、"))
 		}
@@ -1164,24 +1144,8 @@ func renderConfigTOML(p adminConfigPayload, adminTok, sophnetKey string, profile
 	b.WriteString("# entirely. LLM_PROXY_ADMIN_TOKEN overrides this value.\n")
 	fmt.Fprintf(&b, "token = %s\n\n", tomlString(adminTok))
 
-	b.WriteString("[routing]\n")
-	b.WriteString("# Builtin aliases (sonnet/opus/haiku) and custom aliases alike. A plain string\n")
-	b.WriteString("# uses default_upstream; a table may pick a profile and declare image support.\n")
-	for _, e := range p.Routing {
-		key := tomlKey(e.Alias)
-		if e.Upstream == "" && !e.SupportsImage {
-			fmt.Fprintf(&b, "%s = %s\n", key, tomlString(e.Model))
-			continue
-		}
-		parts := []string{fmt.Sprintf("model = %s", tomlString(e.Model))}
-		if e.Upstream != "" {
-			parts = append(parts, fmt.Sprintf("upstream = %s", tomlString(e.Upstream)))
-		}
-		if e.SupportsImage {
-			parts = append(parts, "supports_image = true")
-		}
-		fmt.Fprintf(&b, "%s = { %s }\n", key, strings.Join(parts, ", "))
-	}
+	// No top-level [routing] on purpose: every alias lives in the model table of
+	// the upstream profile that serves it, written by writeUpstreamProfiles.
 	return b.String()
 }
 
@@ -1361,7 +1325,12 @@ func unknownConfigKeys(path string) []string {
 	if toml.Unmarshal(data, &raw) != nil {
 		return nil
 	}
-	known := map[string]bool{"proxy": true, "upstream": true, "upstreams": true, "keys": true, "admin": true, "routing": true}
+	// "routing" is deliberately absent: the top-level section is no longer
+	// modelled, and a save rewrites the file without it. Listing it here would
+	// suppress the warning that tells an operator their old global table is about
+	// to disappear — they need that warning to move the aliases into the profiles
+	// first.
+	known := map[string]bool{"proxy": true, "upstream": true, "upstreams": true, "keys": true, "admin": true}
 	var unknown []string
 	for k := range raw {
 		if !known[k] {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -70,9 +71,12 @@ url = "`+upstream.URL+`"
 vlm_model = "vision-of-beta"
 vlm_max_tokens = 222
 
-[routing]
-sonnet = { model = "alpha-text", upstream = "alpha" }
-opus = { model = "beta-text", upstream = "beta" }
+[upstreams.alpha.routing]
+sonnet = { model = "alpha-text"}
+
+[upstreams.beta.routing]
+opus = { model = "beta-text"}
+
 `)
 
 	image := `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}`
@@ -133,8 +137,9 @@ protocol = "anthropic"
 url = "`+text.URL+`"
 key = "text-key"
 
-[routing]
-sonnet = { model = "deepseek-chat", upstream = "text-profile" }
+[upstreams.text-profile.routing]
+sonnet = { model = "deepseek-chat"}
+
 `)
 
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"what is this"}]}]}`)
@@ -186,8 +191,9 @@ url = "`+text.URL+`"
 vlm_model = "alpha-vision"
 vlm_upstream = "scheme-vision"
 
-[routing]
-sonnet = { model = "deepseek-chat", upstream = "alpha" }
+[upstreams.alpha.routing]
+sonnet = { model = "deepseek-chat"}
+
 `)
 
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"hi"}]}]}`)
@@ -221,9 +227,8 @@ key = "alpha-key"
 [upstreams.alpha.routing]
 alpha-fast = { model = "alpha-fast-model" }
 alpha-smart = { model = "alpha-smart-model", supports_image = true }
+sonnet = { model = "global-model"}
 
-[routing]
-sonnet = { model = "global-model", upstream = "alpha" }
 `)
 
 	rc := snapshotConfig()
@@ -252,36 +257,41 @@ sonnet = { model = "global-model", upstream = "alpha" }
 	}
 }
 
-// The global [routing] table wins a conflict with a scheme table: adding a scheme
-// must never silently reroute traffic the operator already pointed somewhere.
-func TestGlobalRoutingWinsOverASchemeTable(t *testing.T) {
+// Two profiles declaring the same alias is a conflict with no right answer. It
+// resolves deterministically — the profile whose name sorts first wins — and is
+// reported, so the same config cannot route differently between restarts.
+func TestCrossProfileAliasConflictResolvesDeterministically(t *testing.T) {
 	t.Setenv("SOPHNET_API_KEY", "")
 
+	// Declared with "zeta" first so map iteration order would otherwise decide.
 	withProfiles(t, `
 [proxy]
 vlm_model = ""
+
+[upstreams.zeta]
+protocol = "anthropic"
+url = "https://zeta.example/api"
+
+[upstreams.zeta.routing]
+sonnet = { model = "zeta-sonnet" }
 
 [upstreams.alpha]
 protocol = "anthropic"
 url = "https://alpha.example/api"
 
 [upstreams.alpha.routing]
-sonnet = { model = "scheme-sonnet" }
-
-[upstreams.beta]
-protocol = "anthropic"
-url = "https://beta.example/api"
-
-[upstreams.beta.routing]
-sonnet = { model = "other-scheme-sonnet" }
-
-[routing]
-sonnet = "global-sonnet"
+sonnet = { model = "alpha-sonnet" }
 `)
 
-	got := snapshotConfig().routeTarget("sonnet")
-	if got.Model != "global-sonnet" {
-		t.Fatalf("the global routing table must win, got %+v", got)
+	// "alpha" sorts before "zeta", so it wins — every load, not just this one.
+	for i := 0; i < 5; i++ {
+		if err := loadConfig(); err != nil {
+			t.Fatalf("load %d: %v", i, err)
+		}
+		got := snapshotConfig().routeTarget("sonnet")
+		if got.Model != "alpha-sonnet" || got.Upstream != "alpha" {
+			t.Fatalf("the conflict must resolve to the first profile by name, got %+v", got)
+		}
 	}
 }
 
@@ -370,8 +380,9 @@ protocol = "openai"
 url = "`+openaiUp.URL+`"
 vlm_model = "vision-of-oa"
 
-[routing]
-sonnet = { model = "oa-text", upstream = "oa" }
+[upstreams.oa.routing]
+sonnet = { model = "oa-text"}
+
 `)
 
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"hi"}]}]}`)
@@ -381,5 +392,92 @@ sonnet = { model = "oa-text", upstream = "oa" }
 	}
 	if describeModel != "vision-of-oa" {
 		t.Fatalf("the scheme's vision model must still be used, got %q", describeModel)
+	}
+}
+
+// A profile named after a builtin gateway may declare only a model table: since
+// there is no top-level [routing], that shorthand is how an alias is pinned to
+// the anthropic or openai gateway without repeating its protocol and URL.
+func TestBuiltinProfileTableNeedsNoProtocolOrURL(t *testing.T) {
+	t.Setenv("SOPHNET_API_KEY", "")
+
+	withProfiles(t, `
+[proxy]
+vlm_model = ""
+
+[upstream]
+anthropic_url = "https://anthropic.example/api"
+openai_url = "https://openai.example/v1"
+
+[upstreams.anthropic.routing]
+sonnet = { model = "pinned-to-anthropic" }
+
+[upstreams.openai.routing]
+haiku = { model = "pinned-to-openai" }
+`)
+
+	rc := snapshotConfig()
+	if e := rc.routeTarget("sonnet"); e.Model != "pinned-to-anthropic" || e.Upstream != profileNameAnthropic {
+		t.Fatalf("sonnet must route to the anthropic profile, got %+v", e)
+	}
+	if e := rc.routeTarget("haiku"); e.Model != "pinned-to-openai" || e.Upstream != profileNameOpenAI {
+		t.Fatalf("haiku must route to the openai profile, got %+v", e)
+	}
+
+	// The shorthand fills protocol and URL from the builtin definition.
+	up, ok := rc.profile(profileNameAnthropic)
+	if !ok || up.Protocol != protocolAnthropic || up.URL != "https://anthropic.example/api" {
+		t.Fatalf("the anthropic table must resolve to the builtin profile, got %+v ok=%v", up, ok)
+	}
+	up, ok = rc.profile(profileNameOpenAI)
+	if !ok || up.Protocol != protocolOpenAI || up.URL != "https://openai.example/v1" {
+		t.Fatalf("the openai table must resolve to the builtin profile, got %+v ok=%v", up, ok)
+	}
+}
+
+// A config that still carries a top-level [routing] section keeps serving: those
+// aliases are ignored, and the log says so with the names it dropped, because
+// silently ignoring them would look like a routing bug.
+func TestLegacyGlobalRoutingIsRejectedAndReported(t *testing.T) {
+	t.Setenv("SOPHNET_API_KEY", "")
+
+	var logged strings.Builder
+	oldOut := log.Writer()
+	log.SetOutput(&logged)
+	defer log.SetOutput(oldOut)
+
+	withProfiles(t, `
+[proxy]
+vlm_model = ""
+
+[upstream]
+anthropic_url = "https://anthropic.example/api"
+openai_url = "https://openai.example/v1"
+
+[routing]
+sonnet = "old-model"
+my-alias = { model = "another-old-model" }
+
+[upstreams.anthropic.routing]
+opus = { model = "new-model" }
+`)
+
+	msg := logged.String()
+	for _, want := range []string{"[routing]", "sonnet", "my-alias", "[upstreams.<name>.routing]"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("the warning must mention %q, got %q", want, msg)
+		}
+	}
+
+	// The ignored section declares nothing, so the builtin fallback covers sonnet
+	// and the profile table's opus is what actually routes.
+	if e := snapshotConfig().routeTarget("sonnet"); e.Model == "old-model" {
+		t.Fatalf("a top-level [routing] entry must not be served, got %+v", e)
+	}
+	if _, ok := snapshotConfig().routes["my-alias"]; ok {
+		t.Fatal("a top-level [routing] alias must not be served")
+	}
+	if e := snapshotConfig().routeTarget("opus"); e.Model != "new-model" || e.Upstream != profileNameAnthropic {
+		t.Fatalf("the per-profile table must still be served, got %+v", e)
 	}
 }

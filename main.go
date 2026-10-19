@@ -26,21 +26,33 @@ import (
 )
 
 // version is reported in the startup log and on the admin page.
-const version = "0.13.0"
+const version = "0.14.0"
 
 // Config represents /etc/llm-proxy/config.toml
 type Config struct {
 	Proxy    ProxyConfig    `toml:"proxy"`
 	Upstream UpstreamConfig `toml:"upstream"`
-	// Upstreams holds the named upstream profiles: [upstreams.<name>] tables a
-	// routing entry references by name. The map is normalised to lowercase names
-	// and stripped of unusable tables at load (normalizeUpstreamProfiles), so
-	// every key here resolves. Empty for a config that predates profiles, in
-	// which case the two builtin profiles below stand in for it.
+	// Upstreams holds the named upstream profiles: [upstreams.<name>] tables.
+	// The map is normalised to lowercase names and stripped of unusable tables at
+	// load (normalizeUpstreamProfiles), so every key here resolves.
+	//
+	// Each profile carries its whole scheme, including its own model mapping
+	// table ([upstreams.<name>.routing]). There is deliberately no top-level
+	// [routing] section: an alias belongs to exactly one upstream, so making the
+	// table part of the profile is what keeps several upstreams independent
+	// instead of letting a shared table decide where traffic goes.
 	Upstreams map[string]UpstreamProfile `toml:"upstreams"`
 	Keys      KeysConfig                 `toml:"keys"`
 	Admin     AdminConfig                `toml:"admin"`
-	Routing   map[string]toml.Primitive  `toml:"routing"`
+}
+
+// legacyGlobalRouting is the top-level [routing] section configs used before
+// per-profile tables. It is not a field of Config, which is how the loader
+// notices it: a file that still carries one is reported at load rather than
+// silently ignored, because ignoring it would leave every alias it declared
+// unroutable with no explanation.
+type legacyGlobalRouting struct {
+	Routing map[string]toml.Primitive `toml:"routing"`
 }
 
 // AdminConfig configures the web admin page. An empty Token disables the whole
@@ -563,10 +575,12 @@ func storeConfig(c Config, routes, declared map[string]RouteEntry) {
 }
 
 // parseConfig reads the config file and resolves it into a Config plus its
-// routing table, applying defaults and the builtin fallback routes. It never
-// touches the live globals, so a failed parse leaves the running config intact.
-// The declared routes are returned alongside the resolved ones: the admin page
-// edits what the file says, not the result of resolving it.
+// routing table. It never touches the live globals, so a failed parse leaves the
+// running config intact.
+//
+// Every alias comes from a profile's own [upstreams.<name>.routing] table; there
+// is no top-level [routing] to merge in. The returned "declared" table is the
+// union of those per-profile tables, which is what the admin page edits.
 func parseConfig() (Config, map[string]RouteEntry, map[string]RouteEntry, error) {
 	var c Config
 	data, err := os.ReadFile(configPathFromEnv())
@@ -577,35 +591,26 @@ func parseConfig() (Config, map[string]RouteEntry, map[string]RouteEntry, error)
 		return c, nil, nil, fmt.Errorf("parse config: %w", err)
 	}
 
+	// Report a leftover top-level [routing] loudly. It is no longer read, so every
+	// alias it declares is unroutable — an operator migrating a config needs to
+	// know that, not discover it as a 404 from a model name.
+	var legacy legacyGlobalRouting
+	if err := toml.Unmarshal(data, &legacy); err == nil && len(legacy.Routing) > 0 {
+		aliases := make([]string, 0, len(legacy.Routing))
+		for alias := range legacy.Routing {
+			aliases = append(aliases, alias)
+		}
+		sort.Strings(aliases)
+		log.Printf("config: top-level [routing] is no longer supported and was ignored (declared: %s); "+
+			"move each alias into the [upstreams.<name>.routing] table of the profile it belongs to\n",
+			strings.Join(aliases, ", "))
+	}
+
 	applyDefaults(&c)
 	normalizeUpstreamProfiles(&c)
 
-	declared := buildRouteTargets(c.Routing)
-	routes := make(map[string]RouteEntry, len(declared)+3)
-	for alias, e := range declared {
-		routes[alias] = e
-	}
-	// A scheme's own [upstreams.<name>.routing] table fills in the aliases the
-	// global [routing] table does not declare. The global table wins a conflict:
-	// adding a scheme must never silently reroute an alias the operator already
-	// pointed somewhere, and a conflict is almost certainly a mistake worth
-	// reporting.
-	mergeSchemeRoutes(&c, routes, declared)
-	// Drop entries naming an undefined profile before the builtin fallbacks are
-	// applied, so a dropped builtin alias (sonnet/opus/haiku) still gets its
-	// builtin default target instead of disappearing entirely.
-	dropUnknownProfileRoutes(&c, routes)
-	ensureRoute(routes, "sonnet", "DeepSeek-V4-Pro")
-	ensureRoute(routes, "opus", "GLM-5.2")
-	if _, ok := routes["haiku"]; !ok {
-		routes["haiku"] = routes["sonnet"]
-	}
-	applyDefaultUpstream(&c, routes)
+	routes, declared := buildProfileRoutes(&c)
 	validateProfileSelectors(&c)
-
-	// The declared table keeps its entries even when one names a profile the
-	// config lacks: the admin page edits what the file says, and re-saving must
-	// not silently delete a route the operator wrote.
 	return c, routes, declared, nil
 }
 
@@ -651,6 +656,24 @@ func normalizeUpstreamProfiles(c *Config) {
 			continue
 		}
 		p.Protocol = strings.ToLower(strings.TrimSpace(p.Protocol))
+		p.URL = strings.TrimSpace(p.URL)
+
+		// The two builtin gateway names may be declared with only a model table:
+		// since there is no top-level [routing], "put these aliases on the
+		// anthropic gateway" would otherwise need a protocol and a URL that merely
+		// repeat [upstream].anthropic_url. A partial table fills the missing half
+		// from the builtin definition; a table that names neither is exactly that
+		// shorthand.
+		builtinName := name == profileNameAnthropic || name == profileNameOpenAI
+		if builtinName {
+			if p.Protocol == "" {
+				p.Protocol = builtinProtocol(name)
+			}
+			if p.URL == "" {
+				p.URL = c.builtinURL(name)
+			}
+		}
+
 		if p.Protocol != protocolAnthropic && p.Protocol != protocolOpenAI {
 			log.Printf("config: upstream profile %q has protocol %q, must be %q or %q (profile skipped)\n",
 				name, p.Protocol, protocolAnthropic, protocolOpenAI)
@@ -667,6 +690,23 @@ func normalizeUpstreamProfiles(c *Config) {
 		return
 	}
 	c.Upstreams = cleaned
+}
+
+// builtinProtocol is the framing the named builtin gateway speaks.
+func builtinProtocol(name string) string {
+	if normalizeUpstreamName(name) == profileNameOpenAI {
+		return protocolOpenAI
+	}
+	return protocolAnthropic
+}
+
+// builtinURL is the URL the named builtin gateway resolves to when its profile
+// table declares none: the matching [upstream] global.
+func (c Config) builtinURL(name string) string {
+	if normalizeUpstreamName(name) == profileNameOpenAI {
+		return c.Upstream.OpenAIURL
+	}
+	return c.Upstream.AnthropicURL
 }
 
 // validProfileName reports whether a (already lowercase) profile name uses only
@@ -902,23 +942,11 @@ func applyDefaultUpstream(c *Config, routes map[string]RouteEntry) {
 	}
 }
 
-// dropUnknownProfileRoutes removes routing entries that name an upstream profile
-// the config does not define. A route to a profile that does not exist has no
-// URL, key or protocol to send with, so serving it would mean silently picking
-// some other gateway; the [routing] table's existing tolerance applies instead —
-// drop the entry with a warning and let the builtin fallback cover a builtin
-// alias. An entry naming no profile at all resolves to the implicit anthropic
-// one, so it is never dropped here.
-func dropUnknownProfileRoutes(c *Config, routes map[string]RouteEntry) {
-	for alias, e := range routes {
-		if _, ok := c.profileByName(e.Upstream); ok {
-			continue
-		}
-		log.Printf("config: routing entry %q names upstream %q, which is not defined (entry skipped)\n",
-			alias, e.Upstream)
-		delete(routes, alias)
-	}
-}
+// verifyTargetProfile reports whether the profile a resolved route names actually
+// exists. A per-profile table always names its own profile, so this can only fail
+// for a route injected after load (a test, or a hand-edited published table) —
+// but such a route has no URL or key to send with, so it is reported rather than
+// silently redirected to another gateway and billed there.
 
 // validateProfileSelectors checks the profile selectors at load, so a typo is
 // reported once at startup instead of on every request that happens to need the
@@ -1009,25 +1037,26 @@ func ensureRoute(routes map[string]RouteEntry, alias, defaultModel string) {
 	}
 }
 
-// mergeSchemeRoutes folds every [upstreams.<name>.routing] table into the global
-// routing table, so a scheme carries its own model mapping rather than requiring
-// the operator to edit the global [routing] section for each upstream they add.
+// buildProfileRoutes is the single source of every alias the proxy serves: it
+// reads each profile's own [upstreams.<name>.routing] table and returns both the
+// resolved table and the declared one (the same entries, before the two builtin
+// fallbacks are added).
 //
-// Two rules keep the merge predictable:
+// There is no top-level [routing] to merge with, by design: an alias belongs to
+// exactly one upstream, and a shared table is precisely what made several
+// upstreams interfere with each other.
 //
-//   - The global [routing] table always wins. A scheme cannot silently reroute an
-//     alias the operator already declared, because adding an upstream must never
-//     change where existing traffic goes.
-//   - An entry inherits its scheme's profile and may not name another. The table
-//     is scoped to the profile that declares it; naming a different profile there
-//     would make "this scheme's models" ambiguous. Such an entry is skipped with a
-//     warning, the same tolerance a route naming an undefined profile gets.
+// Two rules keep the result unambiguous:
 //
-// A conflict with the global table is reported but not treated as an error: the
-// scheme table is additive, and a duplicate alias most likely means the operator
-// copied a model into a scheme it is already served from.
-func mergeSchemeRoutes(c *Config, routes, declared map[string]RouteEntry) {
-	// Sorted so a conflict between two schemes resolves the same way on every
+//   - An entry inherits its profile and may not name another. The table is
+//     scoped to the profile that declares it, so naming a different profile
+//     there is skipped with a warning.
+//   - Two profiles declaring the same alias is a conflict with no right answer.
+//     The profile that sorts first wins, deterministically, and the clash is
+//     reported. Silently letting map iteration order decide would make the same
+//     config route differently between restarts.
+func buildProfileRoutes(c *Config) (routes, declared map[string]RouteEntry) {
+	// Sorted so a conflict between two profiles resolves the same way on every
 	// load instead of following map iteration order.
 	names := make([]string, 0, len(c.Upstreams))
 	for name := range c.Upstreams {
@@ -1035,13 +1064,14 @@ func mergeSchemeRoutes(c *Config, routes, declared map[string]RouteEntry) {
 	}
 	sort.Strings(names)
 
+	declared = make(map[string]RouteEntry, len(names)*2)
 	for _, name := range names {
 		p := c.Upstreams[name]
 		if len(p.Routing) == 0 {
 			continue
 		}
-		// buildRouteTargets reports and skips malformed entries, which is the same
-		// per-entry tolerance the global table gets.
+		// buildRouteTargets reports and skips malformed entries, which is the
+		// tolerance every routing table gets.
 		scheme := buildRouteTargets(p.Routing)
 		aliases := make([]string, 0, len(scheme))
 		for alias := range scheme {
@@ -1052,24 +1082,36 @@ func mergeSchemeRoutes(c *Config, routes, declared map[string]RouteEntry) {
 		for _, alias := range aliases {
 			e := scheme[alias]
 			if e.Upstream != "" && normalizeUpstreamName(e.Upstream) != name {
-				log.Printf("config: [upstreams.%s.routing] %q names upstream %q, but a scheme's own table may only serve its own profile (entry skipped)\n",
+				log.Printf("config: [upstreams.%s.routing] %q names upstream %q, but a profile's own table may only serve that profile (entry skipped)\n",
 					name, alias, e.Upstream)
 				continue
 			}
-			if _, taken := declared[alias]; taken {
-				log.Printf("config: [upstreams.%s.routing] %q is already declared in [routing] (scheme entry ignored)\n",
-					name, alias)
-				continue
-			}
-			if _, taken := routes[alias]; taken {
-				log.Printf("config: [upstreams.%s.routing] %q is already served by another scheme (entry ignored)\n",
-					name, alias)
+			if prev, taken := declared[alias]; taken {
+				log.Printf("config: [upstreams.%s.routing] %q is already declared by another profile (keeping %q, entry skipped)\n",
+					name, alias, prev.Upstream)
 				continue
 			}
 			e.Upstream = name
-			routes[alias] = e
+			declared[alias] = e
 		}
 	}
+
+	routes = make(map[string]RouteEntry, len(declared)+3)
+	for alias, e := range declared {
+		routes[alias] = e
+	}
+	// The builtin aliases keep working for a config that declares none of them:
+	// Claude Code always asks for one of these three names, so leaving them
+	// unroutable would turn an unconfigured proxy into a 404 machine. They go to
+	// default_upstream, which is the only thing that still decides a gateway
+	// globally.
+	ensureRoute(routes, "sonnet", "DeepSeek-V4-Pro")
+	ensureRoute(routes, "opus", "GLM-5.2")
+	if _, ok := routes["haiku"]; !ok {
+		routes["haiku"] = routes["sonnet"]
+	}
+	applyDefaultUpstream(c, routes)
+	return routes, declared
 }
 
 // normalizeUpstreamName canonicalises the case of a configured gateway name,
@@ -1349,11 +1391,11 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	// text-only openai models ("model ... do not support image params").
 	target := rc.routeTarget(model)
 	newModel := target.Model
-	// The profile the target route resolves to. A route naming a profile the
-	// config does not define cannot be served: dropUnknownProfileRoutes removes it
-	// at load, so the only way to get here is a route injected after load (a test,
-	// or a hand-edited published table). Treat it as unroutable and report the
-	// failure rather than silently picking another gateway and billing it.
+	// The profile the target route resolves to. A per-profile table always names
+	// its own profile, so the only way to get an unresolvable one here is a route
+	// injected after load (a test, or a hand-edited published table). Such a route
+	// has no URL or key to send with, so report it rather than silently picking
+	// another gateway and billing it.
 	targetUp, haveTarget := rc.profile(target.Upstream)
 	if !haveTarget {
 		log.Printf("[RESP] route %q names undefined upstream %q\n", model, target.Upstream)

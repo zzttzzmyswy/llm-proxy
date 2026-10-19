@@ -75,8 +75,8 @@ protocol = "openai"
 url = "https://claude-named.example/v1"
 key = "sk-claude"
 
-[routing]
-sonnet = { model = "m", upstream = "claude" }
+[upstreams.anthropic.routing]
+sonnet = { model = "m" }
 `)
 
 	c := currentConfig()
@@ -122,94 +122,6 @@ token = "s3cret"
 	}
 }
 
-// A route spelled upstream = "claude" is accepted by the loader, but the admin
-// form's dropdowns offer profile names rather than that alias. Reporting the alias
-// verbatim made the row fall back to the first option, so an untouched save
-// silently rerouted it. The view reports the canonical name the dropdown has.
-func TestAdminViewReportsClaudeRoutesAsTheAnthropicProfile(t *testing.T) {
-	t.Setenv("SOPHNET_API_KEY", "")
-
-	withProfiles(t, `
-[proxy]
-port = 8088
-
-[upstream]
-anthropic_url = "https://anthropic.example/api"
-openai_url = "https://openai.example/v1"
-
-[admin]
-token = "s3cret"
-
-[routing]
-sonnet = { model = "m1", upstream = "claude" }
-`)
-
-	view := currentConfigView()
-
-	// Build the option set the page's dropdown actually offers.
-	offered := map[string]bool{"": true}
-	for _, p := range view.Upstreams {
-		offered[p.Name] = true
-	}
-	for _, e := range view.Routing {
-		if !offered[e.Upstream] {
-			t.Fatalf("route %q reports upstream %q, which the dropdown does not offer", e.Alias, e.Upstream)
-		}
-	}
-	if got := view.Upstream.DefaultUpstream; got != "" && !offered[got] {
-		t.Fatalf("default_upstream %q is not among the dropdown options", got)
-	}
-	if got := view.Proxy.VLMUpstream; got != "" && !offered[got] {
-		t.Fatalf("vlm_upstream %q is not among the dropdown options", got)
-	}
-	if got := view.Proxy.ChatUpstream; got != "" && !offered[got] {
-		t.Fatalf("chat_upstream %q is not among the dropdown options", got)
-	}
-}
-
-// The round trip has to be behaviour-preserving: an untouched save of a config
-// whose route names "claude" must leave the route pointing at the anthropic
-// profile, not at whatever the dropdown's first option happens to be.
-func TestAdminUntouchedSaveKeepsAClaudeRouteWhereItWas(t *testing.T) {
-	t.Setenv("SOPHNET_API_KEY", "")
-
-	configTOMLForTest(t, `
-[proxy]
-port = 8088
-
-[upstream]
-anthropic_url = "https://anthropic.example/api"
-openai_url = "https://openai.example/v1"
-default_upstream = "deepseek"
-
-[upstreams.deepseek]
-protocol = "anthropic"
-url = "https://deepseek.example/api"
-key = "sk-d"
-
-[admin]
-token = "s3cret"
-
-[routing]
-sonnet = { model = "m1", upstream = "claude" }
-`)
-
-	before := currentRoutes()["sonnet"]
-	if before.Upstream != profileNameClaudeAlias {
-		t.Fatalf("fixture must start with the alias, got %+v", before)
-	}
-
-	w := postConfig(t, payloadFromViewWithProfiles(t, currentConfigView()), "s3cret")
-	if w.Code != http.StatusOK {
-		t.Fatalf("save must succeed: %d %s", w.Code, w.Body.String())
-	}
-
-	after := currentRoutes()["sonnet"]
-	if up, ok := currentConfig().profileByName(after.Upstream); !ok || up.Name != profileNameAnthropic {
-		t.Fatalf("the route must still resolve to the anthropic profile after an untouched save, got %+v -> %+v", after, up)
-	}
-}
-
 // Two saves running at once must each leave a whole payload behind, never a
 // mixture and never an unparseable file.
 //
@@ -244,8 +156,8 @@ protocol = "anthropic"
 url = "https://beta.example/api"
 key = "sk-beta"
 
-[routing]
-sonnet = { model = "m", upstream = "alpha" }
+[upstreams.alpha.routing]
+sonnet = { model = "m" }
 `)
 
 	base := payloadFromViewWithProfiles(t, currentConfigView())

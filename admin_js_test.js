@@ -436,21 +436,6 @@ test("profilePayloadFromRow tolerates absent fields", () => {
   assert.equal(row.header_timeout_seconds, 0);
 });
 
-// An empty routing row is a line the operator left behind; submitting it would be
-// rejected as an empty alias, so it has to be dropped instead.
-test("routePayloadFromRow drops an empty row", () => {
-  assert.equal(admin.routePayloadFromRow({ alias: "  ", model: "  " }), null);
-  assert.equal(admin.routePayloadFromRow({}), null);
-});
-
-test("routePayloadFromRow trims and keeps a filled row", () => {
-  assert.deepEqual(
-    admin.routePayloadFromRow({ alias: " sonnet ", model: " deepseek-chat ", upstream: "deepseek", supportsImage: true }),
-    { alias: "sonnet", model: "deepseek-chat", upstream: "deepseek", supports_image: true },
-  );
-  assert.equal(admin.routePayloadFromRow({ alias: "x", model: "y" }).supports_image, false);
-});
-
 // A scheme's own model rows are read from the card and submitted without an
 // upstream: the entry belongs to the profile that declares it, so offering a
 // choice there would let the page build a table the loader rejects.
