@@ -224,17 +224,21 @@ export ANTHROPIC_AUTH_TOKEN="<任意值，代理会替换为真实上游密钥>"
 | `routing.opus` | `GLM-5.2` | `opus` 映射目标 |
 | `routing.haiku` | 沿用 `sonnet` | `haiku` 映射目标 |
 | `routing.<别名>` | — | 任意别名(含 sonnet/opus/haiku):字符串走默认网关,表值 `{ model = "...", upstream = "<profile 名>", supports_image = true\|false }` 显式选上游与 image 能力。`upstream` 可填 `[upstreams.<名字>]` 名、`"claude"`/`"anthropic"`(anthropic profile)或 `"openai"` |
-| `upstreams.<名字>` | — | 命名上游 profile：`protocol`（`anthropic`\|`openai`，必填）、`url`（必填，http(s)）、`key`/`key_env`、可选 `header_timeout_seconds`/`body_idle_seconds`/`max_retries`。routing 条目与 `default_upstream`/`vlm_upstream`/`chat_upstream` 按名字引用。详见下方「多上游 profile」 |
+| `upstreams.<名字>` | — | 命名上游 profile（= 一份完整上游方案）：`protocol`（`anthropic`\|`openai`，必填）、`url`（必填，http(s)）、`key`/`key_env`、可选 `header_timeout_seconds`/`body_idle_seconds`/`max_retries`，以及该方案自己的 `vlm_model`/`vlm_max_tokens`/`vlm_upstream` 与 `[upstreams.<名字>.routing]` 模型表。routing 条目与 `default_upstream`/`vlm_upstream`/`chat_upstream` 按名字引用。详见下方「多上游 profile」 |
 
 > **OpenAI 网关路由示例**：`flash = { model = "glm-5.3-flash", upstream = "openai" }`
 > 之后 Claude Code 以模型名 `flash` 发请求即可，代理把请求翻译为 OpenAI 格式转发到 `upstream.openai_url`，并把回复（含流式）翻译回 Anthropic 格式。请求翻译会剥离 thinking 块、把图片转 `image_url`、`tool_use/tool_result` 转 `tool_calls`/`role=tool`；响应侧 `finish_reason→stop_reason`、`usage` 映射，流式 SSE 输出标准 Anthropic 事件序列。
 >
 > **image 能力声明示例**：`vision = { model = "gpt-4o", supports_image = true }`（anthropic 网关直发图片）或 `vision = { model = "glm-5.3-flash", upstream = "openai", supports_image = true }`（openai 网关图片翻译为 `image_url`）。这类路由带图请求不再进 VLM 描述、不再做 image 400 重试。
 
-## 多上游 profile
+## 多上游 profile（上游方案）
 
 需要把不同别名发往不同上游（不同厂商、不同协议、不同密钥）时，用 `[upstreams.<名字>]` 定义**命名上游 profile**，
 routing 条目按名字引用。每个 profile 只选**一种**协议。
+
+**每个 profile 是一份完整的上游方案，而不只是一个地址**：它可以带自己的视觉模型（`vlm_model` /
+`vlm_max_tokens` / `vlm_upstream`）和自己的模型映射表（`[upstreams.<名字>.routing]`）。这样增加第二个上游
+不需要去改共享的 `[proxy]` 与 `[routing]`，两套方案互不影响。
 
 ```toml
 [upstreams.deepseek]
@@ -246,6 +250,15 @@ key_env = "DEEPSEEK_API_KEY"  # 可选：该环境变量非空时优先于 key
 # header_timeout_seconds = 120
 # body_idle_seconds = 90
 # max_retries = 2
+# 本方案自己的图片描述流程（都不写 = 沿用 [proxy] 全局值，与旧配置完全一致）
+vlm_model = "deepseek-vl"
+vlm_max_tokens = 4000
+# vlm_upstream = "anthropic"  # 留空 = 描述请求走本 profile 自己
+
+# 本方案自己的模型映射表：只能指向本 profile
+[upstreams.deepseek.routing]
+deepseek-fast = { model = "deepseek-chat" }
+deepseek-vision = { model = "deepseek-vl", supports_image = true }
 
 [upstreams.local-glm]
 protocol = "openai"
@@ -258,18 +271,45 @@ openai_url = "https://www.sophnet.com/api/open-apis/openai"
 default_upstream = "anthropic"   # 也可填任一 profile 名
 
 [proxy]
-vlm_upstream = "deepseek"        # 图片描述走它（必须 anthropic 协议）
+vlm_upstream = "deepseek"        # 全局 VLM 走它（必须 anthropic 协议）
 chat_upstream = "local-glm"      # /v1/chat/completions 走它（必须 openai 协议）
 
 [routing]
 sonnet = { model = "deepseek-chat", upstream = "deepseek" }
 opus   = { model = "glm-5.3-flash", upstream = "local-glm" }
 haiku  = "DeepSeek-V4-Flash-0731"   # 字符串 = 走 default_upstream
+
+# 于是 Claude Code 用 deepseek-fast / deepseek-vision 这两个名字即可命中
+# deepseek 方案的那些模型，全局 [routing] 不需要知道它们。
 ```
+
+### 每个方案自己的 VLM
+
+带图请求的「先描述再路由」使用**被路由到的那个方案**的 VLM：
+
+| 情况 | 描述用的模型 | 描述请求走哪个上游 |
+|------|--------------|--------------------|
+| profile 写了 `vlm_model`，没写 `vlm_upstream` | 本 profile 的 `vlm_model` | 本 profile（仅当它是 anthropic 协议；否则回落到全局 `vlm_upstream`） |
+| profile 写了 `vlm_upstream` | 本 profile 的 `vlm_model` | `vlm_upstream` 指定的 profile |
+| profile 什么都没写 | `[proxy].vlm_model` | `[proxy].vlm_upstream`（旧行为） |
+
+描述调用固定说 anthropic 的 `/v1/messages`，所以承载它的 profile 必须是 anthropic 协议。指向 openai 协议的
+profile 时加载期打 warning 并回落到隐式 `anthropic`，管理页面保存时直接拒绝。`vlm_max_tokens` 为 0 时沿用
+`[proxy].vlm_max_tokens`。
+
+### 每个方案自己的模型映射表
+
+`[upstreams.<名字>.routing]` 提供该方案专属的别名：
+
+- 条目只写 `model` 与可选的 `supports_image`；`upstream` 由所属方案决定，**写别的 profile 会被跳过并打 warning**
+  （一张表必须只属于一个方案，否则「这个方案的模型」就无从定义）。
+- 与全局 `[routing]` 冲突时**全局优先**：新增一个方案绝不能悄悄改掉已有流量走向；冲突会在日志里报出来。
+- 两个方案的表之间出现同名别名时，按 profile 名排序取第一个，保证每次加载结果一致。
 
 ### 名字与引用规则
 
 - 名字只能用 `a-z` `0-9` `-` `_`，1~32 字符；**大小写不敏感**（`DeepSeek` 与 `deepseek` 是同一个 profile，加载时归一为小写）。
+- `claude` 是**保留名**（它等价于 `anthropic`）：`[upstreams.claude]` 永远无法被解析到，加载时跳过、保存时拒绝。
 - routing 条目的 `upstream`、`default_upstream`、`vlm_upstream`、`chat_upstream` 取值都是 profile 名；`""` 表示走 `default_upstream`（缺省 `anthropic`），`"claude"` 视为 `anthropic`。
 - 引用不存在的 profile：加载时该 routing 条目跳过并打 warning（沿用 routing 表既有的容错）；管理页面保存时直接拒绝（400）。
 - `vlm_upstream` 必须是 anthropic 协议、`chat_upstream` 必须是 openai 协议；填错时加载期回落到对应内置 profile 并打 warning。
@@ -326,13 +366,23 @@ haiku  = "DeepSeek-V4-Flash-0731"   # 字符串 = 走 default_upstream
 ### 管理页面
 
 「配置」区块里的**上游 profile** 表格可新增 / 编辑 / 删除 profile：名字、协议（下拉 anthropic/openai）、URL、
-密钥环境变量、密钥与三项超时/重试。密钥沿用 `keep`/`set`/`clear` 三态（留空 = 保持原密钥不变，**GET 绝不回显明文**）。
-来自 `[upstream]` 的两个隐式 profile 以「内置」只读展示；新增一个同名 profile 即覆盖它。
+密钥环境变量、密钥与三项超时/重试。每个可编辑 profile 下面还有一行**图片描述**（`vlm_model` /
+`vlm_max_tokens` / `vlm_upstream`），留空即沿用 `[proxy]` 的全局值；行内提示会写出实际生效的模型，所以
+「这个方案到底用哪个 VLM」不必回翻配置。密钥沿用 `keep`/`set`/`clear` 三态（留空 = 保持原密钥不变，
+**GET 绝不回显明文**）。来自 `[upstream]` 的两个隐式 profile 以「内置」只读展示（它们没有自己的表可写，
+因此不显示描述行）；新增一个同名 profile 即覆盖它。
 
 路由表的「上游 profile」是下拉（内置 + 所有 profile 名），`proxy` 区块的 `vlm_upstream`/`chat_upstream` 分别只列
-anthropic / openai 协议的 profile。保存校验覆盖：profile 名合法且不重复、协议合法、URL 合法、超时/重试非负、
-路由与选择器引用的 profile 存在且协议匹配、**删除仍被引用的 profile 被拒绝并列出引用方**、对新增 profile 使用
-`keep` 被拒绝。保存沿用既有流程（备份 `.bak.<时间戳>` → 原子写 → 重载失败自动回滚）。
+anthropic / openai 协议的 profile。保存校验覆盖：profile 名合法且不重复且不是保留名 `claude`、协议合法、URL 合法、
+超时/重试非负、`vlm_max_tokens` 非负、方案的 `vlm_upstream` 存在且为 anthropic 协议、路由与选择器引用的 profile
+存在、**删除仍被引用的 profile 被拒绝并列出引用方**、对新增 profile 使用 `keep` 被拒绝。保存沿用既有流程
+（备份 `.bak.<时间戳>` → 原子写 → 重载失败自动回滚）。
+
+### 配色
+
+页面自带明暗两套配色：默认跟随系统 `prefers-color-scheme`，标题栏右上角的 ◐/☀ 按钮可强制切换，选择记在浏览器
+里（`localStorage`），下次打开保持。两套都是独立调好的色板，不是对另一套做反色——状态色（成功/警告/失败）在
+深色下仍然表达同样的严重程度。
 
 ## 测试
 

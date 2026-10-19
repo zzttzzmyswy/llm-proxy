@@ -441,18 +441,24 @@ func handleAdminConfigSave(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "请求体不是合法 JSON: "+err.Error())
 		return
 	}
-	// The running config is read before validation: the save is checked against
-	// the profiles that exist, and a profile key the form asked to keep is carried
-	// over from it — the page is never sent one.
+
+	// Take the transaction lock before reading the running config, not after.
+	// Everything below derives new state from what is on disk and in memory —
+	// the "keep" key and password carry the stored value over, the backup is the
+	// previous file, the rewrite drops keys the old file may carry. Reading the
+	// old value outside the lock lets two concurrent saves both base themselves
+	// on the same snapshot and the later one silently undo the earlier one's
+	// change. Validation is included because it also resolves "keep" profiles out
+	// of the same snapshot.
+	configSaveMu.Lock()
+	defer configSaveMu.Unlock()
+
 	oldConfig := currentConfig()
 	profiles, err := validateConfigPayload(&payload, oldConfig.Upstreams)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	configSaveMu.Lock()
-	defer configSaveMu.Unlock()
 
 	path := configPathFromEnv()
 
@@ -557,6 +563,28 @@ func configWarnings(payload adminConfigPayload, old Config, droppedKeys []string
 	if os.Getenv("SOPHNET_API_KEY") != "" {
 		warnings = append(warnings, "环境变量 SOPHNET_API_KEY 已设置，它的优先级高于配置文件里的密钥。")
 	}
+
+	// Clearing a profile's key does not always mean the profile ends up keyless:
+	// the two builtin gateway names fall back to the legacy [keys].sophnet /
+	// SOPHNET_API_KEY credential. Saying so beats letting the operator believe the
+	// profile has no credential while it keeps authenticating with the old one.
+	for _, p := range payload.Upstreams {
+		if p.KeyAction != "clear" {
+			continue
+		}
+		name := normalizeUpstreamName(p.Name)
+		if name != profileNameAnthropic && name != profileNameOpenAI {
+			continue
+		}
+		switch {
+		case os.Getenv(legacyKeyEnv) != "":
+			warnings = append(warnings, fmt.Sprintf("上游 profile %q 的密钥已清空，但它仍会回落到环境变量 %s（内置网关名的既定行为）。",
+				name, legacyKeyEnv))
+		case old.Keys.Sophnet != "":
+			warnings = append(warnings, fmt.Sprintf("上游 profile %q 的密钥已清空，但它仍会回落到 [keys].sophnet（内置网关名的既定行为）。要真正停用请同时清空该密钥。", name))
+		}
+	}
+
 	if envAdminTok := os.Getenv("LLM_PROXY_ADMIN_TOKEN"); envAdminTok != "" {
 		if payload.Admin.Action == "clear" {
 			// An environment password outranks the file, so clearing the file

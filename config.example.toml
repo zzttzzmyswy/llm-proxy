@@ -62,10 +62,28 @@ openai_url = "https://www.sophnet.com/api/open-apis/openai"
 # # body_idle_seconds = 90
 # # max_retries = 2
 #
+# # ---- 每个 profile 都是一份完整的上游方案 ----
+# # 下面三项让一个 profile 拥有自己的图片描述流程，而不是共用 [proxy] 的全局设置。
+# # 都不写 = 沿用 [proxy] 的 vlm_model / vlm_max_tokens / vlm_upstream，
+# # 也就是旧配置的行为完全不变。
+# # vlm_model = "glm-5v"           # 本 profile 的视觉模型
+# # vlm_max_tokens = 4000          # 本 profile 的每次描述输出上限
+# # vlm_upstream = "anthropic"     # 描述请求走哪个 profile（必须 anthropic 协议）；
+#                                   # 留空 = 走本 profile 自己（仅当本 profile 是
+#                                   # anthropic 协议时成立，否则回落到全局设置）
+#
 # [upstreams.local-glm]
 # protocol = "openai"
 # url = "http://127.0.0.1:9000/v1/chat/completions"
 # key = "sk-local"
+#
+# # ---- 每个 profile 可带自己的模型映射表 ----
+# # [upstreams.<名字>.routing] 里的别名只会路由到该 profile，写 model 与可选的
+# # supports_image 即可，不需要（也不允许）再写 upstream。
+# # 与全局 [routing] 冲突时全局优先；某个别名只属于一个 profile。
+# [upstreams.local-glm.routing]
+# local-fast = { model = "glm-5.3-flash" }
+# local-vision = { model = "glm-5v", supports_image = true }
 
 [keys]
 # Alternative: export SOPHNET_API_KEY=... and leave this empty.
