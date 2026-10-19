@@ -366,17 +366,25 @@ profile 时加载期打 warning 并回落到隐式 `anthropic`，管理页面保
 ### 管理页面
 
 「配置」区块里的**上游 profile** 表格可新增 / 编辑 / 删除 profile：名字、协议（下拉 anthropic/openai）、URL、
-密钥环境变量、密钥与三项超时/重试。每个可编辑 profile 下面还有一行**图片描述**（`vlm_model` /
-`vlm_max_tokens` / `vlm_upstream`），留空即沿用 `[proxy]` 的全局值；行内提示会写出实际生效的模型，所以
-「这个方案到底用哪个 VLM」不必回翻配置。密钥沿用 `keep`/`set`/`clear` 三态（留空 = 保持原密钥不变，
-**GET 绝不回显明文**）。来自 `[upstream]` 的两个隐式 profile 以「内置」只读展示（它们没有自己的表可写，
-因此不显示描述行）；新增一个同名 profile 即覆盖它。
+密钥环境变量、密钥与三项超时/重试。每个可编辑 profile 下面还有两行：
+
+- **图片描述**：`vlm_model` / `vlm_max_tokens` / `vlm_upstream`，留空即沿用 `[proxy]` 的全局值；行内提示会写出
+  实际生效的模型，所以「这个方案到底用哪个 VLM」不必回翻配置。
+- **本方案的模型表**：`[upstreams.<名字>.routing]` 的增删改；别名只路由到本 profile，因此没有上游列。
+
+密钥沿用 `keep`/`set`/`clear` 三态（留空 = 保持原密钥不变，**GET 绝不回显明文**）。来自 `[upstream]` 的两个隐式
+profile 以「内置」只读展示（它们没有自己的表可写，因此不显示上面两行）；新增一个同名 profile 即覆盖它。
 
 路由表的「上游 profile」是下拉（内置 + 所有 profile 名），`proxy` 区块的 `vlm_upstream`/`chat_upstream` 分别只列
 anthropic / openai 协议的 profile。保存校验覆盖：profile 名合法且不重复且不是保留名 `claude`、协议合法、URL 合法、
-超时/重试非负、`vlm_max_tokens` 非负、方案的 `vlm_upstream` 存在且为 anthropic 协议、路由与选择器引用的 profile
-存在、**删除仍被引用的 profile 被拒绝并列出引用方**、对新增 profile 使用 `keep` 被拒绝。保存沿用既有流程
+超时/重试非负、`vlm_max_tokens` 非负、方案的 `vlm_upstream` 存在且为 anthropic 协议、方案模型表的别名/模型非空
+且不重复且不指向别的 profile、路由与选择器引用的 profile 存在、**删除仍被引用的 profile 被拒绝并列出引用方**、
+对新增 profile 使用 `keep` 被拒绝。清空一个名为 `anthropic`/`openai` 的 profile 的密钥时会提示它仍会回落到
+`[keys].sophnet` / `SOPHNET_API_KEY`（内置网关名的既定行为），不会让人误以为凭据已失效。保存沿用既有流程
 （备份 `.bak.<时间戳>` → 原子写 → 重载失败自动回滚）。
+
+「上游 profile」列表与「本方案的模型表」都用**整份提交**语义：页面没带这个字段时沿用运行中的值，带了一个空列表
+则是操作者把行都删了。老版本页面因此不会误删它不认识的数据。
 
 ### 配色
 
