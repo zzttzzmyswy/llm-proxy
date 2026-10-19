@@ -8,6 +8,9 @@
   var autoTimer = null;
   var autoOn = false;
   var config = null;
+  // The [proxy] vision model, so a scheme row's empty placeholder can say what it
+  // will inherit instead of leaving the operator to scroll up and look.
+  var globalVLMModel = "";
 
   function esc(v) {
     return String(v == null ? "" : v).replace(/[&<>"']/g, function (c) {
@@ -755,6 +758,14 @@
 
   // readsOf snapshots a profile row's controls, so the payload builder below can
   // be a pure function over plain values — which is what the node tests exercise.
+  // The describe-pass fields are absent on a builtin row, so they are read through
+  // this tolerant accessor: readsOf is only called for editable rows, but a
+  // missing control must not turn a save into a TypeError.
+  function readValue(row, selector, fallback) {
+    var el = row.querySelector(selector);
+    return el ? el.value : fallback;
+  }
+
   function readsOf(row) {
     return {
       name: row.querySelector(".p-name").value,
@@ -765,7 +776,10 @@
       keyEnv: row.querySelector(".p-key-env").value,
       headerTimeout: row.querySelector(".p-header-timeout").value,
       bodyIdle: row.querySelector(".p-body-idle").value,
-      maxRetries: row.querySelector(".p-max-retries").value
+      maxRetries: row.querySelector(".p-max-retries").value,
+      vlmModel: readValue(row, ".p-vlm-model", ""),
+      vlmMaxTokens: readValue(row, ".p-vlm-max-tokens", ""),
+      vlmUpstream: readValue(row, ".p-vlm-upstream", "")
     };
   }
 
@@ -784,7 +798,12 @@
       key_env: String(r.keyEnv == null ? "" : r.keyEnv).trim(),
       header_timeout_seconds: intOr0(r.headerTimeout),
       body_idle_seconds: intOr0(r.bodyIdle),
-      max_retries: intOr0(r.maxRetries)
+      max_retries: intOr0(r.maxRetries),
+      // The scheme's own describe pass. Blank means "inherit [proxy]", which the
+      // server keeps as an absence rather than freezing the inherited value.
+      vlm_model: String(r.vlmModel == null ? "" : r.vlmModel).trim(),
+      vlm_max_tokens: intOr0(r.vlmMaxTokens),
+      vlm_upstream: String(r.vlmUpstream == null ? "" : r.vlmUpstream).trim()
     };
   }
 
@@ -849,31 +868,50 @@
   // from [upstream].anthropic_url / openai_url — is shown read-only: its fields
   // live in the file's [upstream] section, and the way to override it is to add a
   // profile of the same name, which the name field offers.
-  function profileRow(p) {
+  function profileRow(p, profiles) {
     var row = document.createElement("div");
-    row.className = "route-row profile-row" + (p.builtin ? " is-builtin" : "");
+    row.className = "profile-row" + (p.builtin ? " is-builtin" : "");
     row.dataset.builtin = p.builtin ? "1" : "";
+    var ro = p.builtin;
+    // Composed before the markup because it interpolates the global model, and a
+    // value spliced into a quoted attribute has to be escaped as a whole.
+    var vlmPlaceholder = "留空 = 用全局 " + (globalVLMModel || "（未设置）");
     row.innerHTML =
-      '<div><label>名字</label><input type="text" class="p-name"' +
-        (p.builtin ? " readonly" : "") + ' placeholder="小写字母/数字/-/_"></div>' +
-      '<div><label>协议</label><select class="p-protocol"' + (p.builtin ? " disabled" : "") + ">" +
-        '<option value="anthropic">anthropic</option>' +
-        '<option value="openai">openai</option>' +
-      "</select></div>" +
-      '<div><label>URL</label><input type="text" class="p-url"' + (p.builtin ? " readonly" : "") + "></div>" +
-      '<div><label>密钥环境变量</label><input type="text" class="p-key-env"' +
-        (p.builtin ? " readonly" : "") + ' placeholder="可选"></div>' +
-      '<div><label>密钥</label><input type="password" class="p-key" autocomplete="new-password"' +
-        (p.builtin ? " disabled" : "") + ' placeholder="留空则保持不变"></div>' +
-      '<div class="chk"><input type="checkbox" class="p-key-clear"' +
-        (p.builtin ? " disabled" : "") + '><label>清空密钥</label></div>' +
-      '<div><label>响应头超时</label><input type="number" class="p-header-timeout" min="0"' +
-        (p.builtin ? " disabled" : "") + "></div>" +
-      '<div><label>响应体静默</label><input type="number" class="p-body-idle" min="0"' +
-        (p.builtin ? " disabled" : "") + "></div>" +
-      '<div><label>重试次数</label><input type="number" class="p-max-retries" min="0"' +
-        (p.builtin ? " disabled" : "") + "></div>" +
-      '<div><button class="danger p-del"' + (p.builtin ? " disabled" : "") + ">删除</button></div>" +
+      '<div class="p-fields">' +
+        '<div><label>名字</label><input type="text" class="p-name"' +
+          (ro ? " readonly" : "") + ' placeholder="小写字母/数字/-/_"></div>' +
+        '<div><label>协议</label><select class="p-protocol"' + (ro ? " disabled" : "") + ">" +
+          '<option value="anthropic">anthropic</option>' +
+          '<option value="openai">openai</option>' +
+        "</select></div>" +
+        '<div><label>URL</label><input type="text" class="p-url"' + (ro ? " readonly" : "") + "></div>" +
+        '<div><label>密钥环境变量</label><input type="text" class="p-key-env"' +
+          (ro ? " readonly" : "") + ' placeholder="可选"></div>' +
+        '<div><label>密钥</label><input type="password" class="p-key" autocomplete="new-password"' +
+          (ro ? " disabled" : "") + ' placeholder="留空则保持不变"></div>' +
+        '<div class="chk"><input type="checkbox" class="p-key-clear"' +
+          (ro ? " disabled" : "") + '><label>清空密钥</label></div>' +
+        '<div><label title="等待上游响应头的最长时间，0 = 沿用全局">响应头超时</label>' +
+          '<input type="number" class="p-header-timeout" min="0"' + (ro ? " disabled" : "") + "></div>" +
+        '<div><label title="读取响应体允许的最长静默，0 = 沿用全局">响应体静默</label>' +
+          '<input type="number" class="p-body-idle" min="0"' + (ro ? " disabled" : "") + "></div>" +
+        '<div><label title="瞬态错误后的额外重试次数，0 = 沿用全局">重试次数</label>' +
+          '<input type="number" class="p-max-retries" min="0"' + (ro ? " disabled" : "") + "></div>" +
+        '<div><button class="danger p-del"' + (ro ? " disabled" : "") + ">删除</button></div>" +
+      "</div>" +
+      // The scheme's own describe pass. Kept on its own line because the first
+      // line already carries ten controls; mixing them in would make both sets
+      // unreadable. A builtin profile has no table of its own to put these in, so
+      // the block is omitted rather than shown inert.
+      (ro ? "" :
+      '<div class="p-vlm">' +
+        '<span class="p-vlm-label" title="该 profile 的图片描述设置；留空则沿用 [proxy] 的全局值">图片描述</span>' +
+        '<div><label>视觉模型</label><input type="text" class="p-vlm-model" placeholder="' + esc(vlmPlaceholder) + '"></div>' +
+        '<div><label title="每次图片描述调用的最大输出 token">最大 token</label>' +
+          '<input type="number" class="p-vlm-max-tokens" min="0" placeholder="留空 = 全局"></div>' +
+        '<div><label title="发图片描述请求用哪个 profile（必须 anthropic 协议）">描述走哪个 profile</label>' +
+          '<select class="p-vlm-upstream"></select></div>' +
+      "</div>") +
       '<div class="hint p-hint"></div>';
 
     row.querySelector(".p-name").value = p.name || "";
@@ -884,17 +922,40 @@
     row.querySelector(".p-body-idle").value = p.body_idle_seconds || 0;
     row.querySelector(".p-max-retries").value = p.max_retries || 0;
 
-    var hint = row.querySelector(".p-hint");
-    if (p.builtin) {
-      hint.textContent = "内置 profile：由 [upstream] 的地址合成。" +
-        "要改动它，请新增一个同名的上游 profile 覆盖。";
-    } else if (p.key_from_env) {
-      hint.textContent = "密钥来自环境变量 " + p.key_env + "（优先于此处填写的值）。";
-    } else if (p.key_set) {
-      hint.textContent = "已配置密钥（不回显明文）。";
-    } else {
-      hint.textContent = "未配置密钥。";
+    // The describe-pass block is absent on a builtin row, so these are resolved
+    // defensively rather than assumed.
+    var vlmModelEl = row.querySelector(".p-vlm-model");
+    var vlmMaxEl = row.querySelector(".p-vlm-max-tokens");
+    var vlmSel = row.querySelector(".p-vlm-upstream");
+    if (vlmModelEl) vlmModelEl.value = p.vlm_model || "";
+    if (vlmMaxEl) vlmMaxEl.value = p.vlm_max_tokens || 0;
+    if (vlmSel) {
+      // The serving-profile selector lists only anthropic profiles: the describe
+      // call speaks /v1/messages, so an openai profile here would be rejected on
+      // save. Empty means "the scheme serves its own calls".
+      fillSelect(vlmSel, proxySelectorOptions(profiles, "anthropic"));
+      vlmSel.value = p.vlm_upstream || "";
     }
+
+    var parts = [];
+    if (p.builtin) {
+      parts.push("内置 profile：由 [upstream] 的地址合成。要改动它，请新增一个同名的上游 profile 覆盖。");
+    } else if (p.key_from_env) {
+      parts.push("密钥来自环境变量 " + p.key_env + "（优先于此处填写的值）。");
+    } else if (p.key_set) {
+      parts.push("已配置密钥（不回显明文）。");
+    } else {
+      parts.push("未配置密钥。");
+    }
+    if (p.effective_vlm_model) {
+      parts.push(p.vlm_model
+        ? "图片描述使用本 profile 的模型 " + p.effective_vlm_model + "。"
+        : "图片描述沿用全局模型 " + p.effective_vlm_model + "。");
+    }
+    if (p.protocol === "openai" && p.vlm_model) {
+      parts.push("注意：openai 协议的 profile 无法承载图片描述调用，加载时会回落到 anthropic profile。");
+    }
+    row.querySelector(".p-hint").textContent = parts.join(" ");
 
     // A builtin row borrows its key state from the legacy [keys] section, which
     // the form edits separately, so its own key controls stay inert above.
@@ -934,6 +995,7 @@
 
   function renderConfig(cfg) {
     config = cfg;
+    globalVLMModel = cfg.proxy.vlm_model;
     document.getElementById("cfg-port").value = cfg.proxy.port;
     document.getElementById("cfg-vlm-model").value = cfg.proxy.vlm_model;
     document.getElementById("cfg-vlm-max-tokens").value = cfg.proxy.vlm_max_tokens;
@@ -960,7 +1022,7 @@
 
     var pHost = document.getElementById("profiles");
     pHost.innerHTML = "";
-    profiles.forEach(function (p) { pHost.appendChild(profileRow(p)); });
+    profiles.forEach(function (p) { pHost.appendChild(profileRow(p, profiles)); });
 
     // The three profile selectors offer only what can actually be used: the
     // default gateway takes any profile, while the VLM and chat selectors are
@@ -1092,7 +1154,66 @@
     }
   }
 
+  // ---- theme ----
+  //
+  // The page ships both palettes; CSS picks one from `prefers-color-scheme` and
+  // this toggle overrides it. The choice is remembered per browser so an operator
+  // who prefers one does not have to re-pick on every visit, and an explicit pick
+  // is written as data-theme="light"/"dark" so it outranks the media query.
+  var THEME_KEY = "llm-proxy-theme";
+
+  function storedTheme() {
+    try {
+      var v = window.localStorage.getItem(THEME_KEY);
+      return v === "light" || v === "dark" ? v : "";
+    } catch (err) {
+      // Private mode and some embedded webviews throw on localStorage access;
+      // a missing preference is not a reason to break the page.
+      return "";
+    }
+  }
+
+  function applyTheme(theme) {
+    var root = document.documentElement;
+    if (theme === "light" || theme === "dark") root.setAttribute("data-theme", theme);
+    else root.removeAttribute("data-theme");
+    var btn = document.getElementById("btn-theme");
+    if (btn) {
+      var dark = theme === "dark" ||
+        (!theme && window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+      btn.textContent = dark ? "☀" : "☾";
+      btn.title = dark ? "切换到浅色" : "切换到深色";
+    }
+  }
+
+  function currentTheme() {
+    var explicit = document.documentElement.getAttribute("data-theme");
+    if (explicit) return explicit;
+    if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) return "dark";
+    return "light";
+  }
+
+  function initTheme() {
+    applyTheme(storedTheme());
+    document.getElementById("btn-theme").addEventListener("click", function () {
+      var next = currentTheme() === "dark" ? "light" : "dark";
+      applyTheme(next);
+      try { window.localStorage.setItem(THEME_KEY, next); } catch (err) { /* preference is best-effort */ }
+      // The chart's colours come from CSS variables, but its geometry was measured
+      // against the previous layout, so redraw after the palette settles.
+      if (document.getElementById("history-chart")) renderHistory();
+    });
+    // Follow the OS when the operator has not picked a side.
+    if (window.matchMedia) {
+      var mq = window.matchMedia("(prefers-color-scheme: dark)");
+      var onChange = function () { if (!storedTheme()) { applyTheme(""); if (document.getElementById("history-chart")) renderHistory(); } };
+      if (mq.addEventListener) mq.addEventListener("change", onChange);
+      else if (mq.addListener) mq.addListener(onChange);
+    }
+  }
+
   function initAdmin() {
+  initTheme();
   document.getElementById("btn-refresh").addEventListener("click", refresh);
   document.getElementById("btn-auto").addEventListener("click", function () { setAuto(!autoTimer); });
   document.getElementById("btn-reset").addEventListener("click", async function () {
@@ -1112,7 +1233,7 @@
   // reports key_action "set" (or "clear"), which is exactly what the validator
   // needs for a name the running config does not carry a key for.
   document.getElementById("btn-add-profile").addEventListener("click", function () {
-    document.getElementById("profiles").appendChild(profileRow({ protocol: "anthropic" }));
+    document.getElementById("profiles").appendChild(profileRow({ protocol: "anthropic" }, config ? config.upstreams : []));
   });
   document.getElementById("btn-save").addEventListener("click", saveConfig);
   document.getElementById("btn-reload").addEventListener("click", function () {

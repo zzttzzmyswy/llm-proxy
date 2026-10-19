@@ -379,7 +379,30 @@ test("profilePayloadFromRow reads a blank key as keep", () => {
     header_timeout_seconds: 30,
     body_idle_seconds: 0,
     max_retries: 4,
+    // A blank scheme VLM means "inherit [proxy]"; it must reach the server as an
+    // absence, not as a frozen copy of the global value.
+    vlm_model: "",
+    vlm_max_tokens: 0,
+    vlm_upstream: "",
   });
+});
+
+// A scheme's own describe pass travels with the row. It is the whole point of
+// per-scheme VLMs, so the payload must carry it rather than dropping it.
+test("profilePayloadFromRow carries the scheme's VLM fields", () => {
+  const row = admin.profilePayloadFromRow({
+    name: "alpha",
+    protocol: "anthropic",
+    url: "https://alpha/api",
+    vlmModel: " alpha-vision ",
+    vlmMaxTokens: "1234",
+    vlmUpstream: " gamma ",
+  });
+  assert.equal(row.vlm_model, "alpha-vision");
+  assert.equal(row.vlm_max_tokens, 1234);
+  assert.equal(row.vlm_upstream, "gamma");
+  assert.equal(admin.profilePayloadFromRow({}).vlm_model, "");
+  assert.equal(admin.profilePayloadFromRow({}).vlm_upstream, "");
 });
 
 test("profilePayloadFromRow reads a typed key as set", () => {
