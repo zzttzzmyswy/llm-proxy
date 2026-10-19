@@ -326,3 +326,173 @@ func TestAdminSchemeVLMFieldsAreInTheJSONContract(t *testing.T) {
 		t.Fatalf("the view must report the effective model: %s", vb)
 	}
 }
+
+// A scheme's own model table has to survive a save that never mentions it. The
+// save rewrites every [upstreams.*] table from the payload, so a table the page
+// did not model would be silently dropped — and the aliases it served would stop
+// resolving, which is a routing change nobody asked for.
+func TestAdminSaveRoundTripsSchemeRoutingTables(t *testing.T) {
+	t.Setenv("SOPHNET_API_KEY", "")
+
+	path := configTOMLForTest(t, `
+[proxy]
+port = 8088
+vlm_model = "V"
+
+[admin]
+token = "s3cret"
+
+[upstreams.alpha]
+protocol = "anthropic"
+url = "https://alpha.example/api"
+key = "sk-a"
+
+[upstreams.alpha.routing]
+alpha-fast = { model = "alpha-fast-model" }
+alpha-vision = { model = "alpha-vl", supports_image = true }
+
+[routing]
+sonnet = { model = "m", upstream = "alpha" }
+`)
+
+	view := currentConfigView()
+	var alpha adminUpstreamProfileView
+	for _, p := range view.Upstreams {
+		if p.Name == "alpha" {
+			alpha = p
+		}
+	}
+	if len(alpha.Routing) != 2 {
+		t.Fatalf("the view must report the scheme's two routes, got %+v", alpha.Routing)
+	}
+
+	p := adminConfigPayload{
+		Proxy: view.Proxy, Upstream: view.Upstream,
+		Keys: adminKeysPayload{Action: "keep"}, Admin: adminAuthPayload{Action: "keep"},
+		Routing: view.Routing,
+		Upstreams: []adminUpstreamProfilePayload{{
+			Name: "alpha", Protocol: "anthropic", URL: "https://alpha.example/api",
+			KeyAction: "keep", Routing: alpha.Routing,
+		}},
+	}
+	w := postConfig(t, p, "s3cret")
+	if w.Code != http.StatusOK {
+		t.Fatalf("save must succeed: %d %s", w.Code, w.Body.String())
+	}
+
+	if got := snapshotConfig().routeTarget("alpha-fast"); got.Model != "alpha-fast-model" || got.Upstream != "alpha" {
+		t.Fatalf("the scheme route must survive the save, got %+v", got)
+	}
+	vis := snapshotConfig().routeTarget("alpha-vision")
+	if vis.Model != "alpha-vl" || !vis.SupportsImage {
+		t.Fatalf("the scheme route must keep supports_image, got %+v", vis)
+	}
+
+	// And the file itself must still carry the table, not only the live config.
+	var reloaded Config
+	if err := loadFromDiskInto(t, path, &reloaded); err != nil {
+		t.Fatalf("the saved file must parse: %v", err)
+	}
+	normalizeUpstreamProfiles(&reloaded)
+	if len(reloaded.Upstreams["alpha"].Routing) != 2 {
+		t.Fatalf("the saved file must keep both scheme routes, got %+v", reloaded.Upstreams["alpha"].Routing)
+	}
+}
+
+// An older page does not model a scheme's routing table at all. That absence must
+// read as "leave it alone", not as "delete every row".
+func TestAdminSaveWithoutSchemeRoutingKeepsTheTable(t *testing.T) {
+	t.Setenv("SOPHNET_API_KEY", "")
+
+	path := configTOMLForTest(t, `
+[proxy]
+port = 8088
+vlm_model = "V"
+
+[admin]
+token = "s3cret"
+
+[upstreams.alpha]
+protocol = "anthropic"
+url = "https://alpha.example/api"
+key = "sk-a"
+
+[upstreams.alpha.routing]
+alpha-fast = { model = "alpha-fast-model" }
+`)
+
+	// Build the payload the way an older page would: a profile with no Routing.
+	view := currentConfigView()
+	p := adminConfigPayload{
+		Proxy: view.Proxy, Upstream: view.Upstream,
+		Keys: adminKeysPayload{Action: "keep"}, Admin: adminAuthPayload{Action: "keep"},
+		Routing: view.Routing,
+		Upstreams: []adminUpstreamProfilePayload{{
+			Name: "alpha", Protocol: "anthropic", URL: "https://alpha.example/api", KeyAction: "keep",
+		}},
+	}
+	w := postConfig(t, p, "s3cret")
+	if w.Code != http.StatusOK {
+		t.Fatalf("save must succeed: %d %s", w.Code, w.Body.String())
+	}
+
+	if got := snapshotConfig().routeTarget("alpha-fast"); got.Model != "alpha-fast-model" {
+		t.Fatalf("an unmodelled table must be carried over, got %+v", got)
+	}
+	var reloaded Config
+	if err := loadFromDiskInto(t, path, &reloaded); err != nil {
+		t.Fatal(err)
+	}
+	normalizeUpstreamProfiles(&reloaded)
+	if len(reloaded.Upstreams["alpha"].Routing) != 1 {
+		t.Fatalf("the file must keep the route, got %+v", reloaded.Upstreams["alpha"].Routing)
+	}
+}
+
+// An empty (non-nil) list is the operator having deleted every row, which must
+// take effect. This is the other side of the nil distinction above.
+func TestAdminSaveWithEmptySchemeRoutingClearsTheTable(t *testing.T) {
+	t.Setenv("SOPHNET_API_KEY", "")
+
+	path := configTOMLForTest(t, `
+[proxy]
+port = 8088
+vlm_model = "V"
+
+[admin]
+token = "s3cret"
+
+[upstreams.alpha]
+protocol = "anthropic"
+url = "https://alpha.example/api"
+key = "sk-a"
+
+[upstreams.alpha.routing]
+alpha-fast = { model = "alpha-fast-model" }
+`)
+
+	view := currentConfigView()
+	p := adminConfigPayload{
+		Proxy: view.Proxy, Upstream: view.Upstream,
+		Keys: adminKeysPayload{Action: "keep"}, Admin: adminAuthPayload{Action: "keep"},
+		Routing: view.Routing,
+		Upstreams: []adminUpstreamProfilePayload{{
+			Name: "alpha", Protocol: "anthropic", URL: "https://alpha.example/api",
+			KeyAction: "keep", Routing: []adminRoutingEntry{},
+		}},
+	}
+	w := postConfig(t, p, "s3cret")
+	if w.Code != http.StatusOK {
+		t.Fatalf("save must succeed: %d %s", w.Code, w.Body.String())
+	}
+	if got := snapshotConfig().routeTarget("alpha-fast"); got.Model != "" {
+		t.Fatalf("the deleted route must be gone, got %+v", got)
+	}
+	var reloaded Config
+	if err := loadFromDiskInto(t, path, &reloaded); err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Upstreams["alpha"].Routing) != 0 {
+		t.Fatalf("the file must not keep the deleted route, got %+v", reloaded.Upstreams["alpha"].Routing)
+	}
+}

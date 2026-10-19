@@ -151,7 +151,11 @@ type adminUpstreamProfileView struct {
 	// the [proxy] fallback. The page shows it so an operator who did not set one
 	// can still see what will be used.
 	EffectiveVLMModel string `json:"effective_vlm_model"`
-	Builtin           bool   `json:"builtin"`
+	// Routing is this scheme's own model table ([upstreams.<name>.routing]).
+	// Upstream is always empty here: an entry belongs to the profile that
+	// declares it, so there is nothing to choose.
+	Routing []adminRoutingEntry `json:"routing"`
+	Builtin bool                `json:"builtin"`
 }
 
 type adminKeysView struct {
@@ -239,6 +243,12 @@ type adminUpstreamProfilePayload struct {
 	VLMModel     string `json:"vlm_model"`
 	VLMMaxTokens int    `json:"vlm_max_tokens"`
 	VLMUpstream  string `json:"vlm_upstream"`
+	// Routing is this scheme's own model table, submitted whole like the profile
+	// itself. A nil slice means "not modelled by this client" and the running
+	// config's table is carried over; an empty non-nil slice means the operator
+	// deleted every row. Without this the save would rewrite each [upstreams.*]
+	// table from the payload alone and silently drop the table it never sent.
+	Routing []adminRoutingEntry `json:"routing"`
 }
 
 type adminConfigPayload struct {
@@ -412,6 +422,25 @@ func adminProfileView(name string, p UpstreamProfile, builtin bool, c Config) ad
 	v.EffectiveVLMModel = p.VLMModel
 	if v.EffectiveVLMModel == "" {
 		v.EffectiveVLMModel = c.Proxy.VLMModel
+	}
+	// The scheme's own model table, reported as declared so the page can edit it
+	// without losing the rows it does not show.
+	if len(p.Routing) > 0 {
+		entries := buildRouteTargets(p.Routing)
+		aliases := make([]string, 0, len(entries))
+		for alias := range entries {
+			aliases = append(aliases, alias)
+		}
+		sort.Strings(aliases)
+		v.Routing = make([]adminRoutingEntry, 0, len(aliases))
+		for _, alias := range aliases {
+			e := entries[alias]
+			v.Routing = append(v.Routing, adminRoutingEntry{
+				Alias:         alias,
+				Model:         e.Model,
+				SupportsImage: e.SupportsImage,
+			})
+		}
 	}
 	return v
 }
@@ -829,6 +858,21 @@ func resolveProfiles(submitted []adminUpstreamProfilePayload, old map[string]Ups
 			VLMMaxTokens:         item.VLMMaxTokens,
 			VLMUpstream:          normalizeUpstreamName(item.VLMUpstream),
 		}
+		// The scheme's own model table. A nil slice means the client does not model
+		// it (an older page), so the running config's table is carried over rather
+		// than read as a deletion; an empty non-nil slice is the operator having
+		// removed every row.
+		prof := out[name]
+		if item.Routing != nil {
+			table, err := encodeSchemeRouting(name, item.Routing)
+			if err != nil {
+				return nil, err
+			}
+			prof.Routing = table
+		} else {
+			prof.Routing = old[name].Routing
+		}
+		out[name] = prof
 	}
 	// A scheme's vlm_upstream may name any profile in this same submission, so
 	// the reference can only be resolved once every entry has been read.
@@ -849,7 +893,65 @@ func resolveProfiles(submitted []adminUpstreamProfilePayload, old map[string]Ups
 	return out, nil
 }
 
-// rejectRemovedProfiles refuses a save that drops a profile something still
+// encodeSchemeRouting turns a scheme's submitted model rows into the TOML values
+// its table holds. The table is scoped to one profile, so an entry's upstream is
+// never written — mergeSchemeRoutes rejects one that names a different profile.
+//
+// Every row is validated here, at the one point where the operator can still fix
+// it: an empty alias or model would be skipped by the loader with a warning,
+// which is a silent no-op from the page's point of view.
+func encodeSchemeRouting(profile string, entries []adminRoutingEntry) (map[string]toml.Primitive, error) {
+	if len(entries) == 0 {
+		// A non-nil empty map, not nil: the caller uses nil to mean "the client
+		// did not model this table", and an operator who deleted every row means
+		// the opposite.
+		return map[string]toml.Primitive{}, nil
+	}
+
+	// Render the rows as a small TOML document and let the parser produce the
+	// primitives. Building them by hand means reimplementing toml's value model;
+	// this reuses exactly the syntax the config file itself uses.
+	var b strings.Builder
+	for _, e := range entries {
+		alias := strings.TrimSpace(e.Alias)
+		model := strings.TrimSpace(e.Model)
+		if alias == "" {
+			return nil, fmt.Errorf("上游 profile %q 的路由别名不能为空", profile)
+		}
+		if model == "" {
+			return nil, fmt.Errorf("上游 profile %q 的路由 %q 的模型名不能为空", profile, alias)
+		}
+		if hasControlChars(alias) || hasControlChars(model) {
+			return nil, fmt.Errorf("上游 profile %q 的路由 %q 含非法控制字符", profile, alias)
+		}
+		if e.Upstream != "" && normalizeUpstreamName(e.Upstream) != normalizeUpstreamName(profile) {
+			return nil, fmt.Errorf("上游 profile %q 的路由 %q 不能指向别的 profile（方案的路由表只属于自己）", profile, alias)
+		}
+		key := tomlKey(alias)
+		if e.SupportsImage {
+			fmt.Fprintf(&b, "%s = { model = %s, supports_image = true }\n", key, tomlString(model))
+		} else {
+			fmt.Fprintf(&b, "%s = %s\n", key, tomlString(model))
+		}
+	}
+
+	var table map[string]toml.Primitive
+	if _, err := toml.Decode(b.String(), &table); err != nil {
+		return nil, fmt.Errorf("上游 profile %q 的路由表无法生成: %v", profile, err)
+	}
+	// Decoding collapses duplicate keys, so check for them before the round trip
+	// rather than after: a duplicate is a mistake the operator has to see.
+	seen := map[string]bool{}
+	for _, e := range entries {
+		alias := strings.TrimSpace(e.Alias)
+		if seen[alias] {
+			return nil, fmt.Errorf("上游 profile %q 的路由别名 %q 重复", profile, alias)
+		}
+		seen[alias] = true
+	}
+	return table, nil
+}
+
 // points at, naming each referrer. The config load tolerates a route to a missing
 // profile by skipping it, but a save happens while the operator is looking at the
 // page, so this is the moment to tell them what has to change first.

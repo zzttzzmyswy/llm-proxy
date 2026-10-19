@@ -384,6 +384,9 @@ test("profilePayloadFromRow reads a blank key as keep", () => {
     vlm_model: "",
     vlm_max_tokens: 0,
     vlm_upstream: "",
+    // The page always models the scheme's own model table, so an untouched row
+    // submits an empty list rather than omitting the field.
+    routing: [],
   });
 });
 
@@ -446,4 +449,19 @@ test("routePayloadFromRow trims and keeps a filled row", () => {
     { alias: "sonnet", model: "deepseek-chat", upstream: "deepseek", supports_image: true },
   );
   assert.equal(admin.routePayloadFromRow({ alias: "x", model: "y" }).supports_image, false);
+});
+
+// A scheme's own model rows are read from the card and submitted without an
+// upstream: the entry belongs to the profile that declares it, so offering a
+// choice there would let the page build a table the loader rejects.
+test("schemeRoutePayload never carries an upstream", () => {
+  assert.deepEqual(admin.schemeRoutePayload(" alpha-fast ", " alpha-model ", false), {
+    alias: "alpha-fast",
+    model: "alpha-model",
+    upstream: "",
+    supports_image: false,
+  });
+  assert.equal(admin.schemeRoutePayload("v", "m", true).supports_image, true);
+  // An entirely blank row is a line the operator left behind.
+  assert.equal(admin.schemeRoutePayload("  ", "  ", false), null);
 });

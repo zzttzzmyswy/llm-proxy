@@ -779,8 +779,26 @@
       maxRetries: row.querySelector(".p-max-retries").value,
       vlmModel: readValue(row, ".p-vlm-model", ""),
       vlmMaxTokens: readValue(row, ".p-vlm-max-tokens", ""),
-      vlmUpstream: readValue(row, ".p-vlm-upstream", "")
+      vlmUpstream: readValue(row, ".p-vlm-upstream", ""),
+      routing: readSchemeRoutes(row)
     };
+  }
+
+  // readSchemeRoutes collects a profile row's own model table. The rows live in a
+  // sub-list inside the card, so the caller gets a plain array either way.
+  function readSchemeRoutes(row) {
+    var out = [];
+    var host = row.querySelector(".p-routes");
+    if (!host) return out;
+    host.querySelectorAll(".p-route-row").forEach(function (r) {
+      var entry = schemeRoutePayload(
+        r.querySelector(".pr-alias").value,
+        r.querySelector(".pr-model").value,
+        r.querySelector(".pr-image").checked
+      );
+      if (entry) out.push(entry);
+    });
+    return out;
   }
 
   function intOr0(v) { return parseInt(v, 10) || 0; }
@@ -803,8 +821,21 @@
       // server keeps as an absence rather than freezing the inherited value.
       vlm_model: String(r.vlmModel == null ? "" : r.vlmModel).trim(),
       vlm_max_tokens: intOr0(r.vlmMaxTokens),
-      vlm_upstream: String(r.vlmUpstream == null ? "" : r.vlmUpstream).trim()
+      vlm_upstream: String(r.vlmUpstream == null ? "" : r.vlmUpstream).trim(),
+      // The scheme's own model table, submitted whole. An absent list means the
+      // caller does not model it, so the server carries the stored one over; this
+      // page always sends the list, so deleting every row really deletes them.
+      routing: r.routing || []
     };
+  }
+
+  // schemeRoutePayload reads one row of a scheme's own model table. Upstream is
+  // never sent: an entry belongs to the profile that declares it.
+  function schemeRoutePayload(alias, model, supportsImage) {
+    var a = String(alias == null ? "" : alias).trim();
+    var m = String(model == null ? "" : model).trim();
+    if (!a && !m) return null;
+    return { alias: a, model: m, upstream: "", supports_image: !!supportsImage };
   }
 
   // routePayloadFromRow is the same idea for a routing row. A row with neither an
@@ -912,6 +943,17 @@
         '<div><label title="发图片描述请求用哪个 profile（必须 anthropic 协议）">描述走哪个 profile</label>' +
           '<select class="p-vlm-upstream"></select></div>' +
       "</div>") +
+      // This scheme's own model table. Aliases here route to this profile only,
+      // so there is no upstream column to choose.
+      (ro ? "" :
+      '<div class="p-routes-wrap">' +
+        '<div class="p-routes-head">' +
+          '<span class="p-vlm-label">本方案的模型表</span>' +
+          '<span class="hint">这些别名只路由到本 profile；与全局 [routing] 同名时全局优先。</span>' +
+          '<button type="button" class="p-route-add">添加别名</button>' +
+        "</div>" +
+        '<div class="p-routes"></div>' +
+      "</div>") +
       '<div class="hint p-hint"></div>';
 
     row.querySelector(".p-name").value = p.name || "";
@@ -957,9 +999,38 @@
     }
     row.querySelector(".p-hint").textContent = parts.join(" ");
 
+    // Fill in this scheme's own model table.
+    var routeHost = row.querySelector(".p-routes");
+    if (routeHost) {
+      (p.routing || []).forEach(function (e) { routeHost.appendChild(schemeRouteRow(e)); });
+      var addBtn = row.querySelector(".p-route-add");
+      if (addBtn) {
+        addBtn.addEventListener("click", function () {
+          routeHost.appendChild(schemeRouteRow({}));
+        });
+      }
+    }
+
     // A builtin row borrows its key state from the legacy [keys] section, which
     // the form edits separately, so its own key controls stay inert above.
     row.querySelector(".p-del").addEventListener("click", function () { row.remove(); });
+    return row;
+  }
+
+  // schemeRouteRow renders one alias of a scheme's own model table. There is no
+  // upstream column: the entry belongs to the profile that declares it.
+  function schemeRouteRow(entry) {
+    var row = document.createElement("div");
+    row.className = "p-route-row";
+    row.innerHTML =
+      '<div><label>别名</label><input type="text" class="pr-alias" placeholder="Claude Code 用的模型名"></div>' +
+      '<div><label>上游模型名</label><input type="text" class="pr-model"></div>' +
+      '<div class="chk"><input type="checkbox" class="pr-image"><label>supports_image</label></div>' +
+      '<div><button type="button" class="danger pr-del">删除</button></div>';
+    row.querySelector(".pr-alias").value = entry.alias || "";
+    row.querySelector(".pr-model").value = entry.model || "";
+    row.querySelector(".pr-image").checked = !!entry.supports_image;
+    row.querySelector(".pr-del").addEventListener("click", function () { row.remove(); });
     return row;
   }
 
@@ -1308,6 +1379,7 @@
       proxySelectorOptions: proxySelectorOptions,
       profileOptions: profileOptions,
       profilePayloadFromRow: profilePayloadFromRow,
+      schemeRoutePayload: schemeRoutePayload,
       routePayloadFromRow: routePayloadFromRow
     };
     return;

@@ -883,8 +883,16 @@ func TestAdminProfilePayloadJSONRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(body, &back); err != nil {
 		t.Fatal(err)
 	}
-	if len(back.Upstreams) != 1 || back.Upstreams[0] != p.Upstreams[0] {
+	// The struct now carries a slice (the scheme's own model table), so it is no
+	// longer comparable with ==; compare the scalar fields explicitly.
+	if len(back.Upstreams) != 1 {
 		t.Fatalf("the profile payload must survive JSON: %+v", back.Upstreams)
+	}
+	got, want := back.Upstreams[0], p.Upstreams[0]
+	if got.Name != want.Name || got.Protocol != want.Protocol || got.URL != want.URL ||
+		got.KeyAction != want.KeyAction || got.KeyEnv != want.KeyEnv ||
+		got.HeaderTimeoutSeconds != want.HeaderTimeoutSeconds {
+		t.Fatalf("the profile payload must survive JSON: got %+v, want %+v", got, want)
 	}
 	if !strings.Contains(string(body), `"key_action":"keep"`) {
 		t.Fatalf("the key action must be on the wire: %s", body)

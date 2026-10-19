@@ -179,6 +179,22 @@
     align-self: end; padding-bottom: 8px;
   }
   .profile-row .p-hint { margin-top: 8px; }
+  /* A scheme's own model table: a compact list inside the profile card. */
+  .profile-row .p-routes-wrap {
+    margin-top: 10px; padding: 10px 12px; border: 1px dashed var(--border); border-radius: 8px;
+    background: var(--panel-sunken);
+  }
+  .profile-row .p-routes-head {
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 6px;
+  }
+  .profile-row .p-routes-head .p-vlm-label { padding-bottom: 0; }
+  .profile-row .p-routes-head .hint { margin: 0; flex: 1; }
+  .profile-row .p-route-row {
+    display: grid; grid-template-columns: 1.2fr 1.6fr auto auto;
+    gap: 10px; align-items: end; padding: 6px 0;
+  }
+  .profile-row .p-route-row + .p-route-row { border-top: 1px solid var(--border); }
+  .profile-row .p-routes .empty { padding: 8px 0; text-align: left; font-size: 12px; }
   .profile-list-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; padding: 0 16px 8px; }
   .chk { display: flex; align-items: center; gap: 6px; padding-bottom: 8px; font-size: 13px; }
   .chk label { margin: 0; color: var(--text); }
