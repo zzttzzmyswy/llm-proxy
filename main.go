@@ -69,6 +69,11 @@ type ProxyConfig struct {
 // entry can reference by name. Protocol picks how a request is framed for it
 // (anthropic /v1/messages, or OpenAI chat-completions with translation), and the
 // three timeout/retry fields override the [upstream] globals when set.
+//
+// A profile is a complete scheme rather than just an address: it may carry its
+// own VLM (model, token cap and the profile that serves the describe calls) and
+// its own model mapping table, so adding a second upstream does not mean editing
+// the global [proxy] and [routing] sections.
 type UpstreamProfile struct {
 	// Protocol is "anthropic" or "openai" and is required: exactly one framing
 	// per profile, so a profile never guesses how to talk to its upstream.
@@ -86,6 +91,25 @@ type UpstreamProfile struct {
 	HeaderTimeoutSeconds int `toml:"header_timeout_seconds"`
 	BodyIdleSeconds      int `toml:"body_idle_seconds"`
 	MaxRetries           int `toml:"max_retries"`
+	// VLMModel names the vision model images are described with when a request is
+	// routed to this profile. Empty means "use [proxy].vlm_model", which is what
+	// every config without this field keeps doing. Setting it makes the scheme
+	// self-contained: the VLM, its token cap and the profile serving it all come
+	// from here.
+	VLMModel string `toml:"vlm_model"`
+	// VLMMaxTokens caps each describe call's output. Zero means "inherit
+	// [proxy].vlm_max_tokens".
+	VLMMaxTokens int `toml:"vlm_max_tokens"`
+	// VLMUpstream names the profile the describe calls go through. Empty means
+	// "the profile that declares vlm_model" — i.e. this scheme's own upstream,
+	// whatever protocol it speaks. Naming another profile is how a scheme keeps
+	// its images on a dedicated vision gateway.
+	VLMUpstream string `toml:"vlm_upstream"`
+	// Routing is this scheme's own model mapping table: [upstreams.<name>.routing].
+	// Aliases served by this profile are looked up here first, so a scheme can
+	// name its own models without the global [routing] table knowing them. An
+	// entry may not name another profile — the table is scoped to its profile.
+	Routing map[string]toml.Primitive `toml:"routing"`
 }
 
 // Upstream is one resolved profile: everything needed to send a request to a
@@ -100,6 +124,20 @@ type Upstream struct {
 	HeaderTimeout time.Duration
 	BodyIdle      time.Duration
 	MaxRetries    int
+	// VLMModel is the vision model this scheme describes images with, with the
+	// [proxy] global already folded in. Empty disables the describe pass, exactly
+	// as an empty [proxy].vlm_model always has.
+	VLMModel     string
+	VLMMaxTokens int
+	// VLMUpstream names the profile the describe calls go through. Empty means
+	// this profile itself.
+	VLMUpstream string
+	// OwnVLM is true when the profile declares any VLM field of its own, which
+	// makes this scheme the authority on its describe pass. A profile that
+	// declares none keeps inheriting the global [proxy] trio exactly as it did
+	// before per-scheme VLMs existed — including the global vlm_upstream, which is
+	// a different profile from this one for many deployments.
+	OwnVLM bool
 }
 
 const (
@@ -116,6 +154,10 @@ const (
 const (
 	profileNameAnthropic = "anthropic"
 	profileNameOpenAI    = "openai"
+	// profileNameClaudeAlias is the long-standing spelling of the anthropic
+	// gateway. It is not a profile of its own — profileByName folds it into
+	// profileNameAnthropic — so a [upstreams.claude] table would be unreachable.
+	profileNameClaudeAlias = "claude"
 	// legacyKeyEnv supplies the implicit profiles' key, matching the one key the
 	// proxy used before profiles existed.
 	legacyKeyEnv = "SOPHNET_API_KEY"
@@ -217,6 +259,13 @@ type reqConfig struct {
 	// once routing has picked the profile (see forUpstream); the URL, key,
 	// timeout and retry helpers below then read that one profile.
 	up Upstream
+	// vlmModel / vlmMaxTokens are the describe pass's model and output cap, taken
+	// from the routed scheme (see vlmConfig). They live on the request rather than
+	// being read from the config at each step so a describe call cannot pick up
+	// one scheme's model and another's cap after a mid-request config save.
+	vlmModel     string
+	vlmModelSet  bool
+	vlmMaxTokens int
 }
 
 // snapshotConfig captures the running config and its routing table under a single
@@ -250,16 +299,49 @@ func (rc reqConfig) profile(name string) (Upstream, bool) {
 }
 
 // vlmConfig binds rc to the profile the builtin image-description calls go
-// through: [proxy] vlm_upstream, or the implicit "anthropic" profile when unset.
-// validateProfileSelectors has already folded an unusable selector to "", so a
-// lookup cannot fail here; if one somehow did, the implicit profile is the same
-// fallback the load-time check chose.
-func (rc reqConfig) vlmConfig() reqConfig {
-	up, ok := rc.profile(rc.cfg.Proxy.VLMUpstream)
+// through, and records the vision model and token cap the describe pass uses.
+//
+// The scheme a request is routed to decides both: an upstream that declares its
+// own vlm_model keeps its images on its own vision model, which is what makes a
+// multi-scheme config self-contained. A scheme that declares no VLM field
+// inherits the global [proxy] trio, so every config written before schemes
+// existed behaves exactly as it did.
+//
+// The describe call always speaks the anthropic framing (/v1/messages), so the
+// serving profile has to be an anthropic one. A scheme that sets vlm_model but
+// serves it from an openai-protocol profile therefore falls back to the global
+// vlm_upstream and is reported at load (validateProfileSelectors), rather than
+// having its describe calls sent to a gateway that cannot answer them.
+func (rc reqConfig) vlmConfig(target Upstream) reqConfig {
+	model, maxTokens := target.VLMModel, target.VLMMaxTokens
+	if model == "" {
+		model, maxTokens = rc.cfg.Proxy.VLMModel, rc.cfg.Proxy.VLMMaxTokens
+	}
+
+	// Who serves the describe call. Three cases, in order:
+	//   1. the scheme named a serving profile — that is the answer;
+	//   2. the scheme declared its own vlm_model but named no profile — it serves
+	//      its own describe calls, provided it speaks the anthropic framing;
+	//   3. the scheme declared no VLM of its own — the global [proxy] selector
+	//      decides, exactly as it did before per-scheme VLMs existed.
+	serving := target.VLMUpstream
+	if normalizeUpstreamName(serving) == "" {
+		if target.OwnVLM && target.VLMModel != "" && target.Protocol == protocolAnthropic {
+			serving = target.Name
+		} else {
+			serving = rc.cfg.Proxy.VLMUpstream
+		}
+	}
+	up, ok := rc.profile(serving)
 	if !ok || up.Protocol != protocolAnthropic {
 		up, _ = rc.profile(profileNameAnthropic)
 	}
-	return rc.forUpstream(up)
+
+	rc = rc.forUpstream(up)
+	rc.vlmModel = model
+	rc.vlmModelSet = true
+	rc.vlmMaxTokens = maxTokens
+	return rc
 }
 
 // chatConfig binds rc to the profile the /v1/chat/completions passthrough
@@ -275,6 +357,25 @@ func (rc reqConfig) chatConfig() reqConfig {
 		up, _ = rc.profile(profileNameOpenAI)
 	}
 	return rc.forUpstream(up)
+}
+
+// visionModel is the model the describe pass sends images to: the routed
+// scheme's own vlm_model when it declared one, otherwise the [proxy] global.
+// vlmConfig has already folded those together; the config fallback keeps a
+// reqConfig that never went through it answering the same as before.
+func (rc reqConfig) visionModel() string {
+	if rc.vlmModelSet {
+		return rc.vlmModel
+	}
+	return rc.cfg.Proxy.VLMModel
+}
+
+// visionMaxTokens is the describe call's output cap, resolved the same way.
+func (rc reqConfig) visionMaxTokens() int {
+	if rc.vlmMaxTokens > 0 {
+		return rc.vlmMaxTokens
+	}
+	return rc.cfg.Proxy.VLMMaxTokens
 }
 
 // apiKey returns the key of the bound profile. An unbound reqConfig falls back
@@ -484,6 +585,12 @@ func parseConfig() (Config, map[string]RouteEntry, map[string]RouteEntry, error)
 	for alias, e := range declared {
 		routes[alias] = e
 	}
+	// A scheme's own [upstreams.<name>.routing] table fills in the aliases the
+	// global [routing] table does not declare. The global table wins a conflict:
+	// adding a scheme must never silently reroute an alias the operator already
+	// pointed somewhere, and a conflict is almost certainly a mistake worth
+	// reporting.
+	mergeSchemeRoutes(&c, routes, declared)
 	// Drop entries naming an undefined profile before the builtin fallbacks are
 	// applied, so a dropped builtin alias (sonnet/opus/haiku) still gets its
 	// builtin default target instead of disappearing entirely.
@@ -526,6 +633,15 @@ func normalizeUpstreamProfiles(c *Config) {
 		}
 		if !validProfileName(name) {
 			log.Printf("config: upstream profile %q may only contain a-z, 0-9, '-' and '_', skipped\n", name)
+			continue
+		}
+		// "claude" is the long-standing alias for the anthropic profile, so
+		// profileByName folds it there and a table under that name would never be
+		// reachable — it would silently lose its URL and key. Rejecting it is
+		// better than accepting a profile that cannot be used.
+		if name == profileNameClaudeAlias {
+			log.Printf("config: upstream profile %q is reserved (it is the alias for %q), skipped\n",
+				name, profileNameAnthropic)
 			continue
 		}
 		// A duplicated name differs only by case, so the fold above collides them.
@@ -593,7 +709,7 @@ func validateProfileURL(raw string) error {
 // profile and "claude" its long-standing alias.
 func (c Config) profileByName(name string) (Upstream, bool) {
 	switch normalizeUpstreamName(name) {
-	case "", "claude", profileNameAnthropic:
+	case "", profileNameClaudeAlias, profileNameAnthropic:
 		// An explicit [upstreams.anthropic] replaces the implicit profile built
 		// from [upstream].anthropic_url, so a config can move the default gateway
 		// without a second name for it.
@@ -623,6 +739,11 @@ func (c Config) profileByName(name string) (Upstream, bool) {
 // resolvedProfile folds the [upstream] globals into a declared profile: an
 // unset per-profile timeout/retry inherits the global, and the key falls back to
 // the legacy key resolution when the profile declares none.
+//
+// The VLM fields inherit the same way: a profile that names no vlm_model uses
+// [proxy].vlm_model, so a config written before schemes existed behaves exactly
+// as it did. A profile that does name one owns its whole describe pass — model,
+// token cap and serving profile — which is what makes a scheme self-contained.
 func (c Config) resolvedProfile(name string, p UpstreamProfile) Upstream {
 	up := Upstream{
 		Name:          name,
@@ -631,6 +752,10 @@ func (c Config) resolvedProfile(name string, p UpstreamProfile) Upstream {
 		HeaderTimeout: c.headerTimeout(),
 		BodyIdle:      c.bodyIdle(),
 		MaxRetries:    c.maxRetries(),
+		VLMModel:      c.Proxy.VLMModel,
+		VLMMaxTokens:  c.Proxy.VLMMaxTokens,
+		VLMUpstream:   normalizeUpstreamName(c.Proxy.VLMUpstream),
+		OwnVLM:        p.VLMModel != "" || p.VLMMaxTokens != 0 || p.VLMUpstream != "",
 	}
 	if p.HeaderTimeoutSeconds > 0 {
 		up.HeaderTimeout = time.Duration(p.HeaderTimeoutSeconds) * time.Second
@@ -640,6 +765,15 @@ func (c Config) resolvedProfile(name string, p UpstreamProfile) Upstream {
 	}
 	if p.MaxRetries > 0 {
 		up.MaxRetries = p.MaxRetries
+	}
+	if p.VLMModel != "" {
+		up.VLMModel = p.VLMModel
+	}
+	if p.VLMMaxTokens > 0 {
+		up.VLMMaxTokens = p.VLMMaxTokens
+	}
+	if p.VLMUpstream != "" {
+		up.VLMUpstream = normalizeUpstreamName(p.VLMUpstream)
 	}
 	up.Key = c.profileKey(p, name == profileNameAnthropic || name == profileNameOpenAI)
 	return up
@@ -749,7 +883,7 @@ func applyDefaults(c *Config) {
 // wrote and the admin form's "inherited, not declared" reading intact.
 func applyDefaultUpstream(c *Config, routes map[string]RouteEntry) {
 	def := normalizeUpstreamName(c.Upstream.DefaultUpstream)
-	if def == "" || def == "claude" {
+	if def == "" || def == profileNameClaudeAlias {
 		def = profileNameAnthropic
 	}
 	if def == profileNameAnthropic {
@@ -786,22 +920,17 @@ func dropUnknownProfileRoutes(c *Config, routes map[string]RouteEntry) {
 	}
 }
 
-// validateProfileSelectors checks the two [proxy] profile selectors at load, so a
-// typo is reported once at startup instead of on every request that happens to
-// need the VLM or the chat passthrough. An unusable selector falls back to the
-// profile the pre-profile proxy used, keeping the request served.
+// validateProfileSelectors checks the profile selectors at load, so a typo is
+// reported once at startup instead of on every request that happens to need the
+// VLM or the chat passthrough. An unusable selector falls back to the profile the
+// pre-profile proxy used, keeping the request served.
+//
+// The per-scheme selectors ([upstreams.<name>] vlm_upstream) are checked here
+// too: a scheme that points its describe calls at an openai-protocol profile gets
+// a warning at load rather than a silently misrouted request later.
 func validateProfileSelectors(c *Config) {
-	if name := normalizeUpstreamName(c.Proxy.VLMUpstream); name != "" {
-		up, ok := c.profileByName(name)
-		switch {
-		case !ok:
-			log.Printf("config: proxy.vlm_upstream %q is not a defined upstream profile, falling back to %q\n",
-				c.Proxy.VLMUpstream, profileNameAnthropic)
-		case up.Protocol != protocolAnthropic:
-			log.Printf("config: proxy.vlm_upstream %q has protocol %q, but the VLM describe calls speak %q, falling back to %q\n",
-				name, up.Protocol, protocolAnthropic, profileNameAnthropic)
-		}
-	}
+	checkVLMServingProfile(c, "proxy.vlm_upstream", c.Proxy.VLMUpstream)
+
 	if name := normalizeUpstreamName(c.Proxy.ChatUpstream); name != "" {
 		up, ok := c.profileByName(name)
 		switch {
@@ -812,6 +941,46 @@ func validateProfileSelectors(c *Config) {
 			log.Printf("config: proxy.chat_upstream %q has protocol %q, but the chat passthrough speaks %q, falling back to %q\n",
 				name, up.Protocol, protocolOpenAI, profileNameOpenAI)
 		}
+	}
+
+	names := make([]string, 0, len(c.Upstreams))
+	for name := range c.Upstreams {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		p := c.Upstreams[name]
+		if p.VLMUpstream == "" {
+			// A scheme that named its own vlm_model but no serving profile uses
+			// itself, which only works when it speaks the anthropic framing the
+			// describe call needs. Saying so at load beats discovering it per image.
+			if p.VLMModel != "" && p.Protocol != protocolAnthropic {
+				log.Printf("config: [upstreams.%s] declares vlm_model but speaks %q; its describe calls need an anthropic profile, falling back to %q\n",
+					name, p.Protocol, profileNameAnthropic)
+			}
+			continue
+		}
+		checkVLMServingProfile(c, "[upstreams."+name+"] vlm_upstream", p.VLMUpstream)
+	}
+}
+
+// checkVLMServingProfile reports whether the profile a describe-call selector
+// names can actually serve one: it has to exist and speak the anthropic framing.
+// field names the config key in the message, so a scheme's selector and the
+// global one each point at the line the operator has to fix.
+func checkVLMServingProfile(c *Config, field, value string) {
+	name := normalizeUpstreamName(value)
+	if name == "" {
+		return
+	}
+	up, ok := c.profileByName(name)
+	switch {
+	case !ok:
+		log.Printf("config: %s %q is not a defined upstream profile, falling back to %q\n",
+			field, value, profileNameAnthropic)
+	case up.Protocol != protocolAnthropic:
+		log.Printf("config: %s %q has protocol %q, but the VLM describe calls speak %q, falling back to %q\n",
+			field, name, up.Protocol, protocolAnthropic, profileNameAnthropic)
 	}
 }
 
@@ -837,6 +1006,69 @@ func buildRouteTargets(routing map[string]toml.Primitive) map[string]RouteEntry 
 func ensureRoute(routes map[string]RouteEntry, alias, defaultModel string) {
 	if _, ok := routes[alias]; !ok {
 		routes[alias] = RouteEntry{Model: defaultModel}
+	}
+}
+
+// mergeSchemeRoutes folds every [upstreams.<name>.routing] table into the global
+// routing table, so a scheme carries its own model mapping rather than requiring
+// the operator to edit the global [routing] section for each upstream they add.
+//
+// Two rules keep the merge predictable:
+//
+//   - The global [routing] table always wins. A scheme cannot silently reroute an
+//     alias the operator already declared, because adding an upstream must never
+//     change where existing traffic goes.
+//   - An entry inherits its scheme's profile and may not name another. The table
+//     is scoped to the profile that declares it; naming a different profile there
+//     would make "this scheme's models" ambiguous. Such an entry is skipped with a
+//     warning, the same tolerance a route naming an undefined profile gets.
+//
+// A conflict with the global table is reported but not treated as an error: the
+// scheme table is additive, and a duplicate alias most likely means the operator
+// copied a model into a scheme it is already served from.
+func mergeSchemeRoutes(c *Config, routes, declared map[string]RouteEntry) {
+	// Sorted so a conflict between two schemes resolves the same way on every
+	// load instead of following map iteration order.
+	names := make([]string, 0, len(c.Upstreams))
+	for name := range c.Upstreams {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		p := c.Upstreams[name]
+		if len(p.Routing) == 0 {
+			continue
+		}
+		// buildRouteTargets reports and skips malformed entries, which is the same
+		// per-entry tolerance the global table gets.
+		scheme := buildRouteTargets(p.Routing)
+		aliases := make([]string, 0, len(scheme))
+		for alias := range scheme {
+			aliases = append(aliases, alias)
+		}
+		sort.Strings(aliases)
+
+		for _, alias := range aliases {
+			e := scheme[alias]
+			if e.Upstream != "" && normalizeUpstreamName(e.Upstream) != name {
+				log.Printf("config: [upstreams.%s.routing] %q names upstream %q, but a scheme's own table may only serve its own profile (entry skipped)\n",
+					name, alias, e.Upstream)
+				continue
+			}
+			if _, taken := declared[alias]; taken {
+				log.Printf("config: [upstreams.%s.routing] %q is already declared in [routing] (scheme entry ignored)\n",
+					name, alias)
+				continue
+			}
+			if _, taken := routes[alias]; taken {
+				log.Printf("config: [upstreams.%s.routing] %q is already served by another scheme (entry ignored)\n",
+					name, alias)
+				continue
+			}
+			e.Upstream = name
+			routes[alias] = e
+		}
 	}
 }
 
@@ -1130,12 +1362,20 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		respondUpstreamError(w, fmt.Errorf("route %q names undefined upstream profile %q", model, target.Upstream))
 		return
 	}
-	// The route's own profile drives the request. vlmRC is the separate profile
-	// [proxy] vlm_upstream names: the VLM may live on a different upstream than the
-	// text model, so the describe pass and the VLM fallbacks must not borrow the
-	// route's URL and key.
+	// The route's own profile drives the request. vlmRC is the profile the
+	// describe pass runs on — the scheme's own vlm_upstream when it declared one,
+	// otherwise [proxy] vlm_upstream — so the describe calls and the VLM
+	// fallbacks never borrow the text profile's URL and key by accident.
+	//
+	// The scheme also decides which vision model to use: a route bound to an
+	// upstream that declares its own vlm_model describes images with that model,
+	// which is what keeps several schemes independent of one another.
 	rc = rc.forUpstream(targetUp)
-	vlmRC := rc.vlmConfig()
+	vlmRC := rc.vlmConfig(targetUp)
+	// The model comes from the scheme-aware copy: vlmConfig folds the routed
+	// scheme's own vlm_model over the global one, so reading it from the plain
+	// route snapshot would ignore every per-scheme VLM.
+	vlmModel := vlmRC.visionModel()
 	// vlmFallback is set when the describe pass failed: the original (still
 	// image-carrying) request must be routed to the VLM model via the anthropic
 	// gateway. An openai-route request in this state must NOT be translated to
@@ -1146,18 +1386,16 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	// input) skips the builtin VLM describe pass: the image-carrying request is
 	// forwarded to the model as-is (image blocks intact; openai routes translate
 	// them to image_url parts).
-	if containsImage(req) && rc.cfg.Proxy.VLMModel != "" && !target.SupportsImage {
-		// The describe calls go through [proxy] vlm_upstream, not the route's own
-		// profile.
+	if containsImage(req) && vlmModel != "" && !target.SupportsImage {
 		if describeImages(req, vlmRC) {
 			body, _ = json.Marshal(req)
 		} else {
 			// Describe failed partway (some images replaced, some not): restore the
 			// original request and route the whole thing to the VLM so no image is lost.
 			json.Unmarshal(body, &req)
-			newModel = rc.cfg.Proxy.VLMModel
+			newModel = vlmModel
 			vlmFallback = true
-			stats.warn(model, rc.cfg.Proxy.VLMModel, vlmRC.up.Protocol, catVLMDescribeFailed,
+			stats.warn(model, vlmModel, vlmRC.up.Protocol, catVLMDescribeFailed,
 				"VLM 图片描述失败，整个请求已回退路由到 VLM")
 		}
 	}
@@ -1202,16 +1440,16 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	// detection missed (400 "Model do not support image input"), retry once with the
 	// VLM model. A route marked supports_image=true skips this too — the model is
 	// declared image-capable, so a rejection is a config error worth surfacing.
-	if resp.StatusCode == 400 && rc.cfg.Proxy.VLMModel != "" && newModel != rc.cfg.Proxy.VLMModel && !target.SupportsImage {
+	if resp.StatusCode == 400 && vlmModel != "" && newModel != vlmModel && !target.SupportsImage {
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if strings.Contains(string(respBody), "do not support image") {
-			log.Printf("[RETRY] image 400 -> vlm %s\n", rc.cfg.Proxy.VLMModel)
-			req["model"] = rc.cfg.Proxy.VLMModel
+			log.Printf("[RETRY] image 400 -> vlm %s\n", vlmModel)
+			req["model"] = vlmModel
 			body, _ = json.Marshal(req)
 			// The retry goes to the VLM, so it runs on the VLM profile and is
 			// accounted against the VLM model.
-			tracker.model = rc.cfg.Proxy.VLMModel
+			tracker.model = vlmModel
 			rc = vlmRC
 			resp, err = doUpstreamRequest(body, r, rc)
 			if err != nil {
@@ -1275,7 +1513,13 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		// valid without altering its content.
 		var buf bytes.Buffer
 		leak := newLeakRewriter(req)
-		totalBytes, err := io.Copy(io.MultiWriter(fw, &buf), newResponseRewriter(respBody, leak))
+		rewritten := newResponseRewriter(respBody, leak)
+		totalBytes, err := io.Copy(io.MultiWriter(fw, &buf), rewritten)
+		// Close the reader side unconditionally: on a client disconnect the copy
+		// returns a write error while the rewriter goroutine is still blocked on
+		// the pipe, and closing it is what lets that goroutine exit. Without this,
+		// every aborted stream stranded one goroutine for the life of the process.
+		rewritten.Close()
 		if err != nil {
 			log.Printf("[STREAM_END] error: %v\n", err)
 			tracker.failure(classifyError(err), resp.StatusCode, err.Error())
@@ -1480,7 +1724,7 @@ func newThinkingNormalizingReader(r io.Reader) io.Reader {
 	return newResponseRewriter(r, nil)
 }
 
-func newResponseRewriter(r io.Reader, lr *leakRewriter) io.Reader {
+func newResponseRewriter(r io.Reader, lr *leakRewriter) io.ReadCloser {
 	pr, pw := io.Pipe()
 	go func() {
 		sc := bufio.NewScanner(r)
@@ -1491,7 +1735,13 @@ func newResponseRewriter(r io.Reader, lr *leakRewriter) io.Reader {
 			line := sc.Text()
 			if line == "" {
 				// End of a SSE event block: emit the (possibly normalized) event.
-				emitEvent(pw, event, data.String(), lr)
+				if !emitEvent(pw, event, data.String(), lr) {
+					// The consumer is gone (client disconnected, or the copy
+					// aborted on a write error). Every later write would fail the
+					// same way, so stop instead of draining the whole upstream
+					// stream into a closed pipe.
+					return
+				}
 				event = ""
 				data.Reset()
 				continue
@@ -1522,13 +1772,36 @@ func newResponseRewriter(r io.Reader, lr *leakRewriter) io.Reader {
 	return pr
 }
 
+// errTrackWriter remembers the first write error it saw, so a caller that
+// cannot propagate errors through a chain of helpers (the SSE emitter writes
+// through fmt.Fprintf, whose result the event writers ignore) can still learn
+// whether the consumer is still there.
+type errTrackWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (e *errTrackWriter) Write(p []byte) (int, error) {
+	if e.err != nil {
+		return 0, e.err
+	}
+	n, err := e.w.Write(p)
+	if err != nil {
+		e.err = err
+	}
+	return n, err
+}
+
 // emitEvent writes one normalized SSE event block to pw. It rewrites the JSON payload
 // of `content_block_start` events whose content_block is a thinking block missing a
 // string `thinking` field. The rewritten payload keeps its full envelope (`type`,
 // `index`, ...) with only the nested content_block changed — replacing the whole
 // payload with just the content_block would leave the event unparseable to Claude
 // Code, which then renders the thinking_delta content as body text.
-func emitEvent(pw *io.PipeWriter, event, data string, lr *leakRewriter) {
+//
+// ok is false when the write failed, which means the consumer is gone and the
+// producing goroutine should stop rather than keep draining the upstream.
+func emitEvent(pw *io.PipeWriter, event, data string, lr *leakRewriter) (ok bool) {
 	out := data
 	if event == "content_block_start" && data != "" {
 		var ev struct {
@@ -1548,11 +1821,16 @@ func emitEvent(pw *io.PipeWriter, event, data string, lr *leakRewriter) {
 			}
 		}
 	}
+	// A pipe has no buffer: the write blocks until the reader consumes it, and
+	// returns io.ErrClosedPipe once the reader is gone. Tracking the error here is
+	// what lets the goroutine notice a disconnected client.
+	tracked := &errTrackWriter{w: pw}
 	if lr != nil {
-		lr.process(pw, event, out)
-		return
+		lr.process(tracked, event, out)
+	} else {
+		fmt.Fprintf(tracked, "event: %s\ndata: %s\n\n", event, out)
 	}
-	fmt.Fprintf(pw, "event: %s\ndata: %s\n\n", event, out)
+	return tracked.err == nil
 }
 
 // normalizeThinkingBlock returns a rewritten content_block JSON with guaranteed
@@ -2125,8 +2403,8 @@ func describeImageWithVLM(block map[string]interface{}, ctx string, rc reqConfig
 	}
 
 	req := map[string]interface{}{
-		"model":      rc.cfg.Proxy.VLMModel,
-		"max_tokens": rc.cfg.Proxy.VLMMaxTokens,
+		"model":      rc.visionModel(),
+		"max_tokens": rc.visionMaxTokens(),
 		"messages": []interface{}{
 			map[string]interface{}{
 				"role": "user",

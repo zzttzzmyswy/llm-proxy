@@ -140,7 +140,18 @@ type adminUpstreamProfileView struct {
 	HeaderTimeoutSeconds int    `json:"header_timeout_seconds"`
 	BodyIdleSeconds      int    `json:"body_idle_seconds"`
 	MaxRetries           int    `json:"max_retries"`
-	Builtin              bool   `json:"builtin"`
+	// VLMModel / VLMMaxTokens / VLMUpstream are the scheme's own describe-pass
+	// settings. Empty (or zero) means "inherit [proxy]", which is what the page
+	// shows as a placeholder rather than echoing the inherited value back — a save
+	// that echoed it would freeze the inheritance into the file.
+	VLMModel     string `json:"vlm_model"`
+	VLMMaxTokens int    `json:"vlm_max_tokens"`
+	VLMUpstream  string `json:"vlm_upstream"`
+	// EffectiveVLMModel is the model this scheme actually describes with, after
+	// the [proxy] fallback. The page shows it so an operator who did not set one
+	// can still see what will be used.
+	EffectiveVLMModel string `json:"effective_vlm_model"`
+	Builtin           bool   `json:"builtin"`
 }
 
 type adminKeysView struct {
@@ -221,6 +232,13 @@ type adminUpstreamProfilePayload struct {
 	HeaderTimeoutSeconds int    `json:"header_timeout_seconds"`
 	BodyIdleSeconds      int    `json:"body_idle_seconds"`
 	MaxRetries           int    `json:"max_retries"`
+	// The scheme's own describe-pass settings, submitted the same way: empty/zero
+	// means "inherit [proxy]". VLMUpstream must name an anthropic-protocol
+	// profile, or be empty so the scheme serves its own calls (when it speaks the
+	// anthropic framing) or falls back to the global selector.
+	VLMModel     string `json:"vlm_model"`
+	VLMMaxTokens int    `json:"vlm_max_tokens"`
+	VLMUpstream  string `json:"vlm_upstream"`
 }
 
 type adminConfigPayload struct {
@@ -257,9 +275,13 @@ func currentConfigView() adminConfigView {
 	for _, alias := range aliases {
 		e := declared[alias]
 		entries = append(entries, adminRoutingEntry{
-			Alias:         alias,
-			Model:         e.Model,
-			Upstream:      e.Upstream,
+			Alias: alias,
+			Model: e.Model,
+			// "claude" is an accepted spelling of the anthropic profile, but the
+			// form's select offers profile names, so a row carrying the alias would
+			// show as the first option and an untouched save would silently reroute
+			// it. Report the canonical name the select actually offers.
+			Upstream:      canonicalSelector(e.Upstream),
 			SupportsImage: e.SupportsImage,
 		})
 	}
@@ -284,13 +306,13 @@ func currentConfigView() adminConfigView {
 			Port:         c.Proxy.Port,
 			VLMModel:     c.Proxy.VLMModel,
 			VLMMaxTokens: c.Proxy.VLMMaxTokens,
-			VLMUpstream:  c.Proxy.VLMUpstream,
-			ChatUpstream: c.Proxy.ChatUpstream,
+			VLMUpstream:  canonicalSelector(c.Proxy.VLMUpstream),
+			ChatUpstream: canonicalSelector(c.Proxy.ChatUpstream),
 		},
 		Upstream: adminUpstreamView{
 			AnthropicURL:         c.Upstream.AnthropicURL,
 			OpenAIURL:            c.Upstream.OpenAIURL,
-			DefaultUpstream:      c.Upstream.DefaultUpstream,
+			DefaultUpstream:      canonicalSelector(c.Upstream.DefaultUpstream),
 			HeaderTimeoutSeconds: c.Upstream.HeaderTimeoutSeconds,
 			BodyIdleSeconds:      c.Upstream.BodyIdleSeconds,
 			MaxRetries:           c.Upstream.MaxRetries,
@@ -324,7 +346,7 @@ func profileViews(c Config) []adminUpstreamProfileView {
 
 	out := make([]adminUpstreamProfileView, 0, len(names)+2)
 	for _, name := range names {
-		v := adminProfileView(name, c.Upstreams[name], false)
+		v := adminProfileView(name, c.Upstreams[name], false, c)
 		// A declared profile carrying a builtin gateway name still falls back to
 		// the legacy key, so its key state comes from the resolution rather than
 		// from the table alone — otherwise a [upstreams.anthropic] with no key of
@@ -353,7 +375,10 @@ func profileViews(c Config) []adminUpstreamProfileView {
 			HeaderTimeoutSeconds: int(up.HeaderTimeout.Seconds()),
 			BodyIdleSeconds:      int(up.BodyIdle.Seconds()),
 			MaxRetries:           up.MaxRetries,
-			Builtin:              true,
+			// A builtin profile declares no VLM of its own, so it describes with
+			// the global model; the page shows that as the effective value.
+			EffectiveVLMModel: up.VLMModel,
+			Builtin:           true,
 		})
 	}
 	return out
@@ -361,8 +386,13 @@ func profileViews(c Config) []adminUpstreamProfileView {
 
 // adminProfileView renders one declared profile. The URL is shown trimmed the way
 // the request path uses it, so the page echoes back what the proxy would send.
-func adminProfileView(name string, p UpstreamProfile, builtin bool) adminUpstreamProfileView {
-	return adminUpstreamProfileView{
+//
+// The VLM fields report what the scheme declares, not what it resolves to: an
+// empty vlm_model means "inherit [proxy]", and echoing the inherited value back
+// would freeze the inheritance into the file on the next save. EffectiveVLMModel
+// carries the resolved value separately for display.
+func adminProfileView(name string, p UpstreamProfile, builtin bool, c Config) adminUpstreamProfileView {
+	v := adminUpstreamProfileView{
 		Name:                 name,
 		Protocol:             p.Protocol,
 		URL:                  strings.TrimSuffix(p.URL, "/"),
@@ -372,8 +402,30 @@ func adminProfileView(name string, p UpstreamProfile, builtin bool) adminUpstrea
 		HeaderTimeoutSeconds: p.HeaderTimeoutSeconds,
 		BodyIdleSeconds:      p.BodyIdleSeconds,
 		MaxRetries:           p.MaxRetries,
+		VLMModel:             p.VLMModel,
+		VLMMaxTokens:         p.VLMMaxTokens,
+		VLMUpstream:          normalizeUpstreamName(p.VLMUpstream),
 		Builtin:              builtin,
 	}
+	// What the describe pass will actually use: the scheme's own model, else the
+	// global one. Computed here so the page does not have to duplicate the rule.
+	v.EffectiveVLMModel = p.VLMModel
+	if v.EffectiveVLMModel == "" {
+		v.EffectiveVLMModel = c.Proxy.VLMModel
+	}
+	return v
+}
+
+// canonicalSelector rewrites a selector spelling the page's dropdowns do not
+// offer into the one they do. Only "claude" needs it: it is an accepted alias for
+// the anthropic profile, but the dropdown lists profile names, so leaving the
+// alias in the payload would make an untouched save fall back to the first option
+// and reroute the entry.
+func canonicalSelector(value string) string {
+	if normalizeUpstreamName(value) == profileNameClaudeAlias {
+		return profileNameAnthropic
+	}
+	return value
 }
 
 // configSaveMu serializes the whole save transaction — reading the previous
@@ -679,6 +731,13 @@ func resolveProfiles(submitted []adminUpstreamProfilePayload, old map[string]Ups
 		if !validProfileName(name) {
 			return nil, fmt.Errorf("上游 profile 名 %q 只能包含小写字母、数字、'-' 和 '_'", raw)
 		}
+		// "claude" is the alias for the anthropic profile, so a table under that
+		// name is never reachable — profileByName folds the name before it looks
+		// the profile up. Accepting it here would save a profile whose URL and key
+		// are silently ignored at request time.
+		if name == profileNameClaudeAlias {
+			return nil, fmt.Errorf("上游 profile 名 %q 是保留名（它等价于 %q），请改用其他名字", raw, profileNameAnthropic)
+		}
 		if _, dup := out[name]; dup {
 			return nil, fmt.Errorf("上游 profile 名 %q 重复（名字大小写不敏感）", name)
 		}
@@ -692,6 +751,12 @@ func resolveProfiles(submitted []adminUpstreamProfilePayload, old map[string]Ups
 		}
 		if item.HeaderTimeoutSeconds < 0 || item.BodyIdleSeconds < 0 || item.MaxRetries < 0 {
 			return nil, fmt.Errorf("上游 profile %q 的超时与重试次数不能为负数", name)
+		}
+		if item.VLMMaxTokens < 0 {
+			return nil, fmt.Errorf("上游 profile %q 的 vlm_max_tokens 不能为负数", name)
+		}
+		if hasControlChars(item.VLMModel) {
+			return nil, fmt.Errorf("上游 profile %q 的 vlm_model 含非法控制字符", name)
 		}
 
 		keyEnv := strings.TrimSpace(item.KeyEnv)
@@ -732,6 +797,25 @@ func resolveProfiles(submitted []adminUpstreamProfilePayload, old map[string]Ups
 			HeaderTimeoutSeconds: item.HeaderTimeoutSeconds,
 			BodyIdleSeconds:      item.BodyIdleSeconds,
 			MaxRetries:           item.MaxRetries,
+			VLMModel:             strings.TrimSpace(item.VLMModel),
+			VLMMaxTokens:         item.VLMMaxTokens,
+			VLMUpstream:          normalizeUpstreamName(item.VLMUpstream),
+		}
+	}
+	// A scheme's vlm_upstream may name any profile in this same submission, so
+	// the reference can only be resolved once every entry has been read.
+	known := profileNames(out)
+	for name, p := range out {
+		sel := normalizeUpstreamName(p.VLMUpstream)
+		if sel == "" || sel == name {
+			continue
+		}
+		if !validProfileSelector(sel, known) {
+			return nil, fmt.Errorf("上游 profile %q 的 vlm_upstream 必须是已定义的上游 profile 名（或留空表示自身）", name)
+		}
+		if proto, ok := selectorProtocol(sel, out); ok && proto != protocolAnthropic {
+			return nil, fmt.Errorf("上游 profile %q 的 vlm_upstream 指向 %s 协议的 profile，图片描述调用必须是 %s 协议",
+				name, proto, protocolAnthropic)
 		}
 	}
 	return out, nil
@@ -779,7 +863,7 @@ func rejectRemovedProfiles(p *adminConfigPayload, old, next map[string]UpstreamP
 // anthropic profile, so it counts as a reference to it.
 func selectorRefersTo(value, profile string) bool {
 	name := normalizeUpstreamName(value)
-	if name == "claude" {
+	if name == profileNameClaudeAlias {
 		name = profileNameAnthropic
 	}
 	return name != "" && name == profile
@@ -808,7 +892,7 @@ func checkProtocolSelector(field, value string, profiles map[string]UpstreamProf
 	if name == "" {
 		return nil
 	}
-	if name == "claude" {
+	if name == profileNameClaudeAlias {
 		name = profileNameAnthropic
 	}
 	got, ok := selectorProtocol(name, profiles)
@@ -844,7 +928,7 @@ func selectorProtocol(name string, profiles map[string]UpstreamProfile) (string,
 // names stays legible.
 func validUpstreamName(s string) bool {
 	switch normalizeUpstreamName(s) {
-	case "", "claude", profileNameAnthropic, profileNameOpenAI:
+	case "", profileNameClaudeAlias, profileNameAnthropic, profileNameOpenAI:
 		return true
 	}
 	return false
@@ -1018,6 +1102,44 @@ func writeUpstreamProfiles(b *strings.Builder, profiles map[string]UpstreamProfi
 		}
 		if p.MaxRetries > 0 {
 			fmt.Fprintf(b, "max_retries = %d\n", p.MaxRetries)
+		}
+		// The scheme's own describe pass. Only what the scheme declares is written:
+		// an inherited value stays inherited, so a later change to [proxy] still
+		// flows through instead of being pinned by this save.
+		if p.VLMModel != "" {
+			b.WriteString("# Vision model this scheme describes images with. Empty inherits [proxy].\n")
+			fmt.Fprintf(b, "vlm_model = %s\n", tomlString(p.VLMModel))
+		}
+		if p.VLMMaxTokens > 0 {
+			fmt.Fprintf(b, "vlm_max_tokens = %d\n", p.VLMMaxTokens)
+		}
+		if p.VLMUpstream != "" {
+			b.WriteString("# Profile serving this scheme's describe calls (must speak the anthropic\n")
+			b.WriteString("# protocol). Empty means the scheme serves them itself.\n")
+			fmt.Fprintf(b, "vlm_upstream = %s\n", tomlString(p.VLMUpstream))
+		}
+		// A scheme's model mapping table is emitted as a sub-table. Its entries
+		// always name this scheme implicitly, so only the model and image flag are
+		// written — an upstream field here would be rejected on the next load.
+		if len(p.Routing) > 0 {
+			aliases := make([]string, 0, len(p.Routing))
+			for alias := range p.Routing {
+				aliases = append(aliases, alias)
+			}
+			sort.Strings(aliases)
+			fmt.Fprintf(b, "\n[upstreams.%s.routing]\n", tomlKey(name))
+			for _, alias := range aliases {
+				e, err := decodeRouteEntry(p.Routing[alias])
+				if err != nil {
+					continue
+				}
+				key := tomlKey(alias)
+				if !e.SupportsImage {
+					fmt.Fprintf(b, "%s = %s\n", key, tomlString(e.Model))
+					continue
+				}
+				fmt.Fprintf(b, "%s = { model = %s, supports_image = true }\n", key, tomlString(e.Model))
+			}
 		}
 		b.WriteString("\n")
 	}
