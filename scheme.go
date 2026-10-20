@@ -369,9 +369,10 @@ func resolveKey(spec UpstreamSpec) string {
 	return spec.Key
 }
 
-// resolveVLM builds the scheme's describe pass. The describe call always speaks
-// the anthropic framing (/v1/messages), so calling one through an openai upstream
-// is rejected at load rather than failing per image at request time.
+// resolveVLM builds the scheme's describe pass. The serving upstream may speak
+// either protocol: describeImageWithVLM frames the call for whichever one it is
+// (/v1/messages for anthropic, /v1/chat/completions with an image_url part for
+// openai), so this only has to resolve where the call goes.
 func resolveVLM(scheme string, text Upstream, sec *VLMSection) (*VLMScheme, bool, error) {
 	if strings.TrimSpace(sec.Model) == "" {
 		// No model: the describe pass is off, which is a documented way to run.
@@ -383,24 +384,20 @@ func resolveVLM(scheme string, text Upstream, sec *VLMSection) (*VLMScheme, bool
 		return nil, false, nil
 	}
 
+	// Any upstream can serve the describe pass: the call is built for whatever
+	// protocol the serving upstream speaks (see describeImageWithVLM), so a scheme
+	// whose text upstream is openai can describe images on that same gateway
+	// instead of having to name a second, anthropic one.
 	up, err := resolveUpstream(scheme+" [vlm]", scheme+"/vlm", sec.UpstreamSpec, false)
 	inherits := false
 	switch {
 	case err == errInheritUpstream:
 		// No upstream of its own: the describe calls ride the scheme's text
-		// upstream, which has to be an anthropic one.
-		if text.Protocol != protocolAnthropic {
-			return nil, false, fmt.Errorf("scheme %s: [vlm] declares model = %q but no url, and the scheme's own upstream speaks %q; "+
-				"describe calls speak %q, so give [vlm] its own anthropic url (or remove the model to disable image description)",
-				scheme, sec.Model, text.Protocol, protocolAnthropic)
-		}
+		// upstream, whatever protocol it speaks.
 		up = text
 		inherits = true
 	case err != nil:
 		return nil, false, err
-	case up.Protocol != protocolAnthropic:
-		return nil, false, fmt.Errorf("scheme %s: [vlm] protocol is %q, but describe calls speak %q",
-			scheme, up.Protocol, protocolAnthropic)
 	}
 	maxTokens := sec.MaxTokens
 	if maxTokens <= 0 {

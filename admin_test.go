@@ -201,11 +201,11 @@ func TestAdminConfigViewRedactsKey(t *testing.T) {
 	}
 }
 
-// payloadFromView builds the save payload a round trip of the page would send: the
-// view's own values back, with every key action left at "keep".
-func payloadFromView(view adminConfigView) adminConfigPayload {
-	return adminConfigPayload{
-		Proxy:    view.Proxy,
+// schemePayloadFromView builds the scheme-editor payload a round trip of the page
+// would send: the view's own values back, with every key action left at "keep".
+func schemePayloadFromView(view adminSchemeView) adminSchemePayload {
+	return adminSchemePayload{
+		Name:     view.Name,
 		Upstream: upstreamPayloadFromView(view.Upstream, "keep", ""),
 		VLM: adminVLMPayload{
 			Active:    view.VLM.Active,
@@ -219,7 +219,6 @@ func payloadFromView(view adminConfigView) adminConfigPayload {
 			Inherit:   view.Chat.Inherit,
 			Upstream:  upstreamPayloadFromView(view.Chat.Upstream, "keep", ""),
 		},
-		Admin:   adminAuthPayload{Action: "keep"},
 		Routing: view.Routing,
 	}
 }
@@ -237,13 +236,31 @@ func upstreamPayloadFromView(v adminUpstreamView, keyAction, key string) adminUp
 	}
 }
 
-func postConfig(t *testing.T, p adminConfigPayload, password string) *httptest.ResponseRecorder {
+// postScheme saves one scheme file through the editor endpoint.
+func postScheme(t *testing.T, p adminSchemePayload, password string) *httptest.ResponseRecorder {
 	t.Helper()
-	body, err := json.Marshal(p)
+	return postJSON(t, handleAdminSaveScheme, "/admin/api/config/scheme", p, password)
+}
+
+// postMain saves the main configuration.
+func postMain(t *testing.T, p adminMainPayload, password string) *httptest.ResponseRecorder {
+	t.Helper()
+	return postJSON(t, handleAdminSaveMain, "/admin/api/config/main", p, password)
+}
+
+// postActivate switches the active scheme.
+func postActivate(t *testing.T, name, password string) *httptest.ResponseRecorder {
+	t.Helper()
+	return postJSON(t, handleAdminActivate, "/admin/api/config/activate", adminActivatePayload{Scheme: name}, password)
+}
+
+func postJSON(t *testing.T, h http.HandlerFunc, path string, payload interface{}, password string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return adminCall(t, handleAdminConfig, http.MethodPost, "/admin/api/config", string(body), password)
+	return adminCall(t, h, http.MethodPost, path, string(body), password)
 }
 
 func currentView(t *testing.T) adminConfigView {
@@ -257,17 +274,34 @@ func currentView(t *testing.T) adminConfigView {
 	return view
 }
 
+// schemeEditorView loads one scheme through the editor endpoint, which is how the
+// scheme page reads any file — active or not.
+func schemeEditorView(t *testing.T, name string) adminSchemeView {
+	t.Helper()
+	target := "/admin/api/schemes"
+	if name != "" {
+		target += "?name=" + name
+	}
+	w := adminCall(t, handleAdminSchemes, http.MethodGet, target, "", "s3cret")
+	if w.Code != http.StatusOK {
+		t.Fatalf("scheme view status %d: %s", w.Code, w.Body.String())
+	}
+	var view adminSchemeView
+	decodeBody(t, w, &view)
+	return view
+}
+
 // A save rewrites the scheme file, backs the previous one up, and takes effect
 // without a restart.
 func TestAdminConfigSaveAppliesAndBacksUp(t *testing.T) {
 	_, schemePath := withDefaultConfig(t)
 
-	p := payloadFromView(currentView(t))
+	p := schemePayloadFromView(schemeEditorView(t, ""))
 	p.Upstream.URL = "https://changed.example/api"
 	p.VLM.Model = "Qwen-VL"
 	p.Routing = append(p.Routing, adminRoutingEntry{Alias: "fast", Model: "glm-flash"})
 
-	res := postConfig(t, p, "s3cret")
+	res := postScheme(t, p, "s3cret")
 	if res.Code != http.StatusOK {
 		t.Fatalf("save must succeed, got %d: %s", res.Code, res.Body.String())
 	}
@@ -314,43 +348,34 @@ func TestAdminConfigRejectsInvalidPayloadWithoutWriting(t *testing.T) {
 
 	cases := []struct {
 		name   string
-		mutate func(*adminConfigPayload)
+		mutate func(*adminSchemePayload)
 		want   string
 	}{
-		{"empty url", func(p *adminConfigPayload) { p.Upstream.URL = "" }, "url"},
-		{"bad protocol", func(p *adminConfigPayload) { p.Upstream.Protocol = "grpc" }, "protocol"},
-		{"negative timeout", func(p *adminConfigPayload) { p.Upstream.BodyIdleSeconds = -1 }, "负数"},
-		{"vlm without model", func(p *adminConfigPayload) { p.VLM.Active = true; p.VLM.Model = "" }, "vlm model"},
-		{"vlm inheriting an openai upstream", func(p *adminConfigPayload) {
-			p.Upstream.Protocol = protocolOpenAI
-			p.Upstream.URL = "https://openai.example/v1"
-			p.VLM.Active = true
-			p.VLM.Inherit = true
-			p.VLM.Model = "m"
-		}, "anthropic"},
-		{"chat on an anthropic upstream", func(p *adminConfigPayload) {
+		{"empty url", func(p *adminSchemePayload) { p.Upstream.URL = "" }, "url"},
+		{"bad protocol", func(p *adminSchemePayload) { p.Upstream.Protocol = "grpc" }, "protocol"},
+		{"negative timeout", func(p *adminSchemePayload) { p.Upstream.BodyIdleSeconds = -1 }, "负数"},
+		{"vlm without model", func(p *adminSchemePayload) { p.VLM.Active = true; p.VLM.Model = "" }, "vlm model"},
+		{"chat on an anthropic upstream", func(p *adminSchemePayload) {
 			p.Chat.Available = true
 			p.Chat.Inherit = true
 			p.Chat.Upstream = adminUpstreamPayload{}
 		}, "openai"},
-		{"empty route alias", func(p *adminConfigPayload) {
+		{"empty route alias", func(p *adminSchemePayload) {
 			p.Routing = append(p.Routing, adminRoutingEntry{Alias: "", Model: "m"})
 		}, "别名"},
-		{"empty route model", func(p *adminConfigPayload) {
+		{"empty route model", func(p *adminSchemePayload) {
 			p.Routing = append(p.Routing, adminRoutingEntry{Alias: "x", Model: ""})
 		}, "模型名"},
-		{"duplicate route alias", func(p *adminConfigPayload) {
+		{"duplicate route alias", func(p *adminSchemePayload) {
 			p.Routing = append(p.Routing, adminRoutingEntry{Alias: "sonnet", Model: "m"})
 		}, "重复"},
-		{"port out of range", func(p *adminConfigPayload) { p.Proxy.Port = 70000 }, "端口"},
-		{"switching to a missing scheme", func(p *adminConfigPayload) { p.Proxy.Scheme = "ghost" }, "不存在"},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := payloadFromView(currentView(t))
+			p := schemePayloadFromView(schemeEditorView(t, ""))
 			tc.mutate(&p)
-			res := postConfig(t, p, "s3cret")
+			res := postScheme(t, p, "s3cret")
 			if res.Code != http.StatusBadRequest {
 				t.Fatalf("want 400, got %d: %s", res.Code, res.Body.String())
 			}
@@ -383,9 +408,9 @@ func TestAdminConfigKeyActions(t *testing.T) {
 		{"clear", "", ""},
 	} {
 		t.Run(tc.action, func(t *testing.T) {
-			p := payloadFromView(currentView(t))
+			p := schemePayloadFromView(schemeEditorView(t, ""))
 			p.Upstream.KeyAction, p.Upstream.Key = tc.action, tc.key
-			if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
+			if res := postScheme(t, p, "s3cret"); res.Code != http.StatusOK {
 				t.Fatalf("status %d: %s", res.Code, res.Body.String())
 			}
 			if got := currentScheme().Text.Key; got != tc.want {
@@ -395,9 +420,9 @@ func TestAdminConfigKeyActions(t *testing.T) {
 	}
 
 	// "set" with an empty value is a mistake, not a clear.
-	p := payloadFromView(currentView(t))
+	p := schemePayloadFromView(schemeEditorView(t, ""))
 	p.Upstream.KeyAction, p.Upstream.Key = "set", ""
-	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusBadRequest {
+	if res := postScheme(t, p, "s3cret"); res.Code != http.StatusBadRequest {
 		t.Fatalf("set with an empty key must be rejected, got %d", res.Code)
 	}
 }
@@ -408,9 +433,9 @@ func TestAdminConfigKeyEnvIsNotCopiedIntoTheFile(t *testing.T) {
 	_, schemePath := withDefaultConfig(t)
 	t.Setenv("MYS_TEST_SCHEME_KEY", "from-env")
 
-	p := payloadFromView(currentView(t))
+	p := schemePayloadFromView(schemeEditorView(t, ""))
 	p.Upstream.KeyAction, p.Upstream.Key, p.Upstream.KeyEnv = "clear", "", "MYS_TEST_SCHEME_KEY"
-	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
+	if res := postScheme(t, p, "s3cret"); res.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
 	if got := currentScheme().Text.Key; got != "from-env" {
@@ -425,10 +450,11 @@ func TestAdminConfigKeyEnvIsNotCopiedIntoTheFile(t *testing.T) {
 	}
 }
 
-func TestAdminConfigSaveKeepsAdminTokenByDefault(t *testing.T) {
+// The admin password belongs to the main form: a scheme save neither reads nor
+// changes it.
+func TestAdminMainSaveKeepsAdminTokenByDefault(t *testing.T) {
 	withDefaultConfig(t)
-	p := payloadFromView(currentView(t))
-	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
+	if res := postMain(t, adminMainPayload{Port: 8088, Admin: adminAuthPayload{Action: "keep"}}, "s3cret"); res.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
 	if got := currentConfig().Admin.Token; got != "s3cret" {
@@ -447,12 +473,10 @@ func TestAdminConfigViewReportsAdminTokenState(t *testing.T) {
 	}
 }
 
-func TestAdminConfigAdminTokenActions(t *testing.T) {
+func TestAdminMainAdminTokenActions(t *testing.T) {
 	withDefaultConfig(t)
 
-	p := payloadFromView(currentView(t))
-	p.Admin = adminAuthPayload{Action: "set", Token: "brand-new"}
-	res := postConfig(t, p, "s3cret")
+	res := postMain(t, adminMainPayload{Port: 8088, Admin: adminAuthPayload{Action: "set", Token: "brand-new"}}, "s3cret")
 	if res.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
@@ -468,9 +492,7 @@ func TestAdminConfigAdminTokenActions(t *testing.T) {
 	}
 
 	// Clearing closes the page.
-	p = payloadFromView(currentView(t))
-	p.Admin = adminAuthPayload{Action: "clear"}
-	if res := postConfig(t, p, "brand-new"); res.Code != http.StatusOK {
+	if res := postMain(t, adminMainPayload{Port: 8088, Admin: adminAuthPayload{Action: "clear"}}, "brand-new"); res.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
 	if got := currentConfig().Admin.Token; got != "" {
@@ -478,22 +500,34 @@ func TestAdminConfigAdminTokenActions(t *testing.T) {
 	}
 }
 
-func TestAdminConfigRejectsEmptyAdminTokenSet(t *testing.T) {
+func TestAdminMainRejectsEmptyAdminTokenSet(t *testing.T) {
 	withDefaultConfig(t)
-	p := payloadFromView(currentView(t))
-	p.Admin = adminAuthPayload{Action: "set", Token: ""}
-	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusBadRequest {
+	if res := postMain(t, adminMainPayload{Port: 8088, Admin: adminAuthPayload{Action: "set", Token: ""}}, "s3cret"); res.Code != http.StatusBadRequest {
 		t.Fatalf("set with an empty password must be rejected, got %d", res.Code)
 	}
 }
 
-func TestAdminConfigSaveWarnsAboutPortChange(t *testing.T) {
+func TestAdminMainRejectsPortOutOfRange(t *testing.T) {
 	withDefaultConfig(t)
-	p := payloadFromView(currentView(t))
-	p.Proxy.Port = 9090
-	res := postConfig(t, p, "s3cret")
+	res := postMain(t, adminMainPayload{Port: 70000, Admin: adminAuthPayload{Action: "keep"}}, "s3cret")
+	if res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "端口") {
+		t.Fatalf("an out-of-range port must be rejected with a port message, got %d: %s", res.Code, res.Body.String())
+	}
+}
+
+func TestAdminMainSaveWarnsAboutPortChange(t *testing.T) {
+	withDefaultConfig(t)
+	res := postMain(t, adminMainPayload{Port: 9090, Admin: adminAuthPayload{Action: "keep"}}, "s3cret")
 	if res.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", res.Code, res.Body.String())
+	}
+	var out struct {
+		Warnings []string `json:"warnings"`
+	}
+	decodeBody(t, res, &out)
+	joined := strings.Join(out.Warnings, " | ")
+	if !strings.Contains(joined, "重启") {
+		t.Fatalf("a port change must say a restart is needed, got: %s", joined)
 	}
 }
 
@@ -507,7 +541,7 @@ key = "sk"
 [routing]
 sonnet = "m"
 `)
-	view := currentView(t)
+	view := schemeEditorView(t, "")
 	if view.Chat.Available {
 		t.Fatalf("an anthropic-only scheme must report no chat upstream, got %+v", view.Chat)
 	}
@@ -515,8 +549,8 @@ sonnet = "m"
 		t.Fatalf("no [vlm] table means the describe pass is off, got %+v", view.VLM)
 	}
 
-	p := payloadFromView(view)
-	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
+	p := schemePayloadFromView(view)
+	if res := postScheme(t, p, "s3cret"); res.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
 	written, _ := os.ReadFile(schemePath)
@@ -544,9 +578,7 @@ key = "sk-other"
 	}
 	beforeMainFile, _ := os.ReadFile(mainSchemePath)
 
-	p := payloadFromView(currentView(t))
-	p.Proxy.Scheme = "other"
-	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
+	if res := postActivate(t, "other", "s3cret"); res.Code != http.StatusOK {
 		t.Fatalf("switch must succeed, got %d: %s", res.Code, res.Body.String())
 	}
 	if got := currentConfig().Proxy.Scheme; got != "other" {
@@ -773,11 +805,11 @@ func TestAdminConfigSOPHNETKeyEnvWarningOnlyWhenUnreferenced(t *testing.T) {
 	withDefaultConfig(t)
 	t.Setenv("SOPHNET_API_KEY", "env-secret")
 
-	save := func(mutate func(*adminConfigPayload)) []string {
+	save := func(mutate func(*adminSchemePayload)) []string {
 		t.Helper()
-		p := payloadFromView(currentView(t))
+		p := schemePayloadFromView(schemeEditorView(t, ""))
 		mutate(&p)
-		res := postConfig(t, p, "s3cret")
+		res := postScheme(t, p, "s3cret")
 		if res.Code != http.StatusOK {
 			t.Fatalf("save failed: %d %s", res.Code, res.Body.String())
 		}
@@ -788,7 +820,7 @@ func TestAdminConfigSOPHNETKeyEnvWarningOnlyWhenUnreferenced(t *testing.T) {
 		return out.Warnings
 	}
 
-	joined := strings.Join(save(func(p *adminConfigPayload) {
+	joined := strings.Join(save(func(p *adminSchemePayload) {
 		p.Upstream.KeyAction, p.Upstream.Key, p.Upstream.KeyEnv = "clear", "", "SOPHNET_API_KEY"
 	}), " | ")
 	if strings.Contains(joined, "都没有引用它") {
@@ -797,7 +829,7 @@ func TestAdminConfigSOPHNETKeyEnvWarningOnlyWhenUnreferenced(t *testing.T) {
 
 	// The page resubmits the key_env it read back, so dropping the reference is an
 	// explicit act (the field cleared), not the default.
-	joined = strings.Join(save(func(p *adminConfigPayload) {
+	joined = strings.Join(save(func(p *adminSchemePayload) {
 		p.Upstream.KeyAction, p.Upstream.Key, p.Upstream.KeyEnv = "set", "sk-inline", ""
 	}), " | ")
 	if !strings.Contains(joined, "都没有引用它") {
@@ -805,7 +837,7 @@ func TestAdminConfigSOPHNETKeyEnvWarningOnlyWhenUnreferenced(t *testing.T) {
 	}
 
 	// A [vlm] that reads it counts too.
-	joined = strings.Join(save(func(p *adminConfigPayload) {
+	joined = strings.Join(save(func(p *adminSchemePayload) {
 		p.VLM.Active, p.VLM.Model = true, "vl"
 		p.VLM.Inherit = false
 		p.VLM.Upstream = adminUpstreamPayload{
@@ -824,9 +856,9 @@ func TestAdminConfigHaikuHintReflectsTheInheritance(t *testing.T) {
 	withDefaultConfig(t)
 	save := func(routing []adminRoutingEntry) string {
 		t.Helper()
-		p := payloadFromView(currentView(t))
+		p := schemePayloadFromView(schemeEditorView(t, ""))
 		p.Routing = routing
-		res := postConfig(t, p, "s3cret")
+		res := postScheme(t, p, "s3cret")
 		if res.Code != http.StatusOK {
 			t.Fatalf("save failed: %d %s", res.Code, res.Body.String())
 		}
@@ -932,4 +964,239 @@ max_retries = 3
 			}
 		})
 	}
+}
+
+// The three save endpoints are separate on purpose: the main form must not rewrite
+// a scheme file, and the scheme editor must not rewrite the main file. Both used to
+// be one endpoint that always wrote both.
+func TestAdminMainSaveDoesNotTouchAnySchemeFile(t *testing.T) {
+	_, schemePath := withDefaultConfig(t)
+	before, err := os.ReadFile(schemePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res := postMain(t, adminMainPayload{Port: 8089, Admin: adminAuthPayload{Action: "keep"}}, "s3cret")
+	if res.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
+	}
+	if got := currentConfig().Proxy.Port; got != 8089 {
+		t.Fatalf("the new port must be live, got %d", got)
+	}
+	after, _ := os.ReadFile(schemePath)
+	if string(after) != string(before) {
+		t.Fatalf("a main save must not rewrite the scheme file, got:\n%s", after)
+	}
+	backups, _ := filepath.Glob(schemePath + ".bak.*")
+	if len(backups) != 0 {
+		t.Fatalf("a main save must not back up a scheme file, got %v", backups)
+	}
+}
+
+func TestAdminSchemeSaveDoesNotTouchTheMainFile(t *testing.T) {
+	configPath, schemePath := withDefaultConfig(t)
+	beforeMain, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p := schemePayloadFromView(schemeEditorView(t, ""))
+	p.Upstream.URL = "https://changed.example/api"
+	if res := postScheme(t, p, "s3cret"); res.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
+	}
+	if got := currentScheme().Text.URL; got != "https://changed.example/api" {
+		t.Fatalf("the active scheme must be reloaded, got %q", got)
+	}
+	afterMain, _ := os.ReadFile(configPath)
+	if string(afterMain) != string(beforeMain) {
+		t.Fatalf("a scheme save must not rewrite the main file, got:\n%s", afterMain)
+	}
+	// The scheme file itself did change, which is the point.
+	written, _ := os.ReadFile(schemePath)
+	if !strings.Contains(string(written), "https://changed.example/api") {
+		t.Fatalf("the scheme file must carry the change, got:\n%s", written)
+	}
+}
+
+// The editor can load and save a scheme that is not running, and saving it must not
+// disturb the traffic the active one is serving.
+func TestAdminSchemeEditorEditsAnInactiveScheme(t *testing.T) {
+	_, activeSchemePath := withDefaultConfig(t)
+	second := filepath.Join(filepath.Dir(activeSchemePath), "other.toml")
+	const otherBody = `protocol = "openai"
+url = "https://other.example/v1"
+key = "sk-other"
+
+[routing]
+sonnet = "other-model"
+`
+	if err := os.WriteFile(second, []byte(otherBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	view := schemeEditorView(t, "other")
+	if view.Name != "other" || view.Active {
+		t.Fatalf("the editor must load an inactive scheme and say it is inactive, got %+v", view)
+	}
+	if view.Upstream.URL != "https://other.example/v1" {
+		t.Fatalf("the editor must show that file's own values, got %+v", view.Upstream)
+	}
+
+	p := schemePayloadFromView(view)
+	p.Upstream.URL = "https://other-changed.example/v1"
+	res := postScheme(t, p, "s3cret")
+	if res.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
+	}
+	var out struct {
+		Applied bool `json:"applied"`
+	}
+	decodeBody(t, res, &out)
+	if out.Applied {
+		t.Fatal("saving an inactive scheme must not claim it is applied")
+	}
+
+	// The running scheme is untouched and still on its own URL.
+	if got := currentScheme().Text.URL; got != "https://anthropic.example/api" {
+		t.Fatalf("the active scheme must be unaffected, got %q", got)
+	}
+	if got := currentConfig().Proxy.Scheme; got != "main" {
+		t.Fatalf("saving another scheme must not switch to it, got %q", got)
+	}
+	written, _ := os.ReadFile(second)
+	if !strings.Contains(string(written), "https://other-changed.example/v1") {
+		t.Fatalf("the inactive scheme file must carry the change, got:\n%s", written)
+	}
+}
+
+// The editor only edits existing files: creating one is a filesystem action, and a
+// save must not invent a scheme the operator cannot see in the directory.
+func TestAdminSchemeSaveRejectsAnUnknownScheme(t *testing.T) {
+	withDefaultConfig(t)
+	p := schemePayloadFromView(schemeEditorView(t, ""))
+	p.Name = "ghost"
+	res := postScheme(t, p, "s3cret")
+	if res.Code != http.StatusNotFound {
+		t.Fatalf("an unknown scheme must be rejected, got %d: %s", res.Code, res.Body.String())
+	}
+}
+
+func TestAdminActivateRejectsMissingAndUnloadableSchemes(t *testing.T) {
+	_, activeSchemePath := withDefaultConfig(t)
+
+	if res := postActivate(t, "ghost", "s3cret"); res.Code != http.StatusBadRequest {
+		t.Fatalf("activating a missing scheme must be rejected, got %d", res.Code)
+	}
+
+	// A file that exists but would not load is refused before it can take the proxy
+	// down on the next request.
+	broken := filepath.Join(filepath.Dir(activeSchemePath), "broken.toml")
+	if err := os.WriteFile(broken, []byte("protocol = \"grpc\"\nurl = \"x\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	res := postActivate(t, "broken", "s3cret")
+	if res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "无法加载") {
+		t.Fatalf("an unloadable scheme must be refused with a reason, got %d: %s", res.Code, res.Body.String())
+	}
+	if got := currentConfig().Proxy.Scheme; got != "main" {
+		t.Fatalf("a refused switch must leave the active scheme alone, got %q", got)
+	}
+}
+
+func TestAdminActivateAlreadyActiveIsANoOp(t *testing.T) {
+	configPath, _ := withDefaultConfig(t)
+	before, _ := os.ReadFile(configPath)
+
+	res := postActivate(t, "main", "s3cret")
+	if res.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
+	}
+	after, _ := os.ReadFile(configPath)
+	if string(after) != string(before) {
+		t.Fatalf("activating the running scheme must not rewrite the main file, got:\n%s", after)
+	}
+}
+
+// The old combined POST is gone: a page still calling it gets a clear error rather
+// than a save that writes files it did not model.
+func TestAdminConfigCombinedPostIsGone(t *testing.T) {
+	withDefaultConfig(t)
+	body, _ := json.Marshal(map[string]interface{}{"proxy": map[string]interface{}{"port": 9000}})
+	w := adminCall(t, handleAdminConfig, http.MethodPost, "/admin/api/config", string(body), "s3cret")
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("the combined save must be refused, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "/admin/api/config/main") {
+		t.Fatalf("the error must name the endpoints that replaced it, got %s", w.Body.String())
+	}
+}
+
+// The three write endpoints are POST-only, and say so rather than failing on a
+// missing body: a client pointed at the wrong verb gets an actionable message.
+func TestAdminWriteEndpointsRejectNonPost(t *testing.T) {
+	withDefaultConfig(t)
+	for _, h := range []http.HandlerFunc{handleAdminSaveMain, handleAdminSaveScheme, handleAdminActivate} {
+		w := adminCall(t, h, http.MethodGet, "/admin/api/config/x", "", "s3cret")
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("GET must be refused, got %d", w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "accepts POST") {
+			t.Fatalf("the error must name the verb, got %s", w.Body.String())
+		}
+	}
+}
+
+// The save that used to fail: an openai text upstream with [vlm] inheriting it. The
+// describe call is framed per protocol now, so there is nothing to reject — and the
+// promise that a [vlm] section may name its own upstream in either protocol holds
+// too.
+func TestAdminSchemeSaveAcceptsVLMOnAnOpenAIUpstream(t *testing.T) {
+	withDefaultConfig(t)
+
+	// Inheriting an openai upstream.
+	p := schemePayloadFromView(schemeEditorView(t, ""))
+	p.Upstream = adminUpstreamPayload{
+		Protocol: protocolOpenAI, URL: "https://openai.example/v1", KeyAction: "keep",
+	}
+	p.VLM = adminVLMPayload{Active: true, Model: "vision-model", Inherit: true}
+	res := postScheme(t, p, "s3cret")
+	if res.Code != http.StatusOK {
+		t.Fatalf("inheriting an openai upstream must be accepted, got %d: %s", res.Code, res.Body.String())
+	}
+	if got := currentScheme().VLM.Upstream.Protocol; got != protocolOpenAI {
+		t.Fatalf("the describe pass must run on the openai upstream, got %q", got)
+	}
+	if !currentScheme().VLMInheritsText {
+		t.Fatal("the section must still be recorded as inheriting")
+	}
+
+	// A [vlm] naming its own openai upstream.
+	p = schemePayloadFromView(schemeEditorView(t, ""))
+	p.VLM = adminVLMPayload{
+		Active: true, Model: "vision-model", Inherit: false,
+		Upstream: adminUpstreamPayload{Protocol: protocolOpenAI, URL: "https://vision.example/v1", KeyAction: "keep"},
+	}
+	res = postScheme(t, p, "s3cret")
+	if res.Code != http.StatusOK {
+		t.Fatalf("an explicit openai [vlm] must be accepted, got %d: %s", res.Code, res.Body.String())
+	}
+	if got := currentScheme().VLM.Upstream.URL; got != "https://vision.example/v1" {
+		t.Fatalf("the [vlm] upstream must be the one written, got %q", got)
+	}
+	// And it must survive a reload from the file, not just live in memory.
+	reloaded, err := parseSchemeFile(schemePath(dirOf(t), "main"), "main")
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.VLM == nil || reloaded.VLM.Upstream.Protocol != protocolOpenAI {
+		t.Fatalf("the written file must keep the openai describe upstream, got %+v", reloaded.VLM)
+	}
+}
+
+// dirOf is the schemes directory of the running config.
+func dirOf(t *testing.T) string {
+	t.Helper()
+	c := currentConfig()
+	return schemesDir(&c)
 }

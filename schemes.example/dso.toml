@@ -35,12 +35,10 @@ key_env = "DEEPSEEK_API_KEY"
 [vlm]
 model = "deepseek-vl"
 max_tokens = 8000
-# This scheme's text upstream is openai, and describe calls speak anthropic, so
-# [vlm] must name an anthropic upstream of its own. (Omit protocol/url only when
-# the text upstream above is anthropic.)
-protocol = "anthropic"
-url = "https://www.sophnet.com/api/open-apis/anthropic"
-key_env = "SOPHNET_API_KEY"
+# No protocol/url here: the describe calls reuse this scheme's text upstream above,
+# and the call format follows that upstream's protocol (openai here, so the image
+# travels as an image_url part). Give [vlm] its own protocol/url/key only when the
+# vision model lives on a different gateway.
 
 # ---- Chat passthrough (optional) ----
 # The OpenAI-compatible /v1/chat/completions endpoint forwards here. Must speak

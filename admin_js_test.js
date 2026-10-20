@@ -301,3 +301,198 @@ test("schemeRoutePayload carries alias, model and the image flag", () => {
   // An entirely blank row is a line the operator left behind.
   assert.equal(admin.schemeRoutePayload("  ", "  ", false), null);
 });
+
+// ---- pagination ----
+
+// An empty list still occupies one page, so the pager shows "第 1 / 1 页 · 共 0 条"
+// instead of a page 0 that the operator cannot leave.
+test("pageCount always reports at least one page", () => {
+  assert.equal(admin.pageCount(0, 20), 1);
+  assert.equal(admin.pageCount(1, 20), 1);
+  assert.equal(admin.pageCount(20, 20), 1);
+  assert.equal(admin.pageCount(21, 20), 2);
+  assert.equal(admin.pageCount(100, 20), 5);
+});
+
+// A zero or unparsable size must not divide by zero into Infinity pages.
+test("pageCount tolerates a nonsensical page size", () => {
+  assert.equal(admin.pageCount(50, 0), 1);
+  assert.equal(admin.pageCount(50, -1), 1);
+  assert.equal(admin.pageCount(50, NaN), 1);
+});
+
+// The page is clamped to the list: a list that shrinks under the operator (a model
+// aging out of the retained window) must not leave them on a page with no rows.
+test("pageWindow clamps a page past the end", () => {
+  const win = admin.pageWindow(45, 9, 20);
+  assert.equal(win.pages, 3);
+  assert.equal(win.page, 3);
+  assert.equal(win.start, 40);
+  assert.equal(win.end, 45);
+});
+
+test("pageWindow clamps a page below the start", () => {
+  const win = admin.pageWindow(45, 0, 20);
+  assert.equal(win.page, 1);
+  assert.equal(win.start, 0);
+  assert.equal(win.end, 20);
+});
+
+// The last page is a partial slice: the bounds have to stop at the row count, or
+// the renderer would emit undefined rows.
+test("pageWindow bounds the last page to the row count", () => {
+  const win = admin.pageWindow(41, 3, 20);
+  assert.equal(win.start, 40);
+  assert.equal(win.end, 41);
+});
+
+test("pageWindow of an empty list yields one empty page", () => {
+  const win = admin.pageWindow(0, 1, 20);
+  assert.deepEqual(win, { page: 1, pages: 1, start: 0, end: 0, total: 0 });
+});
+
+// Every pager button has to advance the same state, including from the edges.
+test("applyPagerAction moves between the edges", () => {
+  const total = 45;
+  const state = { page: 2, size: 20 };
+  assert.equal(admin.applyPagerAction(state, "next", total).page, 3);
+  assert.equal(admin.applyPagerAction(state, "last", total).page, 3);
+  assert.equal(admin.applyPagerAction(state, "prev", total).page, 2);
+  assert.equal(admin.applyPagerAction(state, "first", total).page, 1);
+  // Next on the last page stays put rather than running off the end.
+  assert.equal(admin.applyPagerAction({ page: 3, size: 20 }, "next", total).page, 3);
+  assert.equal(admin.applyPagerAction({ page: 1, size: 20 }, "prev", total).page, 1);
+});
+
+// The bar has to disable the buttons that would do nothing, so the operator is not
+// left clicking a control that silently has no effect.
+test("pagerHTML disables the buttons at the edges", () => {
+  // A button's attributes carry data-pager too, so match the whole tag.
+  const disabled = (html, action) =>
+    new RegExp('<button[^>]*data-pager-action="' + action + '"[^>]*\\bdisabled>').test(html);
+
+  const first = admin.pagerHTML("models", { page: 1, pages: 3, start: 0, end: 20, total: 45 }, 20);
+  assert.ok(disabled(first, "first"), "first must be disabled on page 1");
+  assert.ok(disabled(first, "prev"), "prev must be disabled on page 1");
+  assert.ok(!disabled(first, "next"), "next must stay enabled on page 1");
+
+  const last = admin.pagerHTML("models", { page: 3, pages: 3, start: 40, end: 45, total: 45 }, 20);
+  assert.ok(disabled(last, "next"), "next must be disabled on the last page");
+  assert.ok(disabled(last, "last"), "last must be disabled on the last page");
+  assert.ok(!disabled(last, "prev"), "prev must stay enabled on the last page");
+});
+
+test("pagerHTML reports the position and the total", () => {
+  const html = admin.pagerHTML("failures", { page: 2, pages: 4, start: 20, end: 40, total: 73 }, 20);
+  assert.match(html, /第 2 \/ 4 页/);
+  assert.match(html, /共 73 条/);
+});
+
+// The size selector has to show the size in force, or changing it would look like
+// it did not take.
+test("pagerHTML marks the current page size", () => {
+  const html = admin.pagerHTML("models", { page: 1, pages: 1, start: 0, end: 10, total: 10 }, 50);
+  assert.match(html, /<option value="50" selected>/);
+  assert.doesNotMatch(html, /<option value="20" selected>/);
+});
+
+// ---- page routing ----
+
+// The four views are separate pages. An unknown or empty hash must land on the
+// first one rather than showing nothing.
+test("normalisePage maps an unknown hash to the first view", () => {
+  assert.equal(admin.normalisePage(""), "usage");
+  assert.equal(admin.normalisePage("#"), "usage");
+  assert.equal(admin.normalisePage("#/nope"), "usage");
+  assert.equal(admin.normalisePage("#nope"), "usage");
+});
+
+test("normalisePage accepts every view it advertises", () => {
+  admin.viewPages.forEach((name) => {
+    assert.equal(admin.normalisePage("#/" + name), name);
+    assert.equal(admin.normalisePage(name), name);
+  });
+});
+
+test("the view list covers the four requested pages", () => {
+  assert.deepEqual(admin.viewPages.slice().sort(), ["errors", "main", "schemes", "usage"]);
+});
+
+// ---- paged editing ----
+
+// A paged editor only has one page of rows in the DOM, so the save payload must
+// carry the aliases from the other pages too. Reading the DOM alone would delete
+// every alias the operator was not looking at — the worst failure this paging
+// could introduce, and a silent one.
+test("readRouting keeps the aliases on other pages", () => {
+  const path = require.resolve("./admin.js");
+  const savedWindow = global.window;
+  // The module exports helpers only when no DOM exists at require time.
+  delete require.cache[path];
+  global.window = { addEventListener() {}, localStorage: { getItem: () => null, setItem() {} } };
+  const isolated = require("./admin.js");
+
+  const rows = [];
+  const rowEl = (alias, model) => ({
+    querySelector: (sel) => ({
+      ".r-alias": { value: alias },
+      ".r-model": { value: model },
+      ".r-image": { checked: false },
+    })[sel],
+  });
+  global.document = {
+    querySelectorAll: (sel) => (sel === "#routing .route-row" ? rows : []),
+    getElementById: () => null,
+  };
+
+  try {
+    isolated.__setRoutingEntries(
+      ["a0", "a1", "a2", "a3", "a4", "a5"].map((a, i) => ({ alias: a, model: "m" + i })),
+      { page: 2, size: 2 },
+    );
+    // The DOM holds page 2 only; the operator edits a2 there.
+    rows.push(rowEl("a2", "m2-edited"), rowEl("a3", "m3"));
+
+    const out = isolated.__readRouting();
+    assert.equal(out.error, null);
+    assert.deepEqual(out.entries.map((e) => e.alias), ["a0", "a1", "a2", "a3", "a4", "a5"]);
+    // The edit made on the visible page is the one that lands; the rest are carried.
+    assert.equal(out.entries[2].model, "m2-edited");
+    assert.equal(out.entries[0].model, "m0");
+    assert.equal(out.entries[5].model, "m5");
+  } finally {
+    delete require.cache[path];
+    global.window = savedWindow;
+    delete global.document;
+  }
+});
+
+// A half-filled row on the visible page still fails the save, even though the rest
+// of the table is carried over.
+test("readRouting still reports a half-filled visible row", () => {
+  const path = require.resolve("./admin.js");
+  delete require.cache[path];
+  global.window = { addEventListener() {}, localStorage: { getItem: () => null, setItem() {} } };
+  const isolated = require("./admin.js");
+
+  const rows = [{
+    querySelector: (sel) => ({
+      ".r-alias": { value: "only-model" },
+      ".r-model": { value: "" },
+      ".r-image": { checked: false },
+    })[sel],
+  }];
+  global.document = {
+    querySelectorAll: (sel) => (sel === "#routing .route-row" ? rows : []),
+    getElementById: () => null,
+  };
+
+  try {
+    isolated.__setRoutingEntries([], { page: 1, size: 20 });
+    const out = isolated.__readRouting();
+    assert.match(out.error, /缺少上游模型名/);
+  } finally {
+    delete require.cache[path];
+    delete global.document;
+  }
+});

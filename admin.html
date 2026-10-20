@@ -97,14 +97,39 @@
   header h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .01em; white-space: nowrap; }
   header .meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
   header .spacer { flex: 1; }
-  /* Section jump links: the page is long enough that scrolling to the config form
-     was the main way operators wasted time. */
-  nav.jump { display: flex; gap: 2px; flex-wrap: wrap; }
-  nav.jump a {
-    color: var(--muted); text-decoration: none; font-size: 12px;
-    padding: 4px 9px; border-radius: 6px; white-space: nowrap;
+  /* Page tabs. Each view is its own page rather than a section of one long
+     document: stats and configuration answer different questions and were only
+     sharing a scrollbar. */
+  nav.pages { display: flex; gap: 2px; flex-wrap: wrap; }
+  nav.pages a {
+    color: var(--muted); text-decoration: none; font-size: 13px;
+    padding: 5px 12px; border-radius: 7px; white-space: nowrap;
+    border: 1px solid transparent;
   }
-  nav.jump a:hover { color: var(--text); background: var(--panel-sunken); }
+  nav.pages a:hover { color: var(--text); background: var(--panel-sunken); }
+  nav.pages a[aria-current="page"] {
+    color: var(--text); background: var(--accent-soft); border-color: var(--accent);
+    font-weight: 600;
+  }
+  /* Only the current page is rendered; the rest stay in the document so their
+     controls keep their ids and state across a switch. */
+  .page { display: none; }
+  .page.is-active { display: block; }
+  /* Pagination bar shared by the model, failure and routing lists. */
+  .pager {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 8px 12px; border-bottom: 1px solid var(--border);
+    font-size: 12px; color: var(--muted);
+  }
+  .pager button { padding: 3px 9px; font-size: 12px; }
+  .pager button:disabled { opacity: .4; cursor: default; }
+  .pager .pager-info { font-variant-numeric: tabular-nums; }
+  .pager .pager-size { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+  .pager select { font: inherit; font-size: 12px; padding: 2px 4px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text); }
+  /* The routing editor sits on its own page, so its rows can be wider. */
+  #routing .route-row { padding: 8px 16px; }
+  #routing .route-row.empty-page { padding: 18px 16px; color: var(--muted); text-align: center; }
   main { padding: 20px 24px; max-width: 1440px; margin: 0 auto; }
   section { margin-bottom: 26px; scroll-margin-top: 64px; }
   section > h2 {
@@ -159,8 +184,6 @@
   .route-row { display: grid; grid-template-columns: 1.2fr 1.6fr 1fr auto auto auto; gap: 10px; align-items: end; padding: 10px 16px; border-bottom: 1px solid var(--border); }
   .route-row:last-child { border-bottom: none; }
   .route-row input[type=checkbox] { width: auto; }
-  /* A model-table row inside the scheme's mapping table. */
-  #routing .route-row { padding: 8px 16px; }
   .chk { display: flex; align-items: center; gap: 6px; padding-bottom: 8px; font-size: 13px; }
   .chk label { margin: 0; color: var(--text); }
   .banner { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 13px; display: none; white-space: pre-wrap; }
@@ -208,16 +231,15 @@
 <header>
   <h1>llm-proxy</h1>
   <span class="meta" id="head-meta">加载中…</span>
-  <nav class="jump">
-    <a href="#sec-overview">总览</a>
-    <a href="#sec-history">历史速率</a>
-    <a href="#sec-models">模型调用</a>
-    <a href="#sec-failures">失败</a>
-    <a href="#sec-config">配置</a>
+  <nav class="pages" id="nav-pages">
+    <a href="#/usage" data-page="usage">用量统计</a>
+    <a href="#/errors" data-page="errors">报错统计</a>
+    <a href="#/main" data-page="main">主配置</a>
+    <a href="#/schemes" data-page="schemes">方案文件</a>
   </nav>
   <span class="spacer"></span>
   <span class="legend" id="refresh-legend"></span>
-  <button id="btn-refresh" title="立即拉取最新统计">刷新</button>
+  <button id="btn-refresh" title="立即拉取最新数据">刷新</button>
   <button id="btn-auto" title="每 5 秒自动刷新统计">暂停自动刷新</button>
   <button id="btn-theme" class="icon" title="切换明暗配色" aria-label="切换明暗配色">◐</button>
   <button id="btn-reset" class="danger" title="把所有调用统计归零，此操作不可撤销">清零统计</button>
@@ -226,148 +248,194 @@
 <main>
   <div id="banner" class="banner"></div>
 
-  <section id="sec-overview">
-    <h2>总览</h2>
-    <div class="cards" id="totals"></div>
-  </section>
-  <section id="sec-history">
-    <h2>历史速率</h2>
-    <div class="panel">
-      <div class="chart-head" id="history-controls"></div>
-      <div class="chart-wrap"><div id="history-chart"></div></div>
-      <div id="history-summary"></div>
-      <div class="hint" id="history-meta" style="padding:0 16px 12px; margin:0"></div>
-    </div>
-  </section>
-
-  <section id="sec-models">
-    <h2>模型调用情况</h2>
-    <div class="panel scroll" id="models"></div>
-  </section>
-
-  <section id="sec-failures">
-    <h2>失败情况</h2>
-    <div class="panel scroll" id="failures"></div>
-  </section>
-
-  <section id="sec-config">
-    <h2>配置</h2>
-    <div id="save-banner" class="banner"></div>
-    <div class="panel">
-      <div class="form-body">
-        <div class="grid">
-          <div>
-            <label>监听端口</label>
-            <input type="number" id="cfg-port" min="1" max="65535">
-            <div class="hint">端口变更需重启服务，其余配置保存即生效。</div>
-          </div>
-          <div>
-            <label>生效方案</label>
-            <select id="cfg-scheme"></select>
-            <div class="hint" id="cfg-scheme-hint">每份方案是一个完整的上游配置，同一时刻只有一份生效。</div>
-          </div>
-        </div>
-        <div class="hint" id="cfg-paths" style="margin-top:8px"></div>
+  <!-- 用量统计 -->
+  <div class="page" data-page="usage">
+    <section>
+      <h2>总览</h2>
+      <div class="cards" id="totals"></div>
+    </section>
+    <section>
+      <h2>历史速率</h2>
+      <div class="panel">
+        <div class="chart-head" id="history-controls"></div>
+        <div class="chart-wrap"><div id="history-chart"></div></div>
+        <div id="history-summary"></div>
+        <div class="hint" id="history-meta" style="padding:0 16px 12px; margin:0"></div>
       </div>
+    </section>
+    <section>
+      <h2>模型调用情况</h2>
+      <div class="panel">
+        <div class="pager" id="models-pager"></div>
+        <div class="scroll" id="models"></div>
+      </div>
+    </section>
+  </div>
 
-      <div style="border-top:1px solid var(--border)">
-        <div class="form-body" style="padding-bottom:8px">
-          <strong style="font-size:13px">主上游（文本模型）</strong>
-          <span class="hint" style="margin-left:10px">当前生效方案的顶层配置：Claude Code 的 /v1/messages 请求最终发到这里。</span>
-        </div>
+  <!-- 报错统计 -->
+  <div class="page" data-page="errors">
+    <section>
+      <h2>失败情况</h2>
+      <div class="panel">
+        <div class="pager" id="failures-pager"></div>
+        <div class="scroll" id="failures"></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- 主配置 -->
+  <div class="page" data-page="main">
+    <section>
+      <h2>主配置</h2>
+      <div id="main-banner" class="banner"></div>
+      <div class="panel">
         <div class="form-body">
-          <div class="grid wide" id="up-main"></div>
-        </div>
-      </div>
-
-      <div style="border-top:1px solid var(--border)">
-        <div class="form-body" style="padding-bottom:8px">
-          <strong style="font-size:13px">图片描述（VLM）</strong>
-          <span class="hint" style="margin-left:10px">带图请求先由视觉模型描述，再用文本发给主上游。</span>
-        </div>
-        <div class="form-body">
-          <div class="chk" style="margin-bottom:10px">
-            <input type="checkbox" id="cfg-vlm-active">
-            <label for="cfg-vlm-active">启用图片描述</label>
-            <span class="hint" style="margin-left:8px">关闭后带图请求原样转发给主上游，由其自行处理。</span>
-          </div>
-          <div id="vlm-body">
-            <div class="grid wide">
-              <div><label>视觉模型</label><input type="text" id="cfg-vlm-model"></div>
-              <div><label>每次最大输出 token</label><input type="number" id="cfg-vlm-max-tokens" min="0"></div>
+          <div class="grid">
+            <div>
+              <label>监听端口</label>
+              <input type="number" id="cfg-port" min="1" max="65535">
+              <div class="hint">端口变更需重启服务，其余配置保存即生效。</div>
             </div>
-            <div class="chk" style="margin:10px 0">
-              <input type="checkbox" id="cfg-vlm-inherit">
-              <label for="cfg-vlm-inherit">沿用主上游</label>
-              <span class="hint" style="margin-left:8px">勾选后描述调用走上面的主上游地址（要求 anthropic 协议），否则在下面单独配置。</span>
+            <div>
+              <label>当前生效方案</label>
+              <input type="text" id="cfg-active-scheme" readonly>
+              <div class="hint">切换方案在「方案文件」页面操作，这里只展示。</div>
             </div>
-            <div class="grid wide" id="up-vlm"></div>
           </div>
+          <div class="hint" id="cfg-paths" style="margin-top:8px"></div>
         </div>
-      </div>
-
-      <div style="border-top:1px solid var(--border)">
-        <div class="form-body" style="padding-bottom:8px">
-          <strong style="font-size:13px">chat 透传</strong>
-          <span class="hint" style="margin-left:10px">OpenAI 兼容端点 /v1/chat/completions 走哪个上游。</span>
-        </div>
-        <div class="form-body">
-          <div class="chk" style="margin-bottom:10px">
-            <input type="checkbox" id="cfg-chat-available">
-            <label for="cfg-chat-available">启用 chat 透传</label>
-            <span class="hint" style="margin-left:8px">关闭后该端点返回 502。要求 openai 协议的上游。</span>
-          </div>
-          <div id="chat-body">
-            <div class="chk" style="margin:0 0 10px">
-              <input type="checkbox" id="cfg-chat-inherit">
-              <label for="cfg-chat-inherit">沿用主上游</label>
-              <span class="hint" style="margin-left:8px">勾选后透传走上面的主上游地址（要求 openai 协议），否则在下面单独配置。</span>
-            </div>
-            <div class="grid wide" id="up-chat"></div>
-          </div>
-        </div>
-      </div>
-
-      <div style="border-top:1px solid var(--border)">
-        <div class="form-body" style="padding-bottom:8px; display:flex; align-items:center;">
-          <strong style="font-size:13px">模型映射表</strong>
-          <span class="hint" style="margin:0 0 0 10px">别名即客户端请求的模型名，映射到本方案的模型名。未声明的别名原样转发；haiku 未声明时沿用 sonnet。</span>
-        </div>
-        <div id="routing"></div>
         <div class="form-body" style="border-top:1px solid var(--border)">
-          <button id="btn-add-route">添加别名</button>
-        </div>
-      </div>
-
-      <div class="form-body" style="border-top:1px solid var(--border)">
-        <div class="grid">
-          <div>
-            <label>管理页面口令</label>
-            <input type="password" id="cfg-admin-token" placeholder="留空则保持原口令不变" autocomplete="new-password">
-            <div class="hint" id="cfg-admin-hint"></div>
+          <div class="grid">
+            <div>
+              <label>管理页面口令</label>
+              <input type="password" id="cfg-admin-token" placeholder="留空则保持原口令不变" autocomplete="new-password">
+              <div class="hint" id="cfg-admin-hint"></div>
+            </div>
+            <div class="chk"><input type="checkbox" id="cfg-admin-clear"><label for="cfg-admin-clear">清除口令（关闭管理页面）</label></div>
           </div>
-          <div class="chk"><input type="checkbox" id="cfg-admin-clear"><label for="cfg-admin-clear">清除口令（关闭管理页面）</label></div>
+        </div>
+        <div class="form-actions">
+          <button class="primary" id="btn-save-main">保存主配置</button>
+          <button id="btn-reload-main">放弃修改</button>
+          <span class="hint" id="main-save-hint" style="margin:0"></span>
         </div>
       </div>
+      <div class="hint">保存会先备份为 <code>&lt;配置文件&gt;.bak.&lt;时间戳&gt;</code>，再原子写入并立即生效（端口变更除外，需重启服务）。</div>
+    </section>
+  </div>
 
-      <div style="border-top:1px solid var(--border)">
-        <div class="form-body" style="padding-bottom:8px; display:flex; align-items:center;">
-          <strong style="font-size:13px">生效路由</strong>
-        </div>
+  <!-- 方案文件 -->
+  <div class="page" data-page="schemes">
+    <section>
+      <h2>方案文件</h2>
+      <div id="scheme-banner" class="banner"></div>
+      <div class="panel">
         <div class="form-body">
-          <div class="hint" style="margin:0 0 8px">经过 haiku 兜底之后，每个别名实际走哪个模型。这里的内容不会被保存。</div>
-          <div id="effective-routes"></div>
+          <div class="grid">
+            <div>
+              <label>编辑哪个方案</label>
+              <select id="cfg-scheme"></select>
+              <div class="hint" id="cfg-scheme-hint"></div>
+            </div>
+            <div>
+              <label>状态</label>
+              <div id="cfg-scheme-state" style="padding-top:6px"></div>
+              <div class="hint">切换只改主配置里选中的方案，不改动任何方案文件。</div>
+            </div>
+          </div>
+          <div class="hint" id="cfg-scheme-path" style="margin-top:8px"></div>
+        </div>
+        <div class="form-actions" style="border-top:1px solid var(--border)">
+          <button class="primary" id="btn-activate">启用该方案</button>
+          <span class="hint" id="activate-hint" style="margin:0"></span>
+        </div>
+
+        <div style="border-top:1px solid var(--border)">
+          <div class="form-body" style="padding-bottom:8px">
+            <strong style="font-size:13px">主上游（文本模型）</strong>
+            <span class="hint" style="margin-left:10px">该方案的顶层配置：Claude Code 的 /v1/messages 请求最终发到这里。</span>
+          </div>
+          <div class="form-body"><div class="grid wide" id="up-main"></div></div>
+        </div>
+
+        <div style="border-top:1px solid var(--border)">
+          <div class="form-body" style="padding-bottom:8px">
+            <strong style="font-size:13px">图片描述（VLM）</strong>
+            <span class="hint" style="margin-left:10px">带图请求先由视觉模型描述，再用文本发给主上游。</span>
+          </div>
+          <div class="form-body">
+            <div class="chk" style="margin-bottom:10px">
+              <input type="checkbox" id="cfg-vlm-active">
+              <label for="cfg-vlm-active">启用图片描述</label>
+              <span class="hint" style="margin-left:8px">关闭后带图请求原样转发给主上游，由其自行处理。</span>
+            </div>
+            <div id="vlm-body">
+              <div class="grid wide">
+                <div><label>视觉模型</label><input type="text" id="cfg-vlm-model"></div>
+                <div><label>每次最大输出 token</label><input type="number" id="cfg-vlm-max-tokens" min="0"></div>
+              </div>
+              <div class="chk" style="margin:10px 0">
+                <input type="checkbox" id="cfg-vlm-inherit">
+                <label for="cfg-vlm-inherit">沿用主上游</label>
+                <span class="hint" style="margin-left:8px">勾选后描述调用走上面的主上游地址（其协议决定调用格式），否则在下面单独配置。</span>
+              </div>
+              <div class="grid wide" id="up-vlm"></div>
+            </div>
+          </div>
+        </div>
+
+        <div style="border-top:1px solid var(--border)">
+          <div class="form-body" style="padding-bottom:8px">
+            <strong style="font-size:13px">chat 透传</strong>
+            <span class="hint" style="margin-left:10px">OpenAI 兼容端点 /v1/chat/completions 走哪个上游。</span>
+          </div>
+          <div class="form-body">
+            <div class="chk" style="margin-bottom:10px">
+              <input type="checkbox" id="cfg-chat-available">
+              <label for="cfg-chat-available">启用 chat 透传</label>
+              <span class="hint" style="margin-left:8px">关闭后该端点返回 502。要求 openai 协议的上游。</span>
+            </div>
+            <div id="chat-body">
+              <div class="chk" style="margin:0 0 10px">
+                <input type="checkbox" id="cfg-chat-inherit">
+                <label for="cfg-chat-inherit">沿用主上游</label>
+                <span class="hint" style="margin-left:8px">勾选后透传走上面的主上游地址（要求 openai 协议），否则在下面单独配置。</span>
+              </div>
+              <div class="grid wide" id="up-chat"></div>
+            </div>
+          </div>
+        </div>
+
+        <div style="border-top:1px solid var(--border)">
+          <div class="form-body" style="padding-bottom:8px; display:flex; align-items:center;">
+            <strong style="font-size:13px">模型映射表</strong>
+            <span class="hint" style="margin:0 0 0 10px">别名即客户端请求的模型名，映射到本方案的模型名。未声明的别名原样转发；haiku 未声明时沿用 sonnet。</span>
+          </div>
+          <div class="pager" id="routing-pager"></div>
+          <div id="routing"></div>
+          <div class="form-body" style="border-top:1px solid var(--border)">
+            <button id="btn-add-route">添加别名</button>
+          </div>
+        </div>
+
+        <div style="border-top:1px solid var(--border)">
+          <div class="form-body" style="padding-bottom:8px; display:flex; align-items:center;">
+            <strong style="font-size:13px">生效路由</strong>
+          </div>
+          <div class="form-body">
+            <div class="hint" style="margin:0 0 8px">经过 haiku 兜底之后，每个别名实际走哪个模型。这里的内容不会被保存。</div>
+            <div id="effective-routes"></div>
+          </div>
+        </div>
+        <div class="form-actions">
+          <button class="primary" id="btn-save-scheme">保存方案</button>
+          <button id="btn-reload-scheme">放弃修改</button>
+          <span class="hint" id="scheme-save-hint" style="margin:0"></span>
         </div>
       </div>
-      <div class="form-actions">
-        <button class="primary" id="btn-save">保存配置</button>
-        <button id="btn-reload">放弃修改</button>
-        <span class="hint" id="save-hint" style="margin:0"></span>
-      </div>
-    </div>
-    <div class="hint">保存会先备份为 <code>&lt;配置文件&gt;.bak.&lt;时间戳&gt;</code>，再原子写入并立即生效（端口变更除外，需重启服务）。</div>
-  </section>
-</main>
+    </section>
+  </div>
+</main></main>
 
 <div class="tip" id="history-tip" role="tooltip"></div>
 

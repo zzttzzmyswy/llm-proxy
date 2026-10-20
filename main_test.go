@@ -1243,3 +1243,114 @@ func ssePayload(stream, wantEvent string) string {
 	}
 	return ""
 }
+
+// A scheme whose text upstream speaks openai can describe images on that same
+// gateway: no second, anthropic upstream is needed. The describe call has to be
+// framed as a chat-completions request with the image as an image_url part, and the
+// reply parsed from `choices[0].message.content`.
+func TestVLMDescribeSpeaksOpenAIWhenTheUpstreamDoes(t *testing.T) {
+	resetImageDescCacheForTests()
+	t.Cleanup(resetImageDescCacheForTests)
+
+	var mu sync.Mutex
+	var describeBody, finalBody string
+	var describeAuth, describeAPIKey string
+	calls := 0
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		json.Unmarshal(b, &m)
+		model, _ := m["model"].(string)
+
+		mu.Lock()
+		calls++
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if model == "vision-model" {
+			mu.Lock()
+			describeBody = string(b)
+			describeAuth = r.Header.Get("Authorization")
+			describeAPIKey = r.Header.Get("x-api-key")
+			mu.Unlock()
+			// An OpenAI chat-completions reply, not an Anthropic message.
+			io.WriteString(w, `{"id":"c1","model":"vision-model","choices":[{"index":0,"message":{"role":"assistant","content":"openai 描述的图片"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}`)
+			return
+		}
+		mu.Lock()
+		finalBody = string(b)
+		mu.Unlock()
+		io.WriteString(w, `{"id":"c2","model":"text-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":2}}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	// One openai gateway serves both the text model and the vision model, and [vlm]
+	// inherits it — the shape that used to be rejected at save time.
+	withSchemeChat(t, upstream.URL)
+	withVLM(t, "vision-model", 8000)
+	setRoute(t, "sonnet", "text-model", "")
+
+	resp := callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"这是什么"}]}]}`)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("expected a describe call and a text call, got %d", calls)
+	}
+
+	// The describe call is chat-completions shaped, carries the image as a data URL
+	// image_url part, and is authenticated with a bearer token.
+	if !strings.Contains(describeBody, `"image_url"`) {
+		t.Fatalf("the describe call must carry an image_url part, got: %s", describeBody)
+	}
+	if !strings.Contains(describeBody, `data:image/png;base64,AAAA`) {
+		t.Fatalf("the image must travel as a data URL, got: %s", describeBody)
+	}
+	if strings.Contains(describeBody, `"type":"image"`) {
+		t.Fatalf("an Anthropic image block must not reach an openai upstream, got: %s", describeBody)
+	}
+	if !strings.Contains(describeBody, `"role":"user"`) {
+		t.Fatalf("the describe call must be a chat message, got: %s", describeBody)
+	}
+	// The auth header follows the protocol too: openai upstreams take a bearer
+	// token, and sending x-api-key instead would authenticate as nobody.
+	if !strings.HasPrefix(describeAuth, "Bearer ") {
+		t.Fatalf("an openai describe call must use a bearer token, got Authorization=%q", describeAuth)
+	}
+	if describeAPIKey != "" {
+		t.Fatalf("an openai describe call must not send x-api-key, got %q", describeAPIKey)
+	}
+	if !strings.Contains(describeBody, `"model":"vision-model"`) {
+		t.Fatalf("the describe call must name the vision model, got: %s", describeBody)
+	}
+
+	// The description reached the text model in place of the image.
+	if !strings.Contains(finalBody, "openai 描述的图片") {
+		t.Fatalf("the text request must carry the description, got: %s", finalBody)
+	}
+	if strings.Contains(finalBody, `"image_url"`) {
+		t.Fatalf("the text request must not still carry the image, got: %s", finalBody)
+	}
+	if !strings.Contains(resp, "ok") {
+		t.Fatalf("the client must receive the text reply, got: %q", resp)
+	}
+}
+
+// A describe reply whose content arrives as parts (some gateways do that without
+// streaming) must still be read, not treated as an empty description.
+func TestExtractOpenAIChatTextHandlesPartContent(t *testing.T) {
+	got := extractOpenAIChatText([]byte(`{"choices":[{"message":{"content":[{"type":"text","text":"a"},{"type":"text","text":"b"}]}}]}`))
+	if got != "ab" {
+		t.Fatalf("part content must be concatenated, got %q", got)
+	}
+	if got := extractOpenAIChatText([]byte(`{"choices":[{"message":{"content":"plain"}}]}`)); got != "plain" {
+		t.Fatalf("plain content must be read, got %q", got)
+	}
+	if got := extractOpenAIChatText([]byte(`{}`)); got != "" {
+		t.Fatalf("a reply with no choices must read as empty, got %q", got)
+	}
+	if got := extractOpenAIChatText([]byte(`not json`)); got != "" {
+		t.Fatalf("an unparsable reply must read as empty, got %q", got)
+	}
+}
