@@ -159,43 +159,8 @@
   .route-row { display: grid; grid-template-columns: 1.2fr 1.6fr 1fr auto auto auto; gap: 10px; align-items: end; padding: 10px 16px; border-bottom: 1px solid var(--border); }
   .route-row:last-child { border-bottom: none; }
   .route-row input[type=checkbox] { width: auto; }
-  /* A profile carries two control lines — the upstream itself and the describe
-     pass it owns — so it is a card with its own grid rather than a .route-row. */
-  .profile-row { display: block; padding: 12px 16px; }
-  .profile-row.is-builtin { background: var(--panel-sunken); }
-  .profile-row .p-fields {
-    display: grid; gap: 10px; align-items: end;
-    grid-template-columns: 1fr 0.9fr 1.6fr 1fr 1.1fr auto 0.7fr 0.7fr 0.7fr auto;
-  }
-  .profile-row .p-vlm {
-    display: grid; gap: 10px; align-items: end; margin-top: 10px;
-    padding: 10px 12px; border: 1px dashed var(--border); border-radius: 8px;
-    background: var(--panel-sunken);
-    grid-template-columns: auto 1.4fr 0.7fr 1.2fr;
-  }
-  .profile-row .p-vlm-label {
-    font-size: 11px; font-weight: 650; color: var(--muted);
-    text-transform: uppercase; letter-spacing: .05em; white-space: nowrap;
-    align-self: end; padding-bottom: 8px;
-  }
-  .profile-row .p-hint { margin-top: 8px; }
-  /* A scheme's own model table: a compact list inside the profile card. */
-  .profile-row .p-routes-wrap {
-    margin-top: 10px; padding: 10px 12px; border: 1px dashed var(--border); border-radius: 8px;
-    background: var(--panel-sunken);
-  }
-  .profile-row .p-routes-head {
-    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 6px;
-  }
-  .profile-row .p-routes-head .p-vlm-label { padding-bottom: 0; }
-  .profile-row .p-routes-head .hint { margin: 0; flex: 1; }
-  .profile-row .p-route-row {
-    display: grid; grid-template-columns: 1.2fr 1.6fr auto auto;
-    gap: 10px; align-items: end; padding: 6px 0;
-  }
-  .profile-row .p-route-row + .p-route-row { border-top: 1px solid var(--border); }
-  .profile-row .p-routes .empty { padding: 8px 0; text-align: left; font-size: 12px; }
-  .profile-list-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; padding: 0 16px 8px; }
+  /* A model-table row inside the scheme's mapping table. */
+  #routing .route-row { padding: 8px 16px; }
   .chk { display: flex; align-items: center; gap: 6px; padding-bottom: 8px; font-size: 13px; }
   .chk label { margin: 0; color: var(--text); }
   .banner { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 13px; display: none; white-space: pre-wrap; }
@@ -291,56 +256,89 @@
     <div class="panel">
       <div class="form-body">
         <div class="grid">
-          <div><label>监听端口</label><input type="number" id="cfg-port" min="1" max="65535"></div>
-          <div><label>VLM 模型（图片描述）</label><input type="text" id="cfg-vlm-model"></div>
-          <div><label>VLM 最大输出 token</label><input type="number" id="cfg-vlm-max-tokens" min="0"></div>
           <div>
-            <label>VLM 上游 profile</label>
-            <select id="cfg-vlm-upstream"></select>
-            <div class="hint">图片描述调用走哪个上游，只列 anthropic 协议的 profile。</div>
+            <label>监听端口</label>
+            <input type="number" id="cfg-port" min="1" max="65535">
+            <div class="hint">端口变更需重启服务，其余配置保存即生效。</div>
           </div>
           <div>
-            <label>chat 透传上游 profile</label>
-            <select id="cfg-chat-upstream"></select>
-            <div class="hint">/v1/chat/completions 走哪个上游，只列 openai 协议的 profile。</div>
+            <label>生效方案</label>
+            <select id="cfg-scheme"></select>
+            <div class="hint" id="cfg-scheme-hint">每份方案是一个完整的上游配置，同一时刻只有一份生效。</div>
+          </div>
+        </div>
+        <div class="hint" id="cfg-paths" style="margin-top:8px"></div>
+      </div>
+
+      <div style="border-top:1px solid var(--border)">
+        <div class="form-body" style="padding-bottom:8px">
+          <strong style="font-size:13px">主上游（文本模型）</strong>
+          <span class="hint" style="margin-left:10px">当前生效方案的顶层配置：Claude Code 的 /v1/messages 请求最终发到这里。</span>
+        </div>
+        <div class="form-body">
+          <div class="grid wide" id="up-main"></div>
+        </div>
+      </div>
+
+      <div style="border-top:1px solid var(--border)">
+        <div class="form-body" style="padding-bottom:8px">
+          <strong style="font-size:13px">图片描述（VLM）</strong>
+          <span class="hint" style="margin-left:10px">带图请求先由视觉模型描述，再用文本发给主上游。</span>
+        </div>
+        <div class="form-body">
+          <div class="chk" style="margin-bottom:10px">
+            <input type="checkbox" id="cfg-vlm-active">
+            <label for="cfg-vlm-active">启用图片描述</label>
+            <span class="hint" style="margin-left:8px">关闭后带图请求原样转发给主上游，由其自行处理。</span>
+          </div>
+          <div id="vlm-body">
+            <div class="grid wide">
+              <div><label>视觉模型</label><input type="text" id="cfg-vlm-model"></div>
+              <div><label>每次最大输出 token</label><input type="number" id="cfg-vlm-max-tokens" min="0"></div>
+            </div>
+            <div class="chk" style="margin:10px 0">
+              <input type="checkbox" id="cfg-vlm-inherit">
+              <label for="cfg-vlm-inherit">沿用主上游</label>
+              <span class="hint" style="margin-left:8px">勾选后描述调用走上面的主上游地址（要求 anthropic 协议），否则在下面单独配置。</span>
+            </div>
+            <div class="grid wide" id="up-vlm"></div>
           </div>
         </div>
       </div>
-      <div class="form-body" style="border-top:1px solid var(--border)">
-        <div class="grid wide">
-          <div><label>Anthropic 上游地址</label><input type="text" id="cfg-anthropic-url"></div>
-          <div><label>OpenAI 上游地址</label><input type="text" id="cfg-openai-url"></div>
-          <div>
-            <label>默认网关</label>
-            <select id="cfg-default-upstream"></select>
-            <div class="hint">sonnet / opus / haiku 这三个内置别名没有任何 profile 的模型表声明时，走哪个 profile。</div>
+
+      <div style="border-top:1px solid var(--border)">
+        <div class="form-body" style="padding-bottom:8px">
+          <strong style="font-size:13px">chat 透传</strong>
+          <span class="hint" style="margin-left:10px">OpenAI 兼容端点 /v1/chat/completions 走哪个上游。</span>
+        </div>
+        <div class="form-body">
+          <div class="chk" style="margin-bottom:10px">
+            <input type="checkbox" id="cfg-chat-available">
+            <label for="cfg-chat-available">启用 chat 透传</label>
+            <span class="hint" style="margin-left:8px">关闭后该端点返回 502。要求 openai 协议的上游。</span>
           </div>
-          <div><label>响应头超时（秒）</label><input type="number" id="cfg-header-timeout" min="0"></div>
-          <div><label>响应体静默上限（秒）</label><input type="number" id="cfg-body-idle" min="0"></div>
-          <div><label>瞬态重试次数</label><input type="number" id="cfg-max-retries" min="0"></div>
+          <div id="chat-body">
+            <div class="chk" style="margin:0 0 10px">
+              <input type="checkbox" id="cfg-chat-inherit">
+              <label for="cfg-chat-inherit">沿用主上游</label>
+              <span class="hint" style="margin-left:8px">勾选后透传走上面的主上游地址（要求 openai 协议），否则在下面单独配置。</span>
+            </div>
+            <div class="grid wide" id="up-chat"></div>
+          </div>
         </div>
       </div>
-      <div class="form-body" style="border-top:1px solid var(--border)">
-        <div class="grid">
-          <div>
-            <label>上游密钥</label>
-            <input type="password" id="cfg-sophnet" placeholder="留空则保持原密钥不变" autocomplete="new-password">
-            <div class="hint" id="cfg-key-hint"></div>
-          </div>
-          <div class="chk"><input type="checkbox" id="cfg-key-clear"><label for="cfg-key-clear">清除已保存的密钥</label></div>
-        </div>
-      </div>
+
       <div style="border-top:1px solid var(--border)">
         <div class="form-body" style="padding-bottom:8px; display:flex; align-items:center;">
-          <strong style="font-size:13px">上游 profile</strong>
-          <span class="hint" style="margin:0 0 0 10px">每个 profile 是一份独立上游（地址 + 单一协议 + 密钥 + 超时）。路由与 proxy 选择器按名字引用。标注「内置」的两个来自上面的 [upstream] 地址，同名新增即覆盖它们。</span>
+          <strong style="font-size:13px">模型映射表</strong>
+          <span class="hint" style="margin:0 0 0 10px">别名即客户端请求的模型名，映射到本方案的模型名。未声明的别名原样转发；haiku 未声明时沿用 sonnet。</span>
         </div>
-        <div id="profiles"></div>
+        <div id="routing"></div>
         <div class="form-body" style="border-top:1px solid var(--border)">
-          <button id="btn-add-profile">添加上游 profile</button>
-          <span class="hint" style="margin-left:10px">新增后须填写密钥并选「设置」；删除仍被路由引用的 profile 会被拒绝。</span>
+          <button id="btn-add-route">添加别名</button>
         </div>
       </div>
+
       <div class="form-body" style="border-top:1px solid var(--border)">
         <div class="grid">
           <div>
@@ -351,13 +349,13 @@
           <div class="chk"><input type="checkbox" id="cfg-admin-clear"><label for="cfg-admin-clear">清除口令（关闭管理页面）</label></div>
         </div>
       </div>
+
       <div style="border-top:1px solid var(--border)">
         <div class="form-body" style="padding-bottom:8px; display:flex; align-items:center;">
           <strong style="font-size:13px">生效路由</strong>
-          <span class="hint" style="margin:0 0 0 10px">每个别名都定义在它所属上游 profile 的「本方案的模型表」里，请到上方的 profile 卡片中编辑。</span>
         </div>
         <div class="form-body">
-          <div class="hint" style="margin:0 0 8px">经过默认网关与内置兜底之后，每个别名实际走哪个模型。这里的内容不会被保存。</div>
+          <div class="hint" style="margin:0 0 8px">经过 haiku 兜底之后，每个别名实际走哪个模型。这里的内容不会被保存。</div>
           <div id="effective-routes"></div>
         </div>
       </div>
@@ -386,7 +384,6 @@
   var config = null;
   // The [proxy] vision model, so a scheme row's empty placeholder can say what it
   // will inherit instead of leaving the operator to scroll up and look.
-  var globalVLMModel = "";
 
   function esc(v) {
     return String(v == null ? "" : v).replace(/[&<>"']/g, function (c) {
@@ -1131,108 +1128,24 @@
   }
 
   // ---- config ----
-
-  // readsOf snapshots a profile row's controls, so the payload builder below can
-  // be a pure function over plain values — which is what the node tests exercise.
-  // The describe-pass fields are absent on a builtin row, so they are read through
-  // this tolerant accessor: readsOf is only called for editable rows, but a
-  // missing control must not turn a save into a TypeError.
-  function readValue(row, selector, fallback) {
-    var el = row.querySelector(selector);
-    return el ? el.value : fallback;
-  }
-
-  function readsOf(row) {
-    return {
-      name: row.querySelector(".p-name").value,
-      protocol: row.querySelector(".p-protocol").value,
-      url: row.querySelector(".p-url").value,
-      key: row.querySelector(".p-key").value,
-      keyCleared: row.querySelector(".p-key-clear").checked,
-      keyEnv: row.querySelector(".p-key-env").value,
-      headerTimeout: row.querySelector(".p-header-timeout").value,
-      bodyIdle: row.querySelector(".p-body-idle").value,
-      maxRetries: row.querySelector(".p-max-retries").value,
-      vlmModel: readValue(row, ".p-vlm-model", ""),
-      vlmMaxTokens: readValue(row, ".p-vlm-max-tokens", ""),
-      vlmUpstream: readValue(row, ".p-vlm-upstream", ""),
-      routing: readSchemeRoutes(row)
-    };
-  }
-
-  // readSchemeRoutes collects a profile row's own model table. The rows live in a
-  // sub-list inside the card, so the caller gets a plain array either way.
-  function readSchemeRoutes(row) {
-    var out = [];
-    var host = row.querySelector(".p-routes");
-    if (!host) return out;
-    host.querySelectorAll(".p-route-row").forEach(function (r) {
-      var entry = schemeRoutePayload(
-        r.querySelector(".pr-alias").value,
-        r.querySelector(".pr-model").value,
-        r.querySelector(".pr-image").checked
-      );
-      if (entry) out.push(entry);
-    });
-    return out;
-  }
+  //
+  // The form edits one scheme file: a main upstream, an optional image-describe
+  // pass, an optional chat passthrough and a model table. There are no global
+  // upstream settings any more, so every field below belongs to the active scheme
+  // and a save writes exactly that one file.
 
   function intOr0(v) { return parseInt(v, 10) || 0; }
 
-  // profilePayloadFromRow turns one row's raw values into the object the save
-  // posts. A blank key field is "keep" only because the page can never show a
-  // stored key; the server resolves that against the config it is replacing.
-  function profilePayloadFromRow(r) {
-    return {
-      name: String(r.name == null ? "" : r.name).trim(),
-      protocol: r.protocol,
-      url: String(r.url == null ? "" : r.url).trim(),
-      key_action: keyActionOf(r.key == null ? "" : r.key, !!r.keyCleared),
-      key: r.key == null ? "" : r.key,
-      key_env: String(r.keyEnv == null ? "" : r.keyEnv).trim(),
-      header_timeout_seconds: intOr0(r.headerTimeout),
-      body_idle_seconds: intOr0(r.bodyIdle),
-      max_retries: intOr0(r.maxRetries),
-      // The scheme's own describe pass. Blank means "inherit [proxy]", which the
-      // server keeps as an absence rather than freezing the inherited value.
-      vlm_model: String(r.vlmModel == null ? "" : r.vlmModel).trim(),
-      vlm_max_tokens: intOr0(r.vlmMaxTokens),
-      vlm_upstream: String(r.vlmUpstream == null ? "" : r.vlmUpstream).trim(),
-      // The scheme's own model table, submitted whole. An absent list means the
-      // caller does not model it, so the server carries the stored one over; this
-      // page always sends the list, so deleting every row really deletes them.
-      routing: r.routing || []
-    };
-  }
-
-  // schemeRoutePayload reads one row of a scheme's own model table. Upstream is
-  // never sent: an entry belongs to the profile that declares it.
-  function schemeRoutePayload(alias, model, supportsImage) {
-    var a = String(alias == null ? "" : alias).trim();
-    var m = String(model == null ? "" : model).trim();
-    if (!a && !m) return null;
-    return { alias: a, model: m, upstream: "", supports_image: !!supportsImage };
-  }
-
-  // A key field is a three-state choice, the same one [keys].sophnet uses: blank
-  // means "keep whatever is stored" (a stored key is never sent to the page, so
-  // this is the only way to leave it alone), the clear box means "clear", and a
-  // typed value means "set". clear wins over a typed value, matching the page's
-  // own UI, which empties the field when the box is ticked.
+  // keyActionOf turns one credential field into the three-state choice the server
+  // expects. A stored key is never sent to the page, so blank is the only way to
+  // leave one alone; the clear box wins over a typed value, matching the UI, which
+  // empties the field when the box is ticked.
   function keyActionOf(value, cleared) {
     if (cleared) return "clear";
     return value !== "" ? "set" : "keep";
   }
 
-  function profileOptions(profiles, protocol) {
-    return (profiles || []).filter(function (p) {
-      return !protocol || p.protocol === protocol;
-    });
-  }
-
   // fillSelect rebuilds a <select> from a list of {value,label,title} entries.
-  // The caller sets the value afterwards, so an unknown or missing current value
-  // simply leaves the browser on the first option.
   function fillSelect(sel, entries) {
     sel.innerHTML = entries.map(function (e) {
       return '<option value="' + esc(e.value) + '"' +
@@ -1240,277 +1153,231 @@
     }).join("");
   }
 
-  // upstreamOptions lists every profile a route or the default gateway may name.
-  // "" stays first: it is not a profile but the "use default_upstream" spelling,
-  // and collapsing it into "anthropic" would freeze an inherited value into the
-  // file on the next save.
-  function upstreamOptions(profiles) {
-    var entries = [{ value: "", label: "（使用默认网关）" }];
-    (profiles || []).forEach(function (p) {
-      entries.push({
-        value: p.name,
-        label: p.name + "（" + p.protocol + "）" + (p.builtin ? " · 内置" : ""),
-        title: p.url
-      });
-    });
-    return entries;
+  // upstreamFields builds the markup for one upstream's controls. prefix keeps the
+  // ids unique across the three upstreams on the page.
+  function upstreamFields(prefix, showProtocol) {
+    return '' +
+      (showProtocol
+        ? '<div><label>协议</label><select id="' + prefix + '-protocol">' +
+            '<option value="anthropic">anthropic</option>' +
+            '<option value="openai">openai</option>' +
+          '</select></div>'
+        : "") +
+      '<div><label>地址</label><input type="text" id="' + prefix + '-url" placeholder="上游地址"></div>' +
+      '<div><label>密钥环境变量</label><input type="text" id="' + prefix + '-key-env" placeholder="可选，优先于密钥"></div>' +
+      '<div><label>密钥</label><input type="password" id="' + prefix + '-key" autocomplete="new-password" placeholder="留空则保持原密钥不变"></div>' +
+      '<div class="chk"><input type="checkbox" id="' + prefix + '-key-clear"><label for="' + prefix + '-key-clear">清空密钥</label></div>' +
+      '<div><label title="等待上游响应头的最长时间（秒）">响应头超时</label><input type="number" id="' + prefix + '-header-timeout" min="0"></div>' +
+      '<div><label title="读取响应体允许的最长静默（秒）">响应体静默</label><input type="number" id="' + prefix + '-body-idle" min="0"></div>' +
+      '<div><label title="瞬态错误后的额外重试次数">重试次数</label><input type="number" id="' + prefix + '-max-retries" min="0"></div>';
   }
 
-  // profileRow renders one upstream profile. A builtin profile — one synthesised
-  // from [upstream].anthropic_url / openai_url — is shown read-only: its fields
-  // live in the file's [upstream] section, and the way to override it is to add a
-  // profile of the same name, which the name field offers.
-  function profileRow(p, profiles) {
+  // readUpstream snapshots one upstream's controls into the payload the server
+  // takes. Reading through the document keeps this usable for the three sections
+  // that share the same field set.
+  function readUpstream(prefix, withProtocol) {
+    return {
+      protocol: withProtocol ? document.getElementById(prefix + "-protocol").value : "",
+      url: document.getElementById(prefix + "-url").value.trim(),
+      key_action: keyActionOf(
+        document.getElementById(prefix + "-key").value,
+        document.getElementById(prefix + "-key-clear").checked
+      ),
+      key: document.getElementById(prefix + "-key").value,
+      key_env: document.getElementById(prefix + "-key-env").value.trim(),
+      header_timeout_seconds: intOr0(document.getElementById(prefix + "-header-timeout").value),
+      body_idle_seconds: intOr0(document.getElementById(prefix + "-body-idle").value),
+      max_retries: intOr0(document.getElementById(prefix + "-max-retries").value)
+    };
+  }
+
+  // fillUpstream writes one upstream's state into the form. A key is never echoed
+  // back, so the field is cleared and the hint says whether one is stored.
+  function fillUpstream(prefix, up, withProtocol) {
+    if (withProtocol) document.getElementById(prefix + "-protocol").value = up.protocol || "anthropic";
+    document.getElementById(prefix + "-url").value = up.url || "";
+    document.getElementById(prefix + "-key-env").value = up.key_env || "";
+    document.getElementById(prefix + "-key").value = "";
+    document.getElementById(prefix + "-key-clear").checked = false;
+    document.getElementById(prefix + "-header-timeout").value = up.header_timeout_seconds || 0;
+    document.getElementById(prefix + "-body-idle").value = up.body_idle_seconds || 0;
+    document.getElementById(prefix + "-max-retries").value = up.max_retries || 0;
+  }
+
+  function keyHint(up) {
+    if (up.key_from_env) return "密钥来自环境变量 " + up.key_env + "（优先于此处填写的值）";
+    if (up.key_set) return "已配置密钥（不回显明文）";
+    return "未配置密钥";
+  }
+
+  // schemeRoutePayload validates one row of the model table. An empty row is
+  // dropped rather than saved as a broken entry the server would reject.
+  function schemeRoutePayload(alias, model, supportsImage) {
+    var a = String(alias == null ? "" : alias).trim();
+    var m = String(model == null ? "" : model).trim();
+    if (!a && !m) return null;
+    return { alias: a, model: m, supports_image: !!supportsImage };
+  }
+
+  // routeRow renders one alias of the model table.
+  function routeRow(entry) {
     var row = document.createElement("div");
-    row.className = "profile-row" + (p.builtin ? " is-builtin" : "");
-    row.dataset.builtin = p.builtin ? "1" : "";
-    var ro = p.builtin;
-    // Composed before the markup because it interpolates the global model, and a
-    // value spliced into a quoted attribute has to be escaped as a whole.
-    var vlmPlaceholder = "留空 = 用全局 " + (globalVLMModel || "（未设置）");
+    row.className = "route-row";
     row.innerHTML =
-      '<div class="p-fields">' +
-        '<div><label>名字</label><input type="text" class="p-name"' +
-          (ro ? " readonly" : "") + ' placeholder="小写字母/数字/-/_"></div>' +
-        '<div><label>协议</label><select class="p-protocol"' + (ro ? " disabled" : "") + ">" +
-          '<option value="anthropic">anthropic</option>' +
-          '<option value="openai">openai</option>' +
-        "</select></div>" +
-        '<div><label>URL</label><input type="text" class="p-url"' + (ro ? " readonly" : "") + "></div>" +
-        '<div><label>密钥环境变量</label><input type="text" class="p-key-env"' +
-          (ro ? " readonly" : "") + ' placeholder="可选"></div>' +
-        '<div><label>密钥</label><input type="password" class="p-key" autocomplete="new-password"' +
-          (ro ? " disabled" : "") + ' placeholder="留空则保持不变"></div>' +
-        '<div class="chk"><input type="checkbox" class="p-key-clear"' +
-          (ro ? " disabled" : "") + '><label>清空密钥</label></div>' +
-        '<div><label title="等待上游响应头的最长时间，0 = 沿用全局">响应头超时</label>' +
-          '<input type="number" class="p-header-timeout" min="0"' + (ro ? " disabled" : "") + "></div>" +
-        '<div><label title="读取响应体允许的最长静默，0 = 沿用全局">响应体静默</label>' +
-          '<input type="number" class="p-body-idle" min="0"' + (ro ? " disabled" : "") + "></div>" +
-        '<div><label title="瞬态错误后的额外重试次数，0 = 沿用全局">重试次数</label>' +
-          '<input type="number" class="p-max-retries" min="0"' + (ro ? " disabled" : "") + "></div>" +
-        '<div><button class="danger p-del"' + (ro ? " disabled" : "") + ">删除</button></div>" +
-      "</div>" +
-      // The scheme's own describe pass. Kept on its own line because the first
-      // line already carries ten controls; mixing them in would make both sets
-      // unreadable. A builtin profile has no table of its own to put these in, so
-      // the block is omitted rather than shown inert.
-      (ro ? "" :
-      '<div class="p-vlm">' +
-        '<span class="p-vlm-label" title="该 profile 的图片描述设置；留空则沿用 [proxy] 的全局值">图片描述</span>' +
-        '<div><label>视觉模型</label><input type="text" class="p-vlm-model" placeholder="' + esc(vlmPlaceholder) + '"></div>' +
-        '<div><label title="每次图片描述调用的最大输出 token">最大 token</label>' +
-          '<input type="number" class="p-vlm-max-tokens" min="0" placeholder="留空 = 全局"></div>' +
-        '<div><label title="发图片描述请求用哪个 profile（必须 anthropic 协议）">描述走哪个 profile</label>' +
-          '<select class="p-vlm-upstream"></select></div>' +
-      "</div>") +
-      // This scheme's own model table. Aliases here route to this profile only,
-      // so there is no upstream column to choose.
-      (ro ? "" :
-      '<div class="p-routes-wrap">' +
-        '<div class="p-routes-head">' +
-          '<span class="p-vlm-label">本方案的模型表</span>' +
-          '<span class="hint">这些别名只路由到本 profile。别名在整个配置里必须唯一：两个 profile 声明同一个别名时，按 profile 名排序取第一个并记日志。</span>' +
-          '<button type="button" class="p-route-add">添加别名</button>' +
-        "</div>" +
-        '<div class="p-routes"></div>' +
-      "</div>") +
-      '<div class="hint p-hint"></div>';
-
-    row.querySelector(".p-name").value = p.name || "";
-    row.querySelector(".p-protocol").value = p.protocol || "anthropic";
-    row.querySelector(".p-url").value = p.url || "";
-    row.querySelector(".p-key-env").value = p.key_env || "";
-    row.querySelector(".p-header-timeout").value = p.header_timeout_seconds || 0;
-    row.querySelector(".p-body-idle").value = p.body_idle_seconds || 0;
-    row.querySelector(".p-max-retries").value = p.max_retries || 0;
-
-    // The describe-pass block is absent on a builtin row, so these are resolved
-    // defensively rather than assumed.
-    var vlmModelEl = row.querySelector(".p-vlm-model");
-    var vlmMaxEl = row.querySelector(".p-vlm-max-tokens");
-    var vlmSel = row.querySelector(".p-vlm-upstream");
-    if (vlmModelEl) vlmModelEl.value = p.vlm_model || "";
-    if (vlmMaxEl) vlmMaxEl.value = p.vlm_max_tokens || 0;
-    if (vlmSel) {
-      // The serving-profile selector lists only anthropic profiles: the describe
-      // call speaks /v1/messages, so an openai profile here would be rejected on
-      // save. Empty means "the scheme serves its own calls".
-      fillSelect(vlmSel, proxySelectorOptions(profiles, "anthropic"));
-      vlmSel.value = p.vlm_upstream || "";
-    }
-
-    var parts = [];
-    if (p.builtin) {
-      parts.push("内置 profile：由 [upstream] 的地址合成。要改动它，请新增一个同名的上游 profile 覆盖。");
-    } else if (p.key_from_env) {
-      parts.push("密钥来自环境变量 " + p.key_env + "（优先于此处填写的值）。");
-    } else if (p.key_set) {
-      parts.push("已配置密钥（不回显明文）。");
-    } else {
-      parts.push("未配置密钥。");
-    }
-    if (p.effective_vlm_model) {
-      parts.push(p.vlm_model
-        ? "图片描述使用本 profile 的模型 " + p.effective_vlm_model + "。"
-        : "图片描述沿用全局模型 " + p.effective_vlm_model + "。");
-    }
-    if (p.protocol === "openai" && p.vlm_model) {
-      parts.push("注意：openai 协议的 profile 无法承载图片描述调用，加载时会回落到 anthropic profile。");
-    }
-    row.querySelector(".p-hint").textContent = parts.join(" ");
-
-    // Fill in this scheme's own model table.
-    var routeHost = row.querySelector(".p-routes");
-    if (routeHost) {
-      (p.routing || []).forEach(function (e) { routeHost.appendChild(schemeRouteRow(e)); });
-      var addBtn = row.querySelector(".p-route-add");
-      if (addBtn) {
-        addBtn.addEventListener("click", function () {
-          routeHost.appendChild(schemeRouteRow({}));
-        });
-      }
-    }
-
-    // A builtin row borrows its key state from the legacy [keys] section, which
-    // the form edits separately, so its own key controls stay inert above.
-    row.querySelector(".p-del").addEventListener("click", function () { row.remove(); });
+      '<div><label>别名</label><input type="text" class="r-alias" placeholder="Claude Code 用的模型名"></div>' +
+      '<div><label>上游模型名</label><input type="text" class="r-model"></div>' +
+      '<div class="chk"><input type="checkbox" class="r-image"><label>supports_image</label></div>' +
+      '<div><button type="button" class="danger r-del">删除</button></div>';
+    row.querySelector(".r-alias").value = entry.alias || "";
+    row.querySelector(".r-model").value = entry.model || "";
+    row.querySelector(".r-image").checked = !!entry.supports_image;
+    row.querySelector(".r-del").addEventListener("click", function () { row.remove(); });
     return row;
   }
 
-  // schemeRouteRow renders one alias of a scheme's own model table. There is no
-  // upstream column: the entry belongs to the profile that declares it.
-  function schemeRouteRow(entry) {
-    var row = document.createElement("div");
-    row.className = "p-route-row";
-    row.innerHTML =
-      '<div><label>别名</label><input type="text" class="pr-alias" placeholder="Claude Code 用的模型名"></div>' +
-      '<div><label>上游模型名</label><input type="text" class="pr-model"></div>' +
-      '<div class="chk"><input type="checkbox" class="pr-image"><label>supports_image</label></div>' +
-      '<div><button type="button" class="danger pr-del">删除</button></div>';
-    row.querySelector(".pr-alias").value = entry.alias || "";
-    row.querySelector(".pr-model").value = entry.model || "";
-    row.querySelector(".pr-image").checked = !!entry.supports_image;
-    row.querySelector(".pr-del").addEventListener("click", function () { row.remove(); });
-    return row;
+  // readRouting collects the model table. An absent row is dropped, and the row
+  // validator rejects a half-filled one so the save fails with a message instead
+  // of silently losing it.
+  function readRouting() {
+    var out = [];
+    var bad = null;
+    document.querySelectorAll("#routing .route-row").forEach(function (row) {
+      var alias = row.querySelector(".r-alias").value;
+      var model = row.querySelector(".r-model").value;
+      var entry = schemeRoutePayload(alias, model, row.querySelector(".r-image").checked);
+      if (!entry) return;
+      if (!entry.alias) bad = "有一个别名只填了模型名，请补上别名";
+      if (!entry.model) bad = "别名 " + entry.alias + " 缺少上游模型名";
+      out.push(entry);
+    });
+    return { entries: out, error: bad };
   }
 
-  // editableProfiles is the profile list the page edits: the ones the file
-  // declares. A save submits exactly these, so the builtin rows are filtered out
-  // rather than written as [upstreams.*] tables.
-  function editableProfileRows() {
-    var rows = [];
-    document.querySelectorAll("#profiles .profile-row").forEach(function (row) {
-      if (row.dataset.builtin) return;
-      rows.push(row);
-    });
-    return rows;
+  // mountUpstreamForms writes the three upstream field sets into their grids once
+  // at boot. They are identical in shape, so building them from one helper keeps
+  // the ids and field order from drifting apart.
+  function mountUpstreamForms() {
+    document.getElementById("up-main").innerHTML = upstreamFields("up-main", true);
+    document.getElementById("up-vlm").innerHTML = upstreamFields("up-vlm", true);
+    document.getElementById("up-chat").innerHTML = upstreamFields("up-chat", true);
   }
 
   function renderConfig(cfg) {
     config = cfg;
-    globalVLMModel = cfg.proxy.vlm_model;
     document.getElementById("cfg-port").value = cfg.proxy.port;
-    document.getElementById("cfg-vlm-model").value = cfg.proxy.vlm_model;
-    document.getElementById("cfg-vlm-max-tokens").value = cfg.proxy.vlm_max_tokens;
-    document.getElementById("cfg-anthropic-url").value = cfg.upstream.anthropic_url;
-    document.getElementById("cfg-openai-url").value = cfg.upstream.openai_url;
-    document.getElementById("cfg-header-timeout").value = cfg.upstream.header_timeout_seconds;
-    document.getElementById("cfg-body-idle").value = cfg.upstream.body_idle_seconds;
-    document.getElementById("cfg-max-retries").value = cfg.upstream.max_retries;
-    document.getElementById("cfg-sophnet").value = "";
-    document.getElementById("cfg-key-clear").checked = false;
+    document.getElementById("cfg-paths").textContent =
+      "主配置：" + cfg.config_path + "　方案文件：" + (cfg.scheme_path || "（未加载）");
 
-    var hint = cfg.keys.sophnet_from_env
-      ? "已通过环境变量 SOPHNET_API_KEY 配置（优先级高于此处）"
-      : (cfg.keys.sophnet_set ? "已配置（不回显明文）" : "未配置");
-    document.getElementById("cfg-key-hint").textContent = hint;
+    fillSelect(document.getElementById("cfg-scheme"), (cfg.proxy.scheme_list || []).map(function (name) {
+      return { value: name, label: name };
+    }));
+    document.getElementById("cfg-scheme").value = cfg.proxy.scheme || "";
+    document.getElementById("cfg-scheme-hint").textContent =
+      (cfg.proxy.scheme_list || []).length + " 份方案位于 " + cfg.proxy.schemes_dir +
+      "。切换方案只改主配置里选中的那一份，不会改动任何方案文件的内容。";
+
+    // Main upstream.
+    fillUpstream("up-main", cfg.upstream, true);
+    document.getElementById("up-main-key").placeholder = "留空则保持原密钥不变";
+    var mainHintId = "up-main-key-hint";
+    var mainHint = document.getElementById(mainHintId);
+    if (!mainHint) {
+      mainHint = document.createElement("div");
+      mainHint.id = mainHintId;
+      mainHint.className = "hint";
+      document.getElementById("up-main").appendChild(mainHint);
+    }
+    mainHint.textContent = keyHint(cfg.upstream);
+
+    // VLM.
+    document.getElementById("cfg-vlm-active").checked = !!cfg.vlm.active;
+    document.getElementById("cfg-vlm-model").value = cfg.vlm.model || "";
+    document.getElementById("cfg-vlm-max-tokens").value = cfg.vlm.max_tokens || 0;
+    document.getElementById("cfg-vlm-inherit").checked = !!cfg.vlm.inherit;
+    fillUpstream("up-vlm", cfg.vlm.upstream, true);
+    syncVLMSection();
+
+    // Chat.
+    document.getElementById("cfg-chat-available").checked = !!cfg.chat.available;
+    document.getElementById("cfg-chat-inherit").checked = !!cfg.chat.inherit;
+    fillUpstream("up-chat", cfg.chat.upstream, true);
+    syncChatSection();
 
     document.getElementById("cfg-admin-token").value = "";
     document.getElementById("cfg-admin-clear").checked = false;
     document.getElementById("cfg-admin-hint").textContent = cfg.admin.token_from_env
-      ? "已通过环境变量 LLM_PROXY_ADMIN_TOKEN 配置（优先级高于此处，在此修改不会生效）"
+      ? "已通过环境变量 LLM_PROXY_ADMIN_TOKEN 配置（优先于此处，在此修改不会生效）"
       : (cfg.admin.token_set ? "已配置（不回显明文）。修改后需用新口令重新登录。" : "未配置：管理页面当前已关闭");
 
-    var profiles = cfg.upstreams || [];
+    var host = document.getElementById("routing");
+    host.innerHTML = "";
+    (cfg.routing || []).forEach(function (e) { host.appendChild(routeRow(e)); });
 
-    var pHost = document.getElementById("profiles");
-    pHost.innerHTML = "";
-    profiles.forEach(function (p) { pHost.appendChild(profileRow(p, profiles)); });
-
-    // The three profile selectors offer only what can actually be used: the
-    // default gateway takes any profile, while the VLM and chat selectors are
-    // restricted to the protocol their caller speaks, so the page cannot save a
-    // combination the loader would fold back to a builtin profile.
-    fillSelect(document.getElementById("cfg-default-upstream"), upstreamOptions(profiles));
-    document.getElementById("cfg-default-upstream").value = cfg.upstream.default_upstream || "";
-
-    fillSelect(document.getElementById("cfg-vlm-upstream"), proxySelectorOptions(profiles, "anthropic"));
-    document.getElementById("cfg-vlm-upstream").value = cfg.proxy.vlm_upstream || "";
-
-    fillSelect(document.getElementById("cfg-chat-upstream"), proxySelectorOptions(profiles, "openai"));
-    document.getElementById("cfg-chat-upstream").value = cfg.proxy.chat_upstream || "";
-
-    // There is no global routing table to render: every alias is edited inside
-    // the card of the upstream profile that serves it. This summary is the
-    // read-only overview of what the proxy will actually answer.
+    // The effective table is read-only: it includes the haiku fallback, which is
+    // derived rather than written.
     var eff = cfg.effective_routing || {};
     var names = Object.keys(eff).sort();
     document.getElementById("effective-routes").innerHTML = names.length
       ? names.map(function (alias) {
           var e = eff[alias];
-          return '<span class="tag" title="' + (e.declared ? "文件中已声明" : "未声明，使用内置兜底") + '">' +
-                 esc(alias) + " → " + esc(e.model) + "（" + esc(e.upstream || "anthropic") + "）" +
+          return '<span class="tag" title="' + (e.declared ? "方案中已声明" : "未声明，由兜底规则推导") + '">' +
+                 esc(alias) + " → " + esc(e.model) +
+                 (e.supports_image ? " · 原生图片" : "") +
                  (e.declared ? "" : " · 兜底") + "</span>";
         }).join(" ")
       : '<span class="muted">—</span>';
   }
 
-  // proxySelectorOptions lists the profiles a [proxy] selector may name. Empty is
-  // first and means "the implicit builtin profile", which is what a config with no
-  // explicit selector has always used.
-  function proxySelectorOptions(profiles, protocol) {
-    var entries = [{
-      value: "",
-      label: "（默认 " + protocol + " profile）"
-    }];
-    profileOptions(profiles, protocol).forEach(function (p) {
-      entries.push({
-        value: p.name,
-        label: p.name + (p.builtin ? " · 内置" : ""),
-        title: p.url
-      });
+  // syncVLMSection disables the describe-pass fields that the checkboxes make
+  // irrelevant, so an operator cannot fill in a value the save will discard.
+  function syncVLMSection() {
+    var active = document.getElementById("cfg-vlm-active").checked;
+    document.getElementById("vlm-body").style.opacity = active ? "1" : "0.45";
+    var inherit = document.getElementById("cfg-vlm-inherit").checked;
+    document.querySelectorAll("#up-vlm input, #up-vlm select").forEach(function (el) {
+      el.disabled = !active || inherit;
     });
-    return entries;
+  }
+
+  function syncChatSection() {
+    var available = document.getElementById("cfg-chat-available").checked;
+    document.getElementById("chat-body").style.opacity = available ? "1" : "0.45";
+    var inherit = document.getElementById("cfg-chat-inherit").checked;
+    document.querySelectorAll("#up-chat input, #up-chat select").forEach(function (el) {
+      el.disabled = !available || inherit;
+    });
   }
 
   function collectPayload() {
-    // Every editable profile row is submitted, so a row the operator deleted is
-    // simply absent — which is what makes the deletion take effect. Each profile
-    // carries its own model table, so there is no top-level routing list to send.
-    var upstreams = editableProfileRows().map(function (row) {
-      return profilePayloadFromRow(readsOf(row));
-    });
-
+    var routing = readRouting();
+    if (routing.error) throw new Error(routing.error);
+    var vlmActive = document.getElementById("cfg-vlm-active").checked;
     return {
       proxy: {
-        port: parseInt(document.getElementById("cfg-port").value, 10) || 0,
-        vlm_model: document.getElementById("cfg-vlm-model").value.trim(),
-        vlm_max_tokens: parseInt(document.getElementById("cfg-vlm-max-tokens").value, 10) || 0,
-        vlm_upstream: document.getElementById("cfg-vlm-upstream").value,
-        chat_upstream: document.getElementById("cfg-chat-upstream").value
+        port: intOr0(document.getElementById("cfg-port").value),
+        scheme: document.getElementById("cfg-scheme").value
       },
-      upstream: {
-        anthropic_url: document.getElementById("cfg-anthropic-url").value.trim(),
-        openai_url: document.getElementById("cfg-openai-url").value.trim(),
-        default_upstream: document.getElementById("cfg-default-upstream").value,
-        header_timeout_seconds: parseInt(document.getElementById("cfg-header-timeout").value, 10) || 0,
-        body_idle_seconds: parseInt(document.getElementById("cfg-body-idle").value, 10) || 0,
-        max_retries: parseInt(document.getElementById("cfg-max-retries").value, 10) || 0
+      upstream: readUpstream("up-main", true),
+      vlm: {
+        active: vlmActive,
+        model: document.getElementById("cfg-vlm-model").value.trim(),
+        max_tokens: intOr0(document.getElementById("cfg-vlm-max-tokens").value),
+        inherit: document.getElementById("cfg-vlm-inherit").checked,
+        upstream: readUpstream("up-vlm", true)
       },
-      keys: { sophnet_action: keyActionOf(document.getElementById("cfg-sophnet").value, document.getElementById("cfg-key-clear").checked), sophnet: document.getElementById("cfg-sophnet").value },
-      admin: { token_action: keyActionOf(document.getElementById("cfg-admin-token").value, document.getElementById("cfg-admin-clear").checked), token: document.getElementById("cfg-admin-token").value },
-      upstreams: upstreams
+      chat: {
+        available: document.getElementById("cfg-chat-available").checked,
+        inherit: document.getElementById("cfg-chat-inherit").checked,
+        upstream: readUpstream("up-chat", true)
+      },
+      admin: {
+        token_action: keyActionOf(
+          document.getElementById("cfg-admin-token").value,
+          document.getElementById("cfg-admin-clear").checked
+        ),
+        token: document.getElementById("cfg-admin-token").value
+      },
+      routing: routing.entries
     };
   }
 
@@ -1628,20 +1495,19 @@
       banner("banner", "err", "清零失败：" + err.message);
     }
   });
-  // A new profile starts on the anthropic protocol with no stored key: its row
-  // reports key_action "set" (or "clear"), which is exactly what the validator
-  // needs for a name the running config does not carry a key for.
-  document.getElementById("btn-add-profile").addEventListener("click", function () {
-    document.getElementById("profiles").appendChild(profileRow({ protocol: "anthropic" }, config ? config.upstreams : []));
+  document.getElementById("btn-add-route").addEventListener("click", function () {
+    document.getElementById("routing").appendChild(routeRow({}));
   });
+  document.getElementById("cfg-vlm-active").addEventListener("change", syncVLMSection);
+  document.getElementById("cfg-vlm-inherit").addEventListener("change", syncVLMSection);
+  document.getElementById("cfg-chat-available").addEventListener("change", syncChatSection);
+  document.getElementById("cfg-chat-inherit").addEventListener("change", syncChatSection);
+  mountUpstreamForms();
   document.getElementById("btn-save").addEventListener("click", saveConfig);
   document.getElementById("btn-reload").addEventListener("click", function () {
     hideBanner("save-banner");
     document.getElementById("save-hint").textContent = "";
     loadConfig();
-  });
-  document.getElementById("cfg-key-clear").addEventListener("change", function () {
-    if (this.checked) document.getElementById("cfg-sophnet").value = "";
   });
   document.getElementById("cfg-admin-clear").addEventListener("change", function () {
     if (this.checked) document.getElementById("cfg-admin-token").value = "";
@@ -1700,13 +1566,9 @@
       historyRanges: HISTORY_RANGES,
       historyMetrics: HISTORY_METRICS,
       // The config form's helpers are pure functions over plain values, so they
-      // are testable without a DOM: the payload the page builds and the profile
-      // options it filters are exactly what the save validator has to accept.
+      // are testable without a DOM: the payload rows the page builds are exactly
+      // what the save validator has to accept.
       keyActionOf: keyActionOf,
-      upstreamOptions: upstreamOptions,
-      proxySelectorOptions: proxySelectorOptions,
-      profileOptions: profileOptions,
-      profilePayloadFromRow: profilePayloadFromRow,
       schemeRoutePayload: schemeRoutePayload,
     };
     return;

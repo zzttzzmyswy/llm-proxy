@@ -159,43 +159,8 @@
   .route-row { display: grid; grid-template-columns: 1.2fr 1.6fr 1fr auto auto auto; gap: 10px; align-items: end; padding: 10px 16px; border-bottom: 1px solid var(--border); }
   .route-row:last-child { border-bottom: none; }
   .route-row input[type=checkbox] { width: auto; }
-  /* A profile carries two control lines — the upstream itself and the describe
-     pass it owns — so it is a card with its own grid rather than a .route-row. */
-  .profile-row { display: block; padding: 12px 16px; }
-  .profile-row.is-builtin { background: var(--panel-sunken); }
-  .profile-row .p-fields {
-    display: grid; gap: 10px; align-items: end;
-    grid-template-columns: 1fr 0.9fr 1.6fr 1fr 1.1fr auto 0.7fr 0.7fr 0.7fr auto;
-  }
-  .profile-row .p-vlm {
-    display: grid; gap: 10px; align-items: end; margin-top: 10px;
-    padding: 10px 12px; border: 1px dashed var(--border); border-radius: 8px;
-    background: var(--panel-sunken);
-    grid-template-columns: auto 1.4fr 0.7fr 1.2fr;
-  }
-  .profile-row .p-vlm-label {
-    font-size: 11px; font-weight: 650; color: var(--muted);
-    text-transform: uppercase; letter-spacing: .05em; white-space: nowrap;
-    align-self: end; padding-bottom: 8px;
-  }
-  .profile-row .p-hint { margin-top: 8px; }
-  /* A scheme's own model table: a compact list inside the profile card. */
-  .profile-row .p-routes-wrap {
-    margin-top: 10px; padding: 10px 12px; border: 1px dashed var(--border); border-radius: 8px;
-    background: var(--panel-sunken);
-  }
-  .profile-row .p-routes-head {
-    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 6px;
-  }
-  .profile-row .p-routes-head .p-vlm-label { padding-bottom: 0; }
-  .profile-row .p-routes-head .hint { margin: 0; flex: 1; }
-  .profile-row .p-route-row {
-    display: grid; grid-template-columns: 1.2fr 1.6fr auto auto;
-    gap: 10px; align-items: end; padding: 6px 0;
-  }
-  .profile-row .p-route-row + .p-route-row { border-top: 1px solid var(--border); }
-  .profile-row .p-routes .empty { padding: 8px 0; text-align: left; font-size: 12px; }
-  .profile-list-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; padding: 0 16px 8px; }
+  /* A model-table row inside the scheme's mapping table. */
+  #routing .route-row { padding: 8px 16px; }
   .chk { display: flex; align-items: center; gap: 6px; padding-bottom: 8px; font-size: 13px; }
   .chk label { margin: 0; color: var(--text); }
   .banner { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 13px; display: none; white-space: pre-wrap; }
@@ -291,56 +256,89 @@
     <div class="panel">
       <div class="form-body">
         <div class="grid">
-          <div><label>监听端口</label><input type="number" id="cfg-port" min="1" max="65535"></div>
-          <div><label>VLM 模型（图片描述）</label><input type="text" id="cfg-vlm-model"></div>
-          <div><label>VLM 最大输出 token</label><input type="number" id="cfg-vlm-max-tokens" min="0"></div>
           <div>
-            <label>VLM 上游 profile</label>
-            <select id="cfg-vlm-upstream"></select>
-            <div class="hint">图片描述调用走哪个上游，只列 anthropic 协议的 profile。</div>
+            <label>监听端口</label>
+            <input type="number" id="cfg-port" min="1" max="65535">
+            <div class="hint">端口变更需重启服务，其余配置保存即生效。</div>
           </div>
           <div>
-            <label>chat 透传上游 profile</label>
-            <select id="cfg-chat-upstream"></select>
-            <div class="hint">/v1/chat/completions 走哪个上游，只列 openai 协议的 profile。</div>
+            <label>生效方案</label>
+            <select id="cfg-scheme"></select>
+            <div class="hint" id="cfg-scheme-hint">每份方案是一个完整的上游配置，同一时刻只有一份生效。</div>
+          </div>
+        </div>
+        <div class="hint" id="cfg-paths" style="margin-top:8px"></div>
+      </div>
+
+      <div style="border-top:1px solid var(--border)">
+        <div class="form-body" style="padding-bottom:8px">
+          <strong style="font-size:13px">主上游（文本模型）</strong>
+          <span class="hint" style="margin-left:10px">当前生效方案的顶层配置：Claude Code 的 /v1/messages 请求最终发到这里。</span>
+        </div>
+        <div class="form-body">
+          <div class="grid wide" id="up-main"></div>
+        </div>
+      </div>
+
+      <div style="border-top:1px solid var(--border)">
+        <div class="form-body" style="padding-bottom:8px">
+          <strong style="font-size:13px">图片描述（VLM）</strong>
+          <span class="hint" style="margin-left:10px">带图请求先由视觉模型描述，再用文本发给主上游。</span>
+        </div>
+        <div class="form-body">
+          <div class="chk" style="margin-bottom:10px">
+            <input type="checkbox" id="cfg-vlm-active">
+            <label for="cfg-vlm-active">启用图片描述</label>
+            <span class="hint" style="margin-left:8px">关闭后带图请求原样转发给主上游，由其自行处理。</span>
+          </div>
+          <div id="vlm-body">
+            <div class="grid wide">
+              <div><label>视觉模型</label><input type="text" id="cfg-vlm-model"></div>
+              <div><label>每次最大输出 token</label><input type="number" id="cfg-vlm-max-tokens" min="0"></div>
+            </div>
+            <div class="chk" style="margin:10px 0">
+              <input type="checkbox" id="cfg-vlm-inherit">
+              <label for="cfg-vlm-inherit">沿用主上游</label>
+              <span class="hint" style="margin-left:8px">勾选后描述调用走上面的主上游地址（要求 anthropic 协议），否则在下面单独配置。</span>
+            </div>
+            <div class="grid wide" id="up-vlm"></div>
           </div>
         </div>
       </div>
-      <div class="form-body" style="border-top:1px solid var(--border)">
-        <div class="grid wide">
-          <div><label>Anthropic 上游地址</label><input type="text" id="cfg-anthropic-url"></div>
-          <div><label>OpenAI 上游地址</label><input type="text" id="cfg-openai-url"></div>
-          <div>
-            <label>默认网关</label>
-            <select id="cfg-default-upstream"></select>
-            <div class="hint">sonnet / opus / haiku 这三个内置别名没有任何 profile 的模型表声明时，走哪个 profile。</div>
+
+      <div style="border-top:1px solid var(--border)">
+        <div class="form-body" style="padding-bottom:8px">
+          <strong style="font-size:13px">chat 透传</strong>
+          <span class="hint" style="margin-left:10px">OpenAI 兼容端点 /v1/chat/completions 走哪个上游。</span>
+        </div>
+        <div class="form-body">
+          <div class="chk" style="margin-bottom:10px">
+            <input type="checkbox" id="cfg-chat-available">
+            <label for="cfg-chat-available">启用 chat 透传</label>
+            <span class="hint" style="margin-left:8px">关闭后该端点返回 502。要求 openai 协议的上游。</span>
           </div>
-          <div><label>响应头超时（秒）</label><input type="number" id="cfg-header-timeout" min="0"></div>
-          <div><label>响应体静默上限（秒）</label><input type="number" id="cfg-body-idle" min="0"></div>
-          <div><label>瞬态重试次数</label><input type="number" id="cfg-max-retries" min="0"></div>
+          <div id="chat-body">
+            <div class="chk" style="margin:0 0 10px">
+              <input type="checkbox" id="cfg-chat-inherit">
+              <label for="cfg-chat-inherit">沿用主上游</label>
+              <span class="hint" style="margin-left:8px">勾选后透传走上面的主上游地址（要求 openai 协议），否则在下面单独配置。</span>
+            </div>
+            <div class="grid wide" id="up-chat"></div>
+          </div>
         </div>
       </div>
-      <div class="form-body" style="border-top:1px solid var(--border)">
-        <div class="grid">
-          <div>
-            <label>上游密钥</label>
-            <input type="password" id="cfg-sophnet" placeholder="留空则保持原密钥不变" autocomplete="new-password">
-            <div class="hint" id="cfg-key-hint"></div>
-          </div>
-          <div class="chk"><input type="checkbox" id="cfg-key-clear"><label for="cfg-key-clear">清除已保存的密钥</label></div>
-        </div>
-      </div>
+
       <div style="border-top:1px solid var(--border)">
         <div class="form-body" style="padding-bottom:8px; display:flex; align-items:center;">
-          <strong style="font-size:13px">上游 profile</strong>
-          <span class="hint" style="margin:0 0 0 10px">每个 profile 是一份独立上游（地址 + 单一协议 + 密钥 + 超时）。路由与 proxy 选择器按名字引用。标注「内置」的两个来自上面的 [upstream] 地址，同名新增即覆盖它们。</span>
+          <strong style="font-size:13px">模型映射表</strong>
+          <span class="hint" style="margin:0 0 0 10px">别名即客户端请求的模型名，映射到本方案的模型名。未声明的别名原样转发；haiku 未声明时沿用 sonnet。</span>
         </div>
-        <div id="profiles"></div>
+        <div id="routing"></div>
         <div class="form-body" style="border-top:1px solid var(--border)">
-          <button id="btn-add-profile">添加上游 profile</button>
-          <span class="hint" style="margin-left:10px">新增后须填写密钥并选「设置」；删除仍被路由引用的 profile 会被拒绝。</span>
+          <button id="btn-add-route">添加别名</button>
         </div>
       </div>
+
       <div class="form-body" style="border-top:1px solid var(--border)">
         <div class="grid">
           <div>
@@ -351,13 +349,13 @@
           <div class="chk"><input type="checkbox" id="cfg-admin-clear"><label for="cfg-admin-clear">清除口令（关闭管理页面）</label></div>
         </div>
       </div>
+
       <div style="border-top:1px solid var(--border)">
         <div class="form-body" style="padding-bottom:8px; display:flex; align-items:center;">
           <strong style="font-size:13px">生效路由</strong>
-          <span class="hint" style="margin:0 0 0 10px">每个别名都定义在它所属上游 profile 的「本方案的模型表」里，请到上方的 profile 卡片中编辑。</span>
         </div>
         <div class="form-body">
-          <div class="hint" style="margin:0 0 8px">经过默认网关与内置兜底之后，每个别名实际走哪个模型。这里的内容不会被保存。</div>
+          <div class="hint" style="margin:0 0 8px">经过 haiku 兜底之后，每个别名实际走哪个模型。这里的内容不会被保存。</div>
           <div id="effective-routes"></div>
         </div>
       </div>
