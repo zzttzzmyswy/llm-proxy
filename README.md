@@ -169,6 +169,10 @@ go build -o llm-proxy .
 ./llm-proxy            # 默认监听 :8088
 ```
 
+发布二进制用 `sh release.sh` 构建。它固定 `CGO_ENABLED=0` 与 `-buildvcs=false`：前者保证静态链接
+（否则 amd64 会链上构建机的 glibc，换台机器——比如 NAS——可能起不来），后者让同一 commit 重复构建
+得到相同的元数据，而不是因为工作区有别的改动就变成 `+dirty`。
+
 管理页面的源码是 `admin.html`（结构 + 样式）与 `admin.js`（脚本）两个文件，`build.sh` 把脚本内联成单文件 `admin_page.html` 供二进制 `go:embed`。拆开是为了让图表的纯计算部分能在 node 下单测（`admin_js_test.js`），页面本身仍然是一个自包含文档、不依赖 CDN。改了页面没跑 `build.sh` 时 `TestAdminPageIsUpToDateWithItsSources` 会失败，不会静默发出旧页面。
 
 配置路径默认 `/etc/llm-proxy/config.toml`，可用 `LLM_PROXY_CONFIG` 覆盖：
