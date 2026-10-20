@@ -23,6 +23,10 @@ func registerAdmin() {
 	http.HandleFunc("/admin", requireAdmin(handleAdminPage))
 	http.HandleFunc("/admin/", requireAdmin(handleAdminPage))
 	http.HandleFunc("/admin/api/config", requireAdmin(handleAdminConfig))
+	http.HandleFunc("/admin/api/config/main", requireAdmin(handleAdminSaveMain))
+	http.HandleFunc("/admin/api/config/scheme", requireAdmin(handleAdminSaveScheme))
+	http.HandleFunc("/admin/api/config/activate", requireAdmin(handleAdminActivate))
+	http.HandleFunc("/admin/api/schemes", requireAdmin(handleAdminSchemes))
 	http.HandleFunc("/admin/api/stats", requireAdmin(handleAdminStats))
 	http.HandleFunc("/admin/api/stats/history", requireAdmin(handleAdminStatsHistory))
 	http.HandleFunc("/admin/api/stats/reset", requireAdmin(handleAdminStatsReset))
@@ -88,15 +92,41 @@ func handleAdminStatsReset(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true})
 }
 
+// handleAdminConfig serves the read-only configuration state. Saving is split
+// across three endpoints — the main file, one scheme file, and the activation
+// switch — so a page can send only what its own form changed.
 func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, http.StatusOK, currentConfigView())
-	case http.MethodPost:
-		handleAdminConfigSave(w, r)
-	default:
-		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed; use /admin/api/config/main, /admin/api/config/scheme or /admin/api/config/activate")
+		return
 	}
+	writeJSON(w, http.StatusOK, currentConfigView())
+}
+
+// handleAdminSchemes lists the scheme files and returns the one named by
+// ?name=, or the active scheme when the parameter is absent. The editor page
+// loads any scheme this way, so it can edit one that is not running.
+func handleAdminSchemes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	c := currentConfig()
+	dir := schemesDir(&c)
+	name := normalizeSchemeName(r.URL.Query().Get("name"))
+	if name == "" {
+		name = normalizeSchemeName(c.Proxy.Scheme)
+	}
+	if !validSchemeName(name) {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("方案名 %q 不合法", name))
+		return
+	}
+	view, err := schemeView(dir, name)
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
 // adminProxyView is the process-level settings the page edits.
@@ -225,16 +255,32 @@ type adminAuthPayload struct {
 	Token  string `json:"token"`
 }
 
-type adminConfigPayload struct {
-	Proxy    adminProxyView       `json:"proxy"`
+// adminMainPayload is the main-configuration form: the process settings plus the
+// admin password. It writes only config.toml, so it never touches a scheme file.
+type adminMainPayload struct {
+	Port  int              `json:"port"`
+	Admin adminAuthPayload `json:"admin"`
+}
+
+// adminSchemePayload is the scheme editor's form: one scheme file, whole. The name
+// says which file it is; a name that is not the running one is an edit of that file
+// rather than a switch, so editing a scheme never changes which scheme is active.
+type adminSchemePayload struct {
+	Name     string               `json:"name"`
 	Upstream adminUpstreamPayload `json:"upstream"`
 	VLM      adminVLMPayload      `json:"vlm"`
 	Chat     adminChatPayload     `json:"chat"`
-	Admin    adminAuthPayload     `json:"admin"`
 	// Routing is the scheme's complete model table, submitted whole. A nil slice
-	// means the request does not model it and the running table is carried over; an
+	// means the request does not model it and the stored table is carried over; an
 	// empty non-nil slice is the operator having deleted every row.
 	Routing []adminRoutingEntry `json:"routing"`
+}
+
+// adminActivatePayload switches which scheme runs. It is deliberately separate
+// from the editor: switching rewrites one line of the main file and leaves every
+// scheme file exactly as it was.
+type adminActivatePayload struct {
+	Scheme string `json:"scheme"`
 }
 
 // currentConfigView renders the running config for the page.
@@ -273,6 +319,67 @@ func currentConfigView() adminConfigView {
 		v.SchemePath = schemePath(dir, s.Name)
 	}
 	return v
+}
+
+// adminSchemeView is one scheme file as the editor reads it, whether or not it is
+// the scheme currently running. Active says which it is, so the page can promise
+// "saved, effective now" only when it really is.
+type adminSchemeView struct {
+	Name     string            `json:"name"`
+	Path     string            `json:"path"`
+	Active   bool              `json:"active"`
+	Upstream adminUpstreamView `json:"upstream"`
+	VLM      adminVLMView      `json:"vlm"`
+	Chat     adminChatView     `json:"chat"`
+	Routing  []adminRoutingEntry `json:"routing"`
+	// EffectiveRouting is the resolved table including the derived haiku alias.
+	EffectiveRouting map[string]adminEffectiveRoute `json:"effective_routing"`
+}
+
+// currentSchemeView renders the running scheme.
+func currentSchemeView(name string) adminSchemeView {
+	c := currentConfig()
+	v, err := schemeView(schemesDir(&c), name)
+	if err != nil {
+		// The caller asked about a scheme the process just loaded, so this cannot
+		// happen; returning an empty view beats a nil pointer in the response.
+		return adminSchemeView{Name: name}
+	}
+	return v
+}
+
+// schemeView loads one scheme file and renders it for the editor. It parses the
+// file rather than reading the running scheme, so an inactive scheme is editable
+// with the same form and its own stored values.
+func schemeView(dir, name string) (adminSchemeView, error) {
+	path := schemePath(dir, name)
+	if _, err := os.Stat(path); err != nil {
+		return adminSchemeView{}, fmt.Errorf("方案 %q 不存在（%s）", name, path)
+	}
+	s, err := parseSchemeFile(path, name)
+	if err != nil {
+		return adminSchemeView{}, fmt.Errorf("读取方案 %q 失败: %w", name, err)
+	}
+	v := adminSchemeView{
+		Name:             s.Name,
+		Path:             path,
+		Active:           s.Name == normalizeSchemeName(currentConfig().Proxy.Scheme),
+		Upstream:         upstreamView(s.Text),
+		VLM:              adminVLMView{},
+		Chat:             adminChatView{Available: s.Chat.Name != "", Inherit: s.ChatInheritsText, Upstream: upstreamView(s.Chat)},
+		Routing:          routingViews(s),
+		EffectiveRouting: effectiveRouting(s),
+	}
+	if s.VLM != nil {
+		v.VLM = adminVLMView{
+			Active:    true,
+			Model:     s.VLM.Model,
+			MaxTokens: s.VLM.MaxTokens,
+			Inherit:   s.VLMInheritsText,
+			Upstream:  upstreamView(s.VLM.Upstream),
+		}
+	}
+	return v, nil
 }
 
 // upstreamView renders one resolved upstream. A zero Upstream (a scheme with no
@@ -329,131 +436,64 @@ func effectiveRouting(s *Scheme) map[string]adminEffectiveRoute {
 // running config disagreeing.
 var configSaveMu sync.Mutex
 
-func handleAdminConfigSave(w http.ResponseWriter, r *http.Request) {
-	var payload adminConfigPayload
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
-	if err := dec.Decode(&payload); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "请求体不是合法 JSON: "+err.Error())
+// handleAdminSaveMain writes the main configuration: the listen port and the admin
+// password. It is the only save that can change the password, and the only one that
+// never reads or writes a scheme file.
+func handleAdminSaveMain(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed; /admin/api/config/main accepts POST")
+		return
+	}
+	var payload adminMainPayload
+	if err := decodePayload(w, r, &payload); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	// Take the transaction lock before reading the running config, not after: the
-	// "keep" key and password carry the stored value over, and the backup is the
-	// previous file. Reading the old value outside the lock lets two concurrent
-	// saves both base themselves on the same snapshot and the later one silently
-	// undo the earlier one's change.
 	configSaveMu.Lock()
 	defer configSaveMu.Unlock()
 
 	oldConfig := currentConfig()
-	oldScheme := currentScheme()
-	dir := schemesDir(&oldConfig)
-
-	active := normalizeSchemeName(payload.Proxy.Scheme)
-	if active == "" {
-		active = oldConfig.Proxy.Scheme
-	}
-	if !validSchemeName(active) {
-		writeJSONError(w, http.StatusBadRequest,
-			fmt.Sprintf("方案名 %q 只能包含小写字母、数字、'-' 和 '_'（最多 %d 个字符）", payload.Proxy.Scheme, maxSchemeNameLen))
-		return
-	}
-	// Switching and editing are different operations. The submitted body belongs to
-	// the scheme the form was rendered from, so a switch only re-points the main
-	// file and must not write one scheme's settings into another scheme's file.
-	switching := active != oldScheme.Name
-	if switching {
-		target := schemePath(dir, active)
-		if _, err := os.Stat(target); err != nil {
-			writeJSONError(w, http.StatusBadRequest,
-				fmt.Sprintf("要切换到的方案 %q 不存在（%s）；请先在方案目录里创建它，或选择已有方案 %s",
-					active, target, strings.Join(listSchemes(dir), "、")))
-			return
-		}
-	}
-
 	newAdminTok, err := resolveAdminToken(payload.Admin, oldConfig.Admin.Token)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if payload.Proxy.Port < 1 || payload.Proxy.Port > 65535 {
-		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("端口 %d 超出范围（1-65535）", payload.Proxy.Port))
+	if payload.Port < 1 || payload.Port > 65535 {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("端口 %d 超出范围（1-65535）", payload.Port))
 		return
 	}
 
 	newMain := Config{
-		Proxy: ProxyConfig{Port: payload.Proxy.Port, Scheme: active, SchemesDir: oldConfig.Proxy.SchemesDir},
+		Proxy: ProxyConfig{
+			Port:       payload.Port,
+			Scheme:     oldConfig.Proxy.Scheme,
+			SchemesDir: oldConfig.Proxy.SchemesDir,
+		},
 		Admin: AdminConfig{Token: newAdminTok},
 	}
 	mainPath := configPathFromEnv()
-	renderedMain := renderMainTOML(&newMain)
+	rendered := renderMainTOML(&newMain)
 
-	// Validate the scheme body up front so a bad field is reported before anything
-	// is written. A switch carries no scheme body: the target file already exists
-	// and is left exactly as it is.
-	var renderedScheme, schemeFile string
-	if !switching {
-		f, err := validateSchemePayload(&payload, oldScheme)
-		if err != nil {
-			writeJSONError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		renderedScheme = renderSchemeTOML(active, f)
-		schemeFile = schemePath(dir, oldScheme.Name)
-	}
-
-	// Parse before writing: a file that cannot be read would take the proxy down on
-	// its next restart.
-	if err := probeFiles(active, renderedMain, schemeFile, renderedScheme); err != nil {
-		writeJSONError(w, http.StatusBadRequest, "生成的配置无法解析: "+err.Error())
+	var probe Config
+	if err := toml.Unmarshal([]byte(rendered), &probe); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "生成的主配置无法解析: "+err.Error())
 		return
 	}
 
-	// Only the files this save rewrites are backed up.
-	mainBackup, _, err := backupConfigFile(mainPath)
+	backup, _, err := backupConfigFile(mainPath)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "备份配置文件失败: "+err.Error())
 		return
 	}
-	var schemeBackup []byte
-	if !switching {
-		schemeBackup, _, err = backupConfigFile(schemeFile)
-		if err != nil {
-			writeJSONError(w, http.StatusInternalServerError, "备份方案文件失败: "+err.Error())
-			return
-		}
-	}
-
-	if err := writeFileAtomic(mainPath, []byte(renderedMain)); err != nil {
+	if err := writeFileAtomic(mainPath, []byte(rendered)); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "写入配置文件失败: "+err.Error())
 		return
 	}
-	if !switching {
-		if err := writeFileAtomic(schemeFile, []byte(renderedScheme)); err != nil {
-			// The main file is already written; put it back so the two files never
-			// disagree about which scheme runs.
-			rollback(mainPath, mainBackup)
-			writeJSONError(w, http.StatusInternalServerError, "写入方案文件失败: "+err.Error())
-			return
-		}
-	}
-
 	if err := loadConfig(); err != nil {
-		// The files are on disk but unusable: put the previous ones back so the
-		// running proxy and the files never disagree.
 		msg := "配置重载失败: " + err.Error()
-		var problems []string
-		if e := rollback(mainPath, mainBackup); e != "" {
-			problems = append(problems, "回滚主配置失败: "+e)
-		}
-		if !switching {
-			if e := rollback(schemeFile, schemeBackup); e != "" {
-				problems = append(problems, "回滚方案文件失败: "+e)
-			}
-		}
-		if len(problems) > 0 {
-			msg += "；" + strings.Join(problems, "；")
+		if e := rollback(mainPath, backup); e != "" {
+			msg += "；回滚主配置失败: " + e
 		} else {
 			msg += "；已回滚到保存前的配置"
 		}
@@ -468,8 +508,199 @@ func handleAdminConfigSave(w http.ResponseWriter, r *http.Request) {
 		// before the page can talk to the API again. A password supplied by the
 		// environment cannot change from here, so it needs no re-auth.
 		"reauth_required": newAdminTok != oldConfig.Admin.Token && os.Getenv("LLM_PROXY_ADMIN_TOKEN") == "",
-		"warnings":        configWarnings(&payload, switching),
+		"warnings":        mainWarnings(&payload, oldConfig),
 	})
+}
+
+// handleAdminSaveScheme writes one scheme file. The scheme it edits is the one the
+// form was rendered from — not the active one — so editing a scheme that is not
+// running cannot disturb the traffic the proxy is serving.
+func handleAdminSaveScheme(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed; /admin/api/config/scheme accepts POST")
+		return
+	}
+	var payload adminSchemePayload
+	if err := decodePayload(w, r, &payload); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	configSaveMu.Lock()
+	defer configSaveMu.Unlock()
+
+	oldConfig := currentConfig()
+	dir := schemesDir(&oldConfig)
+
+	name := normalizeSchemeName(payload.Name)
+	if !validSchemeName(name) {
+		writeJSONError(w, http.StatusBadRequest,
+			fmt.Sprintf("方案名 %q 只能包含小写字母、数字、'-' 和 '_'（最多 %d 个字符）", payload.Name, maxSchemeNameLen))
+		return
+	}
+	path := schemePath(dir, name)
+	if _, err := os.Stat(path); err != nil {
+		writeJSONError(w, http.StatusNotFound,
+			fmt.Sprintf("方案 %q 不存在（%s）；编辑器只改已有方案，新建请直接在方案目录里创建文件", name, path))
+		return
+	}
+	// The "keep" key action resolves against the file being edited, so base the
+	// validation on that scheme — parsed from disk, because the running scheme may
+	// be a different file.
+	old, err := parseSchemeFile(path, name)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "读取方案失败: "+err.Error())
+		return
+	}
+
+	f, err := validateSchemePayload(&payload, old)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rendered := renderSchemeTOML(name, f)
+
+	// Parse before writing: a file that cannot be read would take the proxy down on
+	// its next restart, and an inactive scheme is loaded by the next switch.
+	probeDir, err := os.MkdirTemp("", "llm-proxy-probe-*")
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "无法创建校验临时目录: "+err.Error())
+		return
+	}
+	defer os.RemoveAll(probeDir)
+	probePath := filepath.Join(probeDir, name+".toml")
+	if err := os.WriteFile(probePath, []byte(rendered), 0o600); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "写入校验文件失败: "+err.Error())
+		return
+	}
+	if _, err := parseSchemeFile(probePath, name); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "生成的方案配置无法解析: "+err.Error())
+		return
+	}
+
+	backup, _, err := backupConfigFile(path)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "备份方案文件失败: "+err.Error())
+		return
+	}
+	if err := writeFileAtomic(path, []byte(rendered)); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "写入方案文件失败: "+err.Error())
+		return
+	}
+
+	// An inactive scheme is not running, so nothing has to be reloaded: the file is
+	// simply what the next activation will read. The active one is reloaded, with
+	// the same rollback the main save uses.
+	if name == normalizeSchemeName(oldConfig.Proxy.Scheme) {
+		if err := loadConfig(); err != nil {
+			msg := "配置重载失败: " + err.Error()
+			if e := rollback(path, backup); e != "" {
+				msg += "；回滚方案文件失败: " + e
+			} else {
+				msg += "；已回滚到保存前的配置"
+			}
+			writeJSONError(w, http.StatusInternalServerError, msg)
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":                      true,
+		"config":                  currentConfigView(),
+		"scheme":                  currentSchemeView(name),
+		"applied":                 name == normalizeSchemeName(oldConfig.Proxy.Scheme),
+		"reauth_required":         false,
+		"warnings":                schemeWarnings(&payload),
+	})
+}
+
+// handleAdminActivate switches which scheme runs. It writes one line of the main
+// file and reads no scheme file beyond checking the target exists.
+func handleAdminActivate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed; /admin/api/config/activate accepts POST")
+		return
+	}
+	var payload adminActivatePayload
+	if err := decodePayload(w, r, &payload); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	configSaveMu.Lock()
+	defer configSaveMu.Unlock()
+
+	oldConfig := currentConfig()
+	dir := schemesDir(&oldConfig)
+	name := normalizeSchemeName(payload.Scheme)
+	if !validSchemeName(name) {
+		writeJSONError(w, http.StatusBadRequest,
+			fmt.Sprintf("方案名 %q 只能包含小写字母、数字、'-' 和 '_'（最多 %d 个字符）", payload.Scheme, maxSchemeNameLen))
+		return
+	}
+	if name == normalizeSchemeName(oldConfig.Proxy.Scheme) {
+		// Already active: report success rather than rewriting the file for nothing.
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"ok": true, "config": currentConfigView(), "scheme": currentSchemeView(name),
+		})
+		return
+	}
+	target := schemePath(dir, name)
+	if _, err := os.Stat(target); err != nil {
+		writeJSONError(w, http.StatusBadRequest,
+			fmt.Sprintf("要切换到的方案 %q 不存在（%s）；请先在方案目录里创建它，或选择已有方案 %s",
+				name, target, strings.Join(listSchemes(dir), "、")))
+		return
+	}
+	// Refuse to activate a file that will not load: a switch that leaves the proxy
+	// unable to serve is worse than a rejected switch.
+	if _, err := parseSchemeFile(target, name); err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("方案 %q 无法加载，未切换: %v", name, err))
+		return
+	}
+
+	newMain := Config{
+		Proxy: ProxyConfig{Port: oldConfig.Proxy.Port, Scheme: name, SchemesDir: oldConfig.Proxy.SchemesDir},
+		Admin: AdminConfig{Token: oldConfig.Admin.Token},
+	}
+	mainPath := configPathFromEnv()
+	rendered := renderMainTOML(&newMain)
+
+	backup, _, err := backupConfigFile(mainPath)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "备份配置文件失败: "+err.Error())
+		return
+	}
+	if err := writeFileAtomic(mainPath, []byte(rendered)); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "写入配置文件失败: "+err.Error())
+		return
+	}
+	if err := loadConfig(); err != nil {
+		msg := "切换后重载失败: " + err.Error()
+		if e := rollback(mainPath, backup); e != "" {
+			msg += "；回滚主配置失败: " + e
+		} else {
+			msg += "；已回滚到切换前的方案"
+		}
+		writeJSONError(w, http.StatusInternalServerError, msg)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"ok":       true,
+		"config":   currentConfigView(),
+		"scheme":   currentSchemeView(name),
+		"warnings": []string{fmt.Sprintf("已切换到方案 %q。切换只改主配置里选中的方案，其他方案文件的内容未被修改。", name)},
+	})
+}
+
+// decodePayload reads one JSON body with the size bound every save uses.
+func decodePayload(w http.ResponseWriter, r *http.Request, into interface{}) error {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err := dec.Decode(into); err != nil {
+		return err
+	}
+	return nil
 }
 
 // rollback puts a file's previous contents back and returns what went wrong, or ""
@@ -504,7 +735,7 @@ func resolveAdminToken(p adminAuthPayload, old string) (string, error) {
 // validateSchemePayload validates the scheme body and returns what to write. Every
 // check happens here, at the one point where the operator can still fix it: a value
 // the loader would silently drop is a no-op from the page's point of view.
-func validateSchemePayload(p *adminConfigPayload, old *Scheme) (*SchemeFile, error) {
+func validateSchemePayload(p *adminSchemePayload, old *Scheme) (*SchemeFile, error) {
 	text, err := validateUpstreamPayload("上游", p.Upstream, old.Text, true)
 	if err != nil {
 		return nil, err
@@ -858,16 +1089,30 @@ func probeFiles(active, mainTOML, schemePath, schemeTOML string) error {
 	return nil
 }
 
-// configWarnings reports what a save changed that the operator should know about.
-func configWarnings(payload *adminConfigPayload, switching bool) []string {
+// mainWarnings reports what the main-configuration save changed that the operator
+// should know about.
+func mainWarnings(p *adminMainPayload, old Config) []string {
 	var warnings []string
-	if switching {
+	if p.Port != old.Proxy.Port {
 		warnings = append(warnings, fmt.Sprintf(
-			"已切换到方案 %q。切换只改主配置里选中的方案，其他方案文件的内容未被修改。", payload.Proxy.Scheme))
-		return warnings
+			"监听端口由 %d 改为 %d：端口变更需重启 llm-proxy 服务才能生效，其余配置已立即生效。", old.Proxy.Port, p.Port))
 	}
+	if os.Getenv("LLM_PROXY_ADMIN_TOKEN") != "" {
+		if p.Admin.Action == "clear" {
+			warnings = append(warnings, "配置文件中的管理口令已清空，但环境变量 LLM_PROXY_ADMIN_TOKEN 仍然生效，管理页面保持开放。")
+		} else {
+			warnings = append(warnings, "环境变量 LLM_PROXY_ADMIN_TOKEN 已设置，它的优先级高于配置文件里的管理口令；在页面上修改口令不会生效。")
+		}
+	}
+	return warnings
+}
+
+// schemeWarnings reports the consequences of the mapping and credential choices in
+// one scheme save.
+func schemeWarnings(p *adminSchemePayload) []string {
+	var warnings []string
 	declared := map[string]bool{}
-	for _, e := range payload.Routing {
+	for _, e := range p.Routing {
 		if alias := strings.TrimSpace(e.Alias); alias != "" {
 			declared[alias] = true
 		}
@@ -892,17 +1137,10 @@ func configWarnings(payload *adminConfigPayload, switching bool) []string {
 	}
 	// The scheme's own key_env is the supported way to keep a secret out of the
 	// file, and the shipped example uses SOPHNET_API_KEY for it. Only warn when
-	// the variable is set but no upstream in the saved scheme reads it — that is
-	// the leftover-from-the-old-global-config case.
-	if os.Getenv("SOPHNET_API_KEY") != "" && !schemeReferencesKeyEnv(payload, "SOPHNET_API_KEY") {
+	// the variable is set but no upstream in this scheme reads it — that is the
+	// leftover-from-the-old-global-config case.
+	if os.Getenv("SOPHNET_API_KEY") != "" && !schemeReferencesKeyEnv(p, "SOPHNET_API_KEY") {
 		warnings = append(warnings, "环境变量 SOPHNET_API_KEY 已设置，但本方案的任何上游都没有引用它：每个上游只用自己的 key / key_env，该变量被忽略。")
-	}
-	if os.Getenv("LLM_PROXY_ADMIN_TOKEN") != "" {
-		if payload.Admin.Action == "clear" {
-			warnings = append(warnings, "配置文件中的管理口令已清空，但环境变量 LLM_PROXY_ADMIN_TOKEN 仍然生效，管理页面保持开放。")
-		} else {
-			warnings = append(warnings, "环境变量 LLM_PROXY_ADMIN_TOKEN 已设置，它的优先级高于配置文件里的管理口令；在页面上修改口令不会生效。")
-		}
 	}
 	return warnings
 }
@@ -917,9 +1155,9 @@ func aliasUndeclaredFallsBack(declared map[string]bool, alias string) bool {
 // reads the named environment variable.
 //
 // A section that inherits the text upstream contributes nothing of its own, so its
-// key_env is not a reference — the save discards it, which is why validateSchemePayload
-// never reads those fields in that case either.
-func schemeReferencesKeyEnv(p *adminConfigPayload, name string) bool {
+// key_env is not a reference — the save discards it, which is why
+// validateSchemePayload never reads those fields in that case either.
+func schemeReferencesKeyEnv(p *adminSchemePayload, name string) bool {
 	referenced := []string{p.Upstream.KeyEnv}
 	if p.VLM.Active && !p.VLM.Inherit {
 		referenced = append(referenced, p.VLM.Upstream.KeyEnv)
