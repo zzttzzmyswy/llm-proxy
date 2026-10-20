@@ -58,3 +58,27 @@ func TestAdminPageCarriesTheHistoryChart(t *testing.T) {
 		}
 	}
 }
+
+// The admin page is four separate views, not one long scroll. If a refactor folds
+// two back together, the operator loses the split this page exists to provide.
+func TestAdminPageIsSplitIntoFourViews(t *testing.T) {
+	page := string(adminHTML)
+	for _, view := range []string{"usage", "errors", "main", "schemes"} {
+		if !strings.Contains(page, `data-page="`+view+`"`) {
+			t.Errorf("the page is missing the %q view", view)
+		}
+	}
+	// Every listing that can grow without bound needs its own pager.
+	for _, pager := range []string{"models-pager", "failures-pager", "routing-pager"} {
+		if !strings.Contains(page, `id="`+pager+`"`) {
+			t.Errorf("the page is missing the %q control", pager)
+		}
+	}
+	// Each configuration view reports its own save result, so one page's message
+	// cannot overwrite the other's.
+	for _, bannerID := range []string{"main-banner", "scheme-banner"} {
+		if !strings.Contains(page, `id="`+bannerID+`"`) {
+			t.Errorf("the page is missing the %q region", bannerID)
+		}
+	}
+}

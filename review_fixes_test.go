@@ -342,9 +342,9 @@ func TestReviewConcurrentSavesStayConsistent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			p := payloadFromView(currentView(t))
+			p := schemePayloadFromView(schemeEditorView(t, ""))
 			p.VLM.Model = fmt.Sprintf("VLM-%d", i)
-			res := postConfig(t, p, "s3cret")
+			res := postScheme(t, p, "s3cret")
 			if res.Code != http.StatusOK {
 				t.Errorf("concurrent save %d failed: %d %s", i, res.Code, res.Body.String())
 			}
@@ -368,17 +368,28 @@ func TestReviewConcurrentSavesStayConsistent(t *testing.T) {
 	}
 }
 
-// P2: a save warning must not live in the region the stats refresh clears.
+// P2: a save warning must not live in the region the stats refresh clears. Each
+// configuration page now has its own save banner, and the stats refresh still owns
+// only the shared "banner" region.
 func TestReviewSaveWarningsHaveTheirOwnRegion(t *testing.T) {
 	page := string(adminHTML)
-	if !strings.Contains(page, `id="save-banner"`) {
-		t.Fatal("save results need their own message region")
+	for _, id := range []string{"main-banner", "scheme-banner"} {
+		if !strings.Contains(page, `id="`+id+`"`) {
+			t.Fatalf("save results need their own message region (%s)", id)
+		}
 	}
 	if !strings.Contains(page, `hideBanner("banner")`) {
 		t.Fatal("the stats refresh must hide only the stats region")
 	}
 	if strings.Contains(page, "hideBanner()") {
 		t.Fatal("a bare hideBanner() would clear the save warnings too")
+	}
+	// A save must never report into the region the stats refresh clears, or its
+	// message would vanish on the next 5s tick.
+	for _, bad := range []string{`banner("banner", "ok", "已保存`, `banner("banner", "warnbox", "已保存`} {
+		if strings.Contains(page, bad) {
+			t.Fatalf("a save result must not use the stats region, found %q", bad)
+		}
 	}
 }
 
@@ -416,13 +427,12 @@ func TestReviewClearWarningRespectsEnvPassword(t *testing.T) {
 	withDefaultConfig(t)
 	t.Setenv("LLM_PROXY_ADMIN_TOKEN", "env-token")
 
-	p := payloadFromView(currentView(t))
-	p.Admin = adminAuthPayload{Action: "clear"}
+	p := adminMainPayload{Port: currentConfig().Proxy.Port, Admin: adminAuthPayload{Action: "clear"}}
 
 	var out struct {
 		Warnings []string `json:"warnings"`
 	}
-	res := postConfig(t, p, "env-token")
+	res := postMain(t, p, "env-token")
 	if res.Code != http.StatusOK {
 		t.Fatalf("clear failed: %d %s", res.Code, res.Body.String())
 	}
