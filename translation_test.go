@@ -1162,3 +1162,67 @@ func TestAnthropicToOpenAIRequestDropsThinking(t *testing.T) {
 		}
 	}
 }
+
+// When the describe pass fails on an openai-served VLM, the whole request has to be
+// routed to that VLM — which means translating it to chat-completions, not sending
+// the Anthropic body to an openai endpoint. The fallback used to assume the VLM
+// upstream spoke anthropic.
+func TestOpenAIVLMDescribeFailFallsBackThroughTranslation(t *testing.T) {
+	resetImageDescCacheForTests()
+	t.Cleanup(resetImageDescCacheForTests)
+
+	var mu sync.Mutex
+	var fallbackBody string
+	calls := 0
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var m map[string]interface{}
+		json.Unmarshal(b, &m)
+		model, _ := m["model"].(string)
+
+		mu.Lock()
+		calls++
+		n := calls
+		if model == "vision-model" && n == 1 {
+			// First describe attempt fails; the fallback then goes to the same model.
+			mu.Unlock()
+			w.WriteHeader(500)
+			return
+		}
+		if model == "vision-model" {
+			fallbackBody = string(b)
+		}
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"c1","model":"vision-model","choices":[{"index":0,"message":{"role":"assistant","content":"vlm saw it"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	withSchemeChat(t, upstream.URL)
+	withVLM(t, "vision-model", 8000)
+	setRoute(t, "sonnet", "text-model", "")
+
+	resp := callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("expected describe (fail) then fallback, got %d calls", calls)
+	}
+	// The fallback must be a chat-completions body: role/content parts, and the image
+	// as an image_url rather than an Anthropic image block.
+	if !strings.Contains(fallbackBody, `"role":"user"`) {
+		t.Fatalf("the fallback must be translated to a chat request, got: %s", fallbackBody)
+	}
+	if !strings.Contains(fallbackBody, `"image_url"`) {
+		t.Fatalf("the fallback must carry the image as image_url, got: %s", fallbackBody)
+	}
+	if strings.Contains(fallbackBody, `"type":"image"`) {
+		t.Fatalf("the fallback must not send an Anthropic image block, got: %s", fallbackBody)
+	}
+	if !strings.Contains(resp, "vlm saw it") {
+		t.Fatalf("the client must receive the VLM reply, got: %q", resp)
+	}
+}

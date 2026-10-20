@@ -355,13 +355,6 @@ func TestAdminConfigRejectsInvalidPayloadWithoutWriting(t *testing.T) {
 		{"bad protocol", func(p *adminSchemePayload) { p.Upstream.Protocol = "grpc" }, "protocol"},
 		{"negative timeout", func(p *adminSchemePayload) { p.Upstream.BodyIdleSeconds = -1 }, "负数"},
 		{"vlm without model", func(p *adminSchemePayload) { p.VLM.Active = true; p.VLM.Model = "" }, "vlm model"},
-		{"vlm inheriting an openai upstream", func(p *adminSchemePayload) {
-			p.Upstream.Protocol = protocolOpenAI
-			p.Upstream.URL = "https://openai.example/v1"
-			p.VLM.Active = true
-			p.VLM.Inherit = true
-			p.VLM.Model = "m"
-		}, "anthropic"},
 		{"chat on an anthropic upstream", func(p *adminSchemePayload) {
 			p.Chat.Available = true
 			p.Chat.Inherit = true
@@ -1152,4 +1145,58 @@ func TestAdminWriteEndpointsRejectNonPost(t *testing.T) {
 			t.Fatalf("the error must name the verb, got %s", w.Body.String())
 		}
 	}
+}
+
+// The save that used to fail: an openai text upstream with [vlm] inheriting it. The
+// describe call is framed per protocol now, so there is nothing to reject — and the
+// promise that a [vlm] section may name its own upstream in either protocol holds
+// too.
+func TestAdminSchemeSaveAcceptsVLMOnAnOpenAIUpstream(t *testing.T) {
+	withDefaultConfig(t)
+
+	// Inheriting an openai upstream.
+	p := schemePayloadFromView(schemeEditorView(t, ""))
+	p.Upstream = adminUpstreamPayload{
+		Protocol: protocolOpenAI, URL: "https://openai.example/v1", KeyAction: "keep",
+	}
+	p.VLM = adminVLMPayload{Active: true, Model: "vision-model", Inherit: true}
+	res := postScheme(t, p, "s3cret")
+	if res.Code != http.StatusOK {
+		t.Fatalf("inheriting an openai upstream must be accepted, got %d: %s", res.Code, res.Body.String())
+	}
+	if got := currentScheme().VLM.Upstream.Protocol; got != protocolOpenAI {
+		t.Fatalf("the describe pass must run on the openai upstream, got %q", got)
+	}
+	if !currentScheme().VLMInheritsText {
+		t.Fatal("the section must still be recorded as inheriting")
+	}
+
+	// A [vlm] naming its own openai upstream.
+	p = schemePayloadFromView(schemeEditorView(t, ""))
+	p.VLM = adminVLMPayload{
+		Active: true, Model: "vision-model", Inherit: false,
+		Upstream: adminUpstreamPayload{Protocol: protocolOpenAI, URL: "https://vision.example/v1", KeyAction: "keep"},
+	}
+	res = postScheme(t, p, "s3cret")
+	if res.Code != http.StatusOK {
+		t.Fatalf("an explicit openai [vlm] must be accepted, got %d: %s", res.Code, res.Body.String())
+	}
+	if got := currentScheme().VLM.Upstream.URL; got != "https://vision.example/v1" {
+		t.Fatalf("the [vlm] upstream must be the one written, got %q", got)
+	}
+	// And it must survive a reload from the file, not just live in memory.
+	reloaded, err := parseSchemeFile(schemePath(dirOf(t), "main"), "main")
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.VLM == nil || reloaded.VLM.Upstream.Protocol != protocolOpenAI {
+		t.Fatalf("the written file must keep the openai describe upstream, got %+v", reloaded.VLM)
+	}
+}
+
+// dirOf is the schemes directory of the running config.
+func dirOf(t *testing.T) string {
+	t.Helper()
+	c := currentConfig()
+	return schemesDir(&c)
 }
