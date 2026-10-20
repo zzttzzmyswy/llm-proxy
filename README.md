@@ -60,12 +60,19 @@ Claude Code 默认只认 Anthropic 官方模型名（`sonnet` / `opus` / `haiku`
 
 浏览器打开 `http://<host>:8088/admin`，用配置里的 `[admin] token` 作为口令（HTTP Basic，用户名任意）。
 
-页面分四块：
+页面分**四页**（顶部标签切换，地址栏带 `#/usage`、`#/errors`、`#/main`、`#/schemes`，可直接收藏某一页）：
 
-- **总览 / 模型调用情况**：每个模型一行，含请求数、成功/失败、失败率、TPM（最近 60 秒 token）、RPM（最近 60 秒请求）、输入/输出 token 累计、缓存命中率、平均与最大延迟，以及最近 30 分钟每分钟 token 的迷你趋势图。按实际发给上游的模型名聚合，并列出打到该模型的别名分布。
-- **历史速率**：趋势图 + 区间小结，用来评估上游平台的稳定性（见下）。
-- **失败情况**：按分类（`upstream_5xx` / `rate_limited` / `upstream_4xx` / `network_timeout` / `network_error` / `empty_response` / `stream_stalled` / `upstream_stream_error` / `translate_error` / `vlm_describe_failed`）计数，并列出最近失败的时间、模型、别名、分类、状态码与消息。网关在 HTTP 200 的流内以 `error` 事件报的错也会计入 `upstream_stream_error`，不会被当成成功。
-- **配置**：结构化表单编辑代理参数、**上游 profile（可增删改，每个 profile 含自己的 VLM 设置与模型映射表）**、`[proxy]` 的两个上游选择器、`[upstream]` 地址与超时、上游密钥、管理页面口令。保存后**立即生效**（进程内热重载），无需重启服务。别名在所属 profile 的卡片里编辑；另有只读的「生效路由」展示回填内置兜底之后每个别名实际走哪个模型。
+- **用量统计**：
+  - *总览*：总请求、失败请求、TPM（最近 60 秒 token）、RPM（最近 60 秒请求）。
+  - *历史速率*：趋势图 + 区间小结，用来评估上游平台的稳定性（见下）。
+  - *模型调用情况*：每个模型一行，含请求数、成功/失败、失败率、TPM、RPM、输入/输出 token 累计、缓存命中率、平均与最大延迟，以及最近 30 分钟每分钟 token 的迷你趋势图。按实际发给上游的模型名聚合，并列出打到该模型的别名分布。**分页**，每页 20/50/100 条可选。
+- **报错统计**：按分类（`upstream_5xx` / `rate_limited` / `upstream_4xx` / `network_timeout` / `network_error` / `empty_response` / `stream_stalled` / `upstream_stream_error` / `translate_error` / `vlm_describe_failed`）计数，并列出失败的时间、模型、别名、分类、状态码与消息。网关在 HTTP 200 的流内以 `error` 事件报的错也会计入 `upstream_stream_error`，不会被当成成功。**分页**。
+- **主配置**：监听端口与管理页面口令。只写主配置 `config.toml`，**不会碰任何方案文件**。端口变更需重启，其余立即生效。
+- **方案文件**：下拉选择要编辑的方案（可以是不生效的那份），编辑它的主上游、`[vlm]`、`[chat]` 与模型映射表；模型表**分页**。保存只写该方案文件。要让它生效，用同一页的「启用该方案」——切换只改主配置里选中的名字，**不改动任何方案文件**。页面会明确标出当前编辑的是「生效中」还是「未生效」，保存提示也据此区分「已生效」与「保存了，启用后生效」。
+
+> 三个写操作是分开的：`/admin/api/config/main`（主配置）、`/admin/api/config/scheme`（单个方案）、
+> `/admin/api/config/activate`（切换）。所以改端口不会顺手重写方案文件，改方案也不会顺手改主配置。
+> 编辑未生效的方案不会重载进程，只有生效中的那份保存后才立即生效。
 
 ### 历史速率图
 
