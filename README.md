@@ -243,7 +243,7 @@ export ANTHROPIC_AUTH_TOKEN="<任意值，代理会替换为真实上游密钥>"
 
 | 表 | 说明 |
 |----|------|
-| `[vlm]` | 图片描述。`model`（视觉模型）+ `max_tokens`（默认 8000），以及可选的 `protocol`/`url`/`key`/`key_env`。**不写 protocol/url 就沿用本方案的文本上游**——只有当文本上游是 anthropic 协议时成立，因为描述调用走 `/v1/messages`。整个表或 `model` 留空 = 关闭描述，带图请求原样转发 |
+| `[vlm]` | 图片描述。`model`（视觉模型）+ `max_tokens`（默认 8000），以及可选的 `protocol`/`url`/`key`/`key_env`。**不写 protocol/url 就沿用本方案的文本上游**，调用格式随该上游的协议：anthropic 走 `/v1/messages`，openai 走 `/v1/chat/completions`（图片作为 `image_url` part）。整个表或 `model` 留空 = 关闭描述，带图请求原样转发 |
 | `[chat]` | `/v1/chat/completions` 透传走哪个上游，**必须 openai 协议**。不写 protocol/url 就沿用文本上游（要求文本上游是 openai）。anthropic 方案又不写 `[chat]` 时，该端点返回 502 而不是乱转发 |
 | `[routing]` | 本方案的模型映射表：`<别名> = "模型名"` 或 `{ model = "...", supports_image = true }`。别名即客户端请求的模型名，解析顺序见下。`supports_image = true` 表示该模型原生支持图片，带图请求跳过描述直发 |
 
@@ -323,8 +323,8 @@ haiku  = { model = "DeepSeek-Flash-1017", supports_image = true }
 - **没有全局兜底**。以前 `[upstream]`/`[keys]`/`[proxy].vlm_*` 提供的默认值已全部移除：少写一个 `url` 就是启动
   报错，而不是悄悄走另一个网关。`SOPHNET_API_KEY` 也不再被读取。
 - **方案名即文件名**，只能用小写字母、数字、`-`、`_`，最长 32 字符。
-- **段可以继承本方案的文本上游**（`[vlm]`/`[chat]` 不写 protocol/url），但协议必须匹配：描述调用只说 anthropic，
-  透传说只 openai。不匹配时加载即报错，不会留到请求时才失败。
+- **段可以继承本方案的文本上游**（`[vlm]`/`[chat]` 不写 protocol/url）。`[vlm]` 两种协议都支持（调用格式随上游）；
+  `[chat]` 透传端点只说 openai，继承一个 anthropic 上游时加载即报错，不会留到请求时才失败。
 - **密钥永不回显**。管理页面只显示「是否已配置」与「是否来自环境变量」。
 
 ### 管理页面
