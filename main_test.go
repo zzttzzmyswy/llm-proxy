@@ -664,7 +664,7 @@ func TestHaikuFallsBackToSonnetWhenUnconfigured(t *testing.T) {
 	})
 
 	path := filepath.Join(t.TempDir(), "config.toml")
-	content := `[routing]
+	content := `[upstreams.anthropic.routing]
 sonnet = "DeepSeek-V4-Flash-0731"
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {

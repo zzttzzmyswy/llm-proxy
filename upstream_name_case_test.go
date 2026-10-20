@@ -49,8 +49,9 @@ func TestUppercaseOpenAIUpstreamSelectsTheOpenAIGateway(t *testing.T) {
 anthropic_url = "`+anthro.URL+`"
 openai_url = "`+openAI.URL+`"
 
-[routing]
-flash = { model = "glm-5.3-flash", upstream = "OpenAI" }
+[upstreams.openai.routing]
+flash = { model = "glm-5.3-flash"}
+
 `)
 
 	if e := currentRoutes()["flash"]; e.Upstream != "openai" {

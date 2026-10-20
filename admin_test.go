@@ -27,9 +27,13 @@ sophnet = "sk-original"
 [admin]
 token = "s3cret"
 
-[routing]
+# Every alias lives in the model table of the upstream profile that serves it;
+# there is no top-level [routing] any more.
+[upstreams.anthropic.routing]
 sonnet = { model = "DeepSeek-Flash", supports_image = true }
-haiku = { model = "glm-5.3-flash", upstream = "openai" }
+
+[upstreams.openai.routing]
+haiku = { model = "glm-5.3-flash" }
 `
 
 // withTempConfig points the proxy at a throwaway config file, loads it, and
@@ -157,18 +161,20 @@ func TestAdminConfigViewRedactsKey(t *testing.T) {
 	if view.Proxy.VLMModel != "MiniMax-M3" || view.Upstream.HeaderTimeoutSeconds != 120 {
 		t.Fatalf("defaults must be applied to the view: %+v", view)
 	}
-	// routing lists what the file declares, so a save cannot freeze an inherited
-	// value into the file. The builtin opus fallback is not declared, so it shows
-	// up only in the effective view.
-	if len(view.Routing) != 2 {
-		t.Fatalf("routing must list the declared aliases only, got %+v", view.Routing)
-	}
+	// Each profile reports the aliases its own table declares, so a save cannot
+	// freeze an inherited value into the file. The builtin opus fallback is not
+	// declared anywhere, so it shows up only in the effective view.
 	byAlias := map[string]adminRoutingEntry{}
-	for _, e := range view.Routing {
-		byAlias[e.Alias] = e
+	for _, prof := range view.Upstreams {
+		for _, e := range prof.Routing {
+			byAlias[e.Alias] = e
+		}
+	}
+	if len(byAlias) != 2 {
+		t.Fatalf("the profiles must report the declared aliases only, got %+v", byAlias)
 	}
 	if _, ok := byAlias["opus"]; ok {
-		t.Fatalf("an undeclared builtin fallback must not appear in the editable routing, got %+v", byAlias["opus"])
+		t.Fatalf("an undeclared builtin fallback must not appear in the editable tables, got %+v", byAlias["opus"])
 	}
 	if e := byAlias["sonnet"]; !e.SupportsImage || e.Model != "DeepSeek-Flash" {
 		t.Fatalf("sonnet route: %+v", e)
@@ -188,7 +194,6 @@ func payloadFromView(t *testing.T, view adminConfigView) adminConfigPayload {
 		Proxy:    view.Proxy,
 		Upstream: view.Upstream,
 		Keys:     adminKeysPayload{Action: "keep"},
-		Routing:  view.Routing,
 	}
 }
 
@@ -213,9 +218,13 @@ func TestAdminConfigSaveAppliesAndBacksUp(t *testing.T) {
 	p := payloadFromView(t, view)
 	p.Proxy.VLMModel = "Qwen3-VL"
 	p.Upstream.MaxRetries = 5
-	for i := range p.Routing {
-		if p.Routing[i].Alias == "sonnet" {
-			p.Routing[i].Model = "DeepSeek-V5"
+	// The aliases live in the profiles' own tables, so edit them there.
+	p.Upstreams = profilesPayloadFromView(t, view)
+	for i := range p.Upstreams {
+		for j := range p.Upstreams[i].Routing {
+			if p.Upstreams[i].Routing[j].Alias == "sonnet" {
+				p.Upstreams[i].Routing[j].Model = "DeepSeek-V5"
+			}
 		}
 	}
 
@@ -276,20 +285,23 @@ func TestAdminConfigRejectsInvalidPayloadWithoutWriting(t *testing.T) {
 		{"bad url scheme", func(p *adminConfigPayload) { p.Upstream.OpenAIURL = "ftp://x/y" }},
 		{"bad default upstream", func(p *adminConfigPayload) { p.Upstream.DefaultUpstream = "gemini" }},
 		{"duplicate alias", func(p *adminConfigPayload) {
-			p.Routing = append(p.Routing, adminRoutingEntry{Alias: "sonnet", Model: "dup"})
+			// An alias is scoped to one profile, so the duplicate is inside a
+			// profile's own table.
+			p.Upstreams[0].Routing = append(p.Upstreams[0].Routing,
+				adminRoutingEntry{Alias: p.Upstreams[0].Routing[0].Alias, Model: "dup"})
 		}},
-		{"empty model", func(p *adminConfigPayload) { p.Routing[0].Model = "  " }},
-		{"empty alias", func(p *adminConfigPayload) { p.Routing[0].Alias = "" }},
-		{"bad route upstream", func(p *adminConfigPayload) { p.Routing[0].Upstream = "bedrock" }},
+		{"empty model", func(p *adminConfigPayload) { p.Upstreams[0].Routing[0].Model = "  " }},
+		{"empty alias", func(p *adminConfigPayload) { p.Upstreams[0].Routing[0].Alias = "" }},
+		{"bad route upstream", func(p *adminConfigPayload) { p.Upstreams[0].Routing[0].Upstream = "bedrock" }},
 		{"set without a key", func(p *adminConfigPayload) { p.Keys = adminKeysPayload{Action: "set"} }},
 		{"unknown key action", func(p *adminConfigPayload) { p.Keys = adminKeysPayload{Action: "wipe"} }},
 		{"negative retries", func(p *adminConfigPayload) { p.Upstream.MaxRetries = -1 }},
-		{"control char in model", func(p *adminConfigPayload) { p.Routing[0].Model = "bad\x00model" }},
+		{"control char in model", func(p *adminConfigPayload) { p.Upstreams[0].Routing[0].Model = "bad\x00model" }},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := payloadFromView(t, view)
+			p := payloadFromViewWithProfiles(t, view)
 			tc.mutate(&p)
 			res := postConfig(t, p, "s3cret")
 			if res.Code != http.StatusBadRequest {
@@ -522,16 +534,19 @@ func TestAdminConfigSaveWarnsAboutPortChange(t *testing.T) {
 	var view adminConfigView
 	decodeBody(t, w, &view)
 
-	p := payloadFromView(t, view)
+	p := payloadFromViewWithProfiles(t, view)
 	p.Proxy.Port = 9099
-	// Drop a builtin alias to check the fallback is reported.
-	kept := p.Routing[:0]
-	for _, e := range p.Routing {
-		if e.Alias != "opus" {
-			kept = append(kept, e)
+	// Drop a builtin alias from whatever profile table declares it, to check the
+	// fallback is reported.
+	for i := range p.Upstreams {
+		kept := p.Upstreams[i].Routing[:0]
+		for _, e := range p.Upstreams[i].Routing {
+			if e.Alias != "opus" {
+				kept = append(kept, e)
+			}
 		}
+		p.Upstreams[i].Routing = kept
 	}
-	p.Routing = kept
 
 	res := postConfig(t, p, "s3cret")
 	if res.Code != http.StatusOK {
@@ -653,15 +668,41 @@ func TestRenderConfigTOMLRoundTrip(t *testing.T) {
 			BodyIdleSeconds:      90,
 			MaxRetries:           2,
 		},
-		Routing: []adminRoutingEntry{
-			{Alias: "sonnet", Model: "DeepSeek-Flash", SupportsImage: true},
-			{Alias: "opus", Model: "GLM-5.3", Upstream: "openai"},
-			{Alias: "with space", Model: "quoted-alias"},
-			{Alias: "plain", Model: "plain-model"},
+		Upstreams: []adminUpstreamProfilePayload{
+			{
+				Name: "anthropic", Protocol: "anthropic", URL: "https://anthropic.example/api",
+				Routing: []adminRoutingEntry{
+					{Alias: "sonnet", Model: "DeepSeek-Flash", SupportsImage: true},
+					{Alias: "with space", Model: "quoted-alias"},
+					{Alias: "plain", Model: "plain-model"},
+				},
+			},
+			{
+				Name: "openai", Protocol: "openai", URL: "https://openai.example/v1",
+				Routing: []adminRoutingEntry{
+					{Alias: "opus", Model: "GLM-5.3"},
+				},
+			},
 		},
 	}
 
-	rendered := renderConfigTOML(p, "tok", "sk-x", nil)
+	profiles := map[string]UpstreamProfile{
+		"anthropic": {
+			Protocol: protocolAnthropic, URL: "https://anthropic.example/api",
+			Routing: map[string]toml.Primitive{
+				"sonnet":     mustTOMLPrimitive(t, `{ model = "DeepSeek-Flash", supports_image = true }`),
+				"with space": mustTOMLPrimitive(t, `"quoted-alias"`),
+				"plain":      mustTOMLPrimitive(t, `"plain-model"`),
+			},
+		},
+		"openai": {
+			Protocol: protocolOpenAI, URL: "https://openai.example/v1",
+			Routing: map[string]toml.Primitive{
+				"opus": mustTOMLPrimitive(t, `{ model = "GLM-5.3" }`),
+			},
+		},
+	}
+	rendered := renderConfigTOML(p, "tok", "sk-x", profiles)
 
 	var got Config
 	if err := toml.Unmarshal([]byte(rendered), &got); err != nil {
@@ -671,20 +712,20 @@ func TestRenderConfigTOMLRoundTrip(t *testing.T) {
 		t.Fatalf("secrets must be carried over: %+v", got)
 	}
 
-	routes := buildRouteTargets(got.Routing)
-	applyDefaultUpstream(&got, routes)
+	normalizeUpstreamProfiles(&got)
+	routes, _ := buildProfileRoutes(&got)
 	if routes["sonnet"].Model != "DeepSeek-Flash" || !routes["sonnet"].SupportsImage {
 		t.Fatalf("sonnet route lost its fields: %+v", routes["sonnet"])
 	}
-	// opus declared no upstream, so default_upstream=openai must fill it in.
+	// "opus" is declared on the openai profile, so it must route there.
 	if routes["opus"].Upstream != "openai" {
-		t.Fatalf("default_upstream must apply to the round-tripped config: %+v", routes["opus"])
+		t.Fatalf("a per-profile alias must keep its profile: %+v", routes["opus"])
 	}
 	if routes["with space"].Model != "quoted-alias" {
 		t.Fatalf("a quoted alias must round trip: %+v", routes)
 	}
-	if routes["plain"].Upstream != "openai" {
-		t.Fatalf("a plain string route must still pick up the default gateway: %+v", routes["plain"])
+	if routes["plain"].Upstream != "anthropic" {
+		t.Fatalf("an alias in the anthropic table must route there: %+v", routes["plain"])
 	}
 }
 

@@ -140,7 +140,22 @@ type adminUpstreamProfileView struct {
 	HeaderTimeoutSeconds int    `json:"header_timeout_seconds"`
 	BodyIdleSeconds      int    `json:"body_idle_seconds"`
 	MaxRetries           int    `json:"max_retries"`
-	Builtin              bool   `json:"builtin"`
+	// VLMModel / VLMMaxTokens / VLMUpstream are the scheme's own describe-pass
+	// settings. Empty (or zero) means "inherit [proxy]", which is what the page
+	// shows as a placeholder rather than echoing the inherited value back — a save
+	// that echoed it would freeze the inheritance into the file.
+	VLMModel     string `json:"vlm_model"`
+	VLMMaxTokens int    `json:"vlm_max_tokens"`
+	VLMUpstream  string `json:"vlm_upstream"`
+	// EffectiveVLMModel is the model this scheme actually describes with, after
+	// the [proxy] fallback. The page shows it so an operator who did not set one
+	// can still see what will be used.
+	EffectiveVLMModel string `json:"effective_vlm_model"`
+	// Routing is this scheme's own model table ([upstreams.<name>.routing]).
+	// Upstream is always empty here: an entry belongs to the profile that
+	// declares it, so there is nothing to choose.
+	Routing []adminRoutingEntry `json:"routing"`
+	Builtin bool                `json:"builtin"`
 }
 
 type adminKeysView struct {
@@ -168,7 +183,7 @@ type adminRoutingEntry struct {
 
 // adminEffectiveRoute is the gateway and model an alias actually resolves to
 // after the default gateway and the builtin fallbacks are applied. It is shown
-// read-only: the form edits what the file declares, so a value inherited from
+// read-only: the form edits the per-profile tables, so a value inherited from
 // default_upstream is not frozen into the file by a save.
 type adminEffectiveRoute struct {
 	Model    string `json:"model"`
@@ -183,10 +198,10 @@ type adminConfigView struct {
 	Upstream   adminUpstreamView `json:"upstream"`
 	// Upstreams lists every profile the page may select: the declared
 	// [upstreams.*] tables plus the two builtin ones, each flagged so the page can
-	// render the builtin entries read-only.
+	// render the builtin entries read-only. Each entry carries that profile's own
+	// model table, because there is no global one.
 	Upstreams []adminUpstreamProfileView `json:"upstreams"`
 	Keys      adminKeysView              `json:"keys"`
-	Routing   []adminRoutingEntry        `json:"routing"`
 	// EffectiveRouting covers every alias the proxy will serve, including the
 	// builtin fallbacks that are not written in the file.
 	EffectiveRouting map[string]adminEffectiveRoute `json:"effective_routing"`
@@ -221,48 +236,48 @@ type adminUpstreamProfilePayload struct {
 	HeaderTimeoutSeconds int    `json:"header_timeout_seconds"`
 	BodyIdleSeconds      int    `json:"body_idle_seconds"`
 	MaxRetries           int    `json:"max_retries"`
+	// The scheme's own describe-pass settings, submitted the same way: empty/zero
+	// means "inherit [proxy]". VLMUpstream must name an anthropic-protocol
+	// profile, or be empty so the scheme serves its own calls (when it speaks the
+	// anthropic framing) or falls back to the global selector.
+	VLMModel     string `json:"vlm_model"`
+	VLMMaxTokens int    `json:"vlm_max_tokens"`
+	VLMUpstream  string `json:"vlm_upstream"`
+	// Routing is this scheme's own model table, submitted whole like the profile
+	// itself. A nil slice means "not modelled by this client" and the running
+	// config's table is carried over; an empty non-nil slice means the operator
+	// deleted every row. Without this the save would rewrite each [upstreams.*]
+	// table from the payload alone and silently drop the table it never sent.
+	Routing []adminRoutingEntry `json:"routing"`
 }
 
 type adminConfigPayload struct {
-	Proxy    adminProxyView      `json:"proxy"`
-	Upstream adminUpstreamView   `json:"upstream"`
-	Keys     adminKeysPayload    `json:"keys"`
-	Admin    adminAuthPayload    `json:"admin"`
-	Routing  []adminRoutingEntry `json:"routing"`
+	Proxy    adminProxyView    `json:"proxy"`
+	Upstream adminUpstreamView `json:"upstream"`
+	Keys     adminKeysPayload  `json:"keys"`
+	Admin    adminAuthPayload  `json:"admin"`
 	// Upstreams is the complete profile list the save should write, so a profile
 	// the operator deleted is one that is simply absent here. A nil list means the
 	// request does not model profiles at all (an older page), and the running
 	// config's profiles are carried over instead of being read as a deletion.
+	//
+	// Each profile carries its own model table. There is no top-level routing list
+	// to submit: a json "routing" field from an older page is ignored, which is
+	// safe because that page also sends the profiles, and each one's table rides
+	// along inside it.
 	Upstreams []adminUpstreamProfilePayload `json:"upstreams"`
 }
 
 // currentConfigView renders the running config for the page. The upstream key is
 // never returned — only whether one is configured and where it comes from.
 //
-// routing lists the aliases as declared in the file, which is what the form
-// edits; effective_routing reports where each alias actually goes once the
-// default gateway and the builtin fallbacks are applied.
+// Each upstream profile carries its own model table, so there is no top-level
+// routing list here; effective_routing still reports where every alias actually
+// goes once the default gateway and the builtin fallbacks are applied.
 func currentConfigView() adminConfigView {
 	c := currentConfig()
 	declared := currentDeclaredRoutes()
 	resolved := currentRoutes()
-
-	aliases := make([]string, 0, len(declared))
-	for alias := range declared {
-		aliases = append(aliases, alias)
-	}
-	sort.Strings(aliases)
-
-	entries := make([]adminRoutingEntry, 0, len(aliases))
-	for _, alias := range aliases {
-		e := declared[alias]
-		entries = append(entries, adminRoutingEntry{
-			Alias:         alias,
-			Model:         e.Model,
-			Upstream:      e.Upstream,
-			SupportsImage: e.SupportsImage,
-		})
-	}
 
 	effective := make(map[string]adminEffectiveRoute, len(resolved))
 	for alias, e := range resolved {
@@ -284,13 +299,13 @@ func currentConfigView() adminConfigView {
 			Port:         c.Proxy.Port,
 			VLMModel:     c.Proxy.VLMModel,
 			VLMMaxTokens: c.Proxy.VLMMaxTokens,
-			VLMUpstream:  c.Proxy.VLMUpstream,
-			ChatUpstream: c.Proxy.ChatUpstream,
+			VLMUpstream:  canonicalSelector(c.Proxy.VLMUpstream),
+			ChatUpstream: canonicalSelector(c.Proxy.ChatUpstream),
 		},
 		Upstream: adminUpstreamView{
 			AnthropicURL:         c.Upstream.AnthropicURL,
 			OpenAIURL:            c.Upstream.OpenAIURL,
-			DefaultUpstream:      c.Upstream.DefaultUpstream,
+			DefaultUpstream:      canonicalSelector(c.Upstream.DefaultUpstream),
 			HeaderTimeoutSeconds: c.Upstream.HeaderTimeoutSeconds,
 			BodyIdleSeconds:      c.Upstream.BodyIdleSeconds,
 			MaxRetries:           c.Upstream.MaxRetries,
@@ -300,7 +315,6 @@ func currentConfigView() adminConfigView {
 			SophnetSet:     c.Keys.Sophnet != "",
 			SophnetFromEnv: os.Getenv("SOPHNET_API_KEY") != "",
 		},
-		Routing:          entries,
 		EffectiveRouting: effective,
 	}
 }
@@ -324,7 +338,7 @@ func profileViews(c Config) []adminUpstreamProfileView {
 
 	out := make([]adminUpstreamProfileView, 0, len(names)+2)
 	for _, name := range names {
-		v := adminProfileView(name, c.Upstreams[name], false)
+		v := adminProfileView(name, c.Upstreams[name], false, c)
 		// A declared profile carrying a builtin gateway name still falls back to
 		// the legacy key, so its key state comes from the resolution rather than
 		// from the table alone — otherwise a [upstreams.anthropic] with no key of
@@ -353,7 +367,10 @@ func profileViews(c Config) []adminUpstreamProfileView {
 			HeaderTimeoutSeconds: int(up.HeaderTimeout.Seconds()),
 			BodyIdleSeconds:      int(up.BodyIdle.Seconds()),
 			MaxRetries:           up.MaxRetries,
-			Builtin:              true,
+			// A builtin profile declares no VLM of its own, so it describes with
+			// the global model; the page shows that as the effective value.
+			EffectiveVLMModel: up.VLMModel,
+			Builtin:           true,
 		})
 	}
 	return out
@@ -361,8 +378,13 @@ func profileViews(c Config) []adminUpstreamProfileView {
 
 // adminProfileView renders one declared profile. The URL is shown trimmed the way
 // the request path uses it, so the page echoes back what the proxy would send.
-func adminProfileView(name string, p UpstreamProfile, builtin bool) adminUpstreamProfileView {
-	return adminUpstreamProfileView{
+//
+// The VLM fields report what the scheme declares, not what it resolves to: an
+// empty vlm_model means "inherit [proxy]", and echoing the inherited value back
+// would freeze the inheritance into the file on the next save. EffectiveVLMModel
+// carries the resolved value separately for display.
+func adminProfileView(name string, p UpstreamProfile, builtin bool, c Config) adminUpstreamProfileView {
+	v := adminUpstreamProfileView{
 		Name:                 name,
 		Protocol:             p.Protocol,
 		URL:                  strings.TrimSuffix(p.URL, "/"),
@@ -372,8 +394,49 @@ func adminProfileView(name string, p UpstreamProfile, builtin bool) adminUpstrea
 		HeaderTimeoutSeconds: p.HeaderTimeoutSeconds,
 		BodyIdleSeconds:      p.BodyIdleSeconds,
 		MaxRetries:           p.MaxRetries,
+		VLMModel:             p.VLMModel,
+		VLMMaxTokens:         p.VLMMaxTokens,
+		VLMUpstream:          normalizeUpstreamName(p.VLMUpstream),
 		Builtin:              builtin,
 	}
+	// What the describe pass will actually use: the scheme's own model, else the
+	// global one. Computed here so the page does not have to duplicate the rule.
+	v.EffectiveVLMModel = p.VLMModel
+	if v.EffectiveVLMModel == "" {
+		v.EffectiveVLMModel = c.Proxy.VLMModel
+	}
+	// The scheme's own model table, reported as declared so the page can edit it
+	// without losing the rows it does not show.
+	if len(p.Routing) > 0 {
+		entries := buildRouteTargets(p.Routing)
+		aliases := make([]string, 0, len(entries))
+		for alias := range entries {
+			aliases = append(aliases, alias)
+		}
+		sort.Strings(aliases)
+		v.Routing = make([]adminRoutingEntry, 0, len(aliases))
+		for _, alias := range aliases {
+			e := entries[alias]
+			v.Routing = append(v.Routing, adminRoutingEntry{
+				Alias:         alias,
+				Model:         e.Model,
+				SupportsImage: e.SupportsImage,
+			})
+		}
+	}
+	return v
+}
+
+// canonicalSelector rewrites a selector spelling the page's dropdowns do not
+// offer into the one they do. Only "claude" needs it: it is an accepted alias for
+// the anthropic profile, but the dropdown lists profile names, so leaving the
+// alias in the payload would make an untouched save fall back to the first option
+// and reroute the entry.
+func canonicalSelector(value string) string {
+	if normalizeUpstreamName(value) == profileNameClaudeAlias {
+		return profileNameAnthropic
+	}
+	return value
 }
 
 // configSaveMu serializes the whole save transaction — reading the previous
@@ -389,18 +452,24 @@ func handleAdminConfigSave(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "请求体不是合法 JSON: "+err.Error())
 		return
 	}
-	// The running config is read before validation: the save is checked against
-	// the profiles that exist, and a profile key the form asked to keep is carried
-	// over from it — the page is never sent one.
+
+	// Take the transaction lock before reading the running config, not after.
+	// Everything below derives new state from what is on disk and in memory —
+	// the "keep" key and password carry the stored value over, the backup is the
+	// previous file, the rewrite drops keys the old file may carry. Reading the
+	// old value outside the lock lets two concurrent saves both base themselves
+	// on the same snapshot and the later one silently undo the earlier one's
+	// change. Validation is included because it also resolves "keep" profiles out
+	// of the same snapshot.
+	configSaveMu.Lock()
+	defer configSaveMu.Unlock()
+
 	oldConfig := currentConfig()
 	profiles, err := validateConfigPayload(&payload, oldConfig.Upstreams)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-
-	configSaveMu.Lock()
-	defer configSaveMu.Unlock()
 
 	path := configPathFromEnv()
 
@@ -490,12 +559,14 @@ func configWarnings(payload adminConfigPayload, old Config, droppedKeys []string
 			old.Proxy.Port, payload.Proxy.Port))
 	}
 	declared := map[string]bool{}
-	for _, e := range payload.Routing {
-		declared[e.Alias] = true
+	for _, prof := range payload.Upstreams {
+		for _, e := range prof.Routing {
+			declared[e.Alias] = true
+		}
 	}
 	for _, alias := range []string{"sonnet", "opus", "haiku"} {
 		if !declared[alias] {
-			warnings = append(warnings, fmt.Sprintf("未声明 %s 路由，将回落到内置默认目标。", alias))
+			warnings = append(warnings, fmt.Sprintf("未在任何上游 profile 的模型表里声明 %s，将回落到内置默认目标。", alias))
 		}
 	}
 	if len(droppedKeys) > 0 {
@@ -505,6 +576,28 @@ func configWarnings(payload adminConfigPayload, old Config, droppedKeys []string
 	if os.Getenv("SOPHNET_API_KEY") != "" {
 		warnings = append(warnings, "环境变量 SOPHNET_API_KEY 已设置，它的优先级高于配置文件里的密钥。")
 	}
+
+	// Clearing a profile's key does not always mean the profile ends up keyless:
+	// the two builtin gateway names fall back to the legacy [keys].sophnet /
+	// SOPHNET_API_KEY credential. Saying so beats letting the operator believe the
+	// profile has no credential while it keeps authenticating with the old one.
+	for _, p := range payload.Upstreams {
+		if p.KeyAction != "clear" {
+			continue
+		}
+		name := normalizeUpstreamName(p.Name)
+		if name != profileNameAnthropic && name != profileNameOpenAI {
+			continue
+		}
+		switch {
+		case os.Getenv(legacyKeyEnv) != "":
+			warnings = append(warnings, fmt.Sprintf("上游 profile %q 的密钥已清空，但它仍会回落到环境变量 %s（内置网关名的既定行为）。",
+				name, legacyKeyEnv))
+		case old.Keys.Sophnet != "":
+			warnings = append(warnings, fmt.Sprintf("上游 profile %q 的密钥已清空，但它仍会回落到 [keys].sophnet（内置网关名的既定行为）。要真正停用请同时清空该密钥。", name))
+		}
+	}
+
 	if envAdminTok := os.Getenv("LLM_PROXY_ADMIN_TOKEN"); envAdminTok != "" {
 		if payload.Admin.Action == "clear" {
 			// An environment password outranks the file, so clearing the file
@@ -597,26 +690,24 @@ func validateConfigPayload(p *adminConfigPayload, oldProfiles map[string]Upstrea
 		return nil, fmt.Errorf("管理口令含非法控制字符")
 	}
 
-	seen := map[string]bool{}
-	for _, e := range p.Routing {
-		if strings.TrimSpace(e.Alias) == "" {
-			return nil, fmt.Errorf("路由别名不能为空")
-		}
-		if seen[e.Alias] {
-			return nil, fmt.Errorf("路由别名 %q 重复", e.Alias)
-		}
-		seen[e.Alias] = true
-		if strings.TrimSpace(e.Model) == "" {
-			return nil, fmt.Errorf("路由 %q 的模型名不能为空", e.Alias)
-		}
-		if !validProfileSelector(e.Upstream, known) {
-			return nil, fmt.Errorf("路由 %q 的 upstream 必须是已定义的上游 profile 名（或 \"\"、\"claude\"、\"anthropic\"、\"openai\"）", e.Alias)
-		}
-		for _, field := range []struct{ name, value string }{
-			{"别名", e.Alias}, {"模型名", e.Model},
-		} {
-			if hasControlChars(field.value) {
-				return nil, fmt.Errorf("路由 %q 的%s含非法控制字符", e.Alias, field.name)
+	// Each profile's own model table is validated as part of that profile: an
+	// alias belongs to exactly one upstream, so there is no global table to check
+	// here and no cross-profile uniqueness rule beyond "one alias, one profile",
+	// which encodeSchemeRouting and buildProfileRoutes enforce.
+	for _, prof := range p.Upstreams {
+		for _, e := range prof.Routing {
+			if strings.TrimSpace(e.Alias) == "" {
+				return nil, fmt.Errorf("上游 profile %q 的路由别名不能为空", prof.Name)
+			}
+			if strings.TrimSpace(e.Model) == "" {
+				return nil, fmt.Errorf("上游 profile %q 的路由 %q 的模型名不能为空", prof.Name, e.Alias)
+			}
+			for _, field := range []struct{ name, value string }{
+				{"别名", e.Alias}, {"模型名", e.Model},
+			} {
+				if hasControlChars(field.value) {
+					return nil, fmt.Errorf("上游 profile %q 的路由 %q 的%s含非法控制字符", prof.Name, e.Alias, field.name)
+				}
 			}
 		}
 	}
@@ -679,6 +770,13 @@ func resolveProfiles(submitted []adminUpstreamProfilePayload, old map[string]Ups
 		if !validProfileName(name) {
 			return nil, fmt.Errorf("上游 profile 名 %q 只能包含小写字母、数字、'-' 和 '_'", raw)
 		}
+		// "claude" is the alias for the anthropic profile, so a table under that
+		// name is never reachable — profileByName folds the name before it looks
+		// the profile up. Accepting it here would save a profile whose URL and key
+		// are silently ignored at request time.
+		if name == profileNameClaudeAlias {
+			return nil, fmt.Errorf("上游 profile 名 %q 是保留名（它等价于 %q），请改用其他名字", raw, profileNameAnthropic)
+		}
 		if _, dup := out[name]; dup {
 			return nil, fmt.Errorf("上游 profile 名 %q 重复（名字大小写不敏感）", name)
 		}
@@ -692,6 +790,12 @@ func resolveProfiles(submitted []adminUpstreamProfilePayload, old map[string]Ups
 		}
 		if item.HeaderTimeoutSeconds < 0 || item.BodyIdleSeconds < 0 || item.MaxRetries < 0 {
 			return nil, fmt.Errorf("上游 profile %q 的超时与重试次数不能为负数", name)
+		}
+		if item.VLMMaxTokens < 0 {
+			return nil, fmt.Errorf("上游 profile %q 的 vlm_max_tokens 不能为负数", name)
+		}
+		if hasControlChars(item.VLMModel) {
+			return nil, fmt.Errorf("上游 profile %q 的 vlm_model 含非法控制字符", name)
 		}
 
 		keyEnv := strings.TrimSpace(item.KeyEnv)
@@ -732,12 +836,104 @@ func resolveProfiles(submitted []adminUpstreamProfilePayload, old map[string]Ups
 			HeaderTimeoutSeconds: item.HeaderTimeoutSeconds,
 			BodyIdleSeconds:      item.BodyIdleSeconds,
 			MaxRetries:           item.MaxRetries,
+			VLMModel:             strings.TrimSpace(item.VLMModel),
+			VLMMaxTokens:         item.VLMMaxTokens,
+			VLMUpstream:          normalizeUpstreamName(item.VLMUpstream),
+		}
+		// The scheme's own model table. A nil slice means the client does not model
+		// it (an older page), so the running config's table is carried over rather
+		// than read as a deletion; an empty non-nil slice is the operator having
+		// removed every row.
+		prof := out[name]
+		if item.Routing != nil {
+			table, err := encodeSchemeRouting(name, item.Routing)
+			if err != nil {
+				return nil, err
+			}
+			prof.Routing = table
+		} else {
+			prof.Routing = old[name].Routing
+		}
+		out[name] = prof
+	}
+	// A scheme's vlm_upstream may name any profile in this same submission, so
+	// the reference can only be resolved once every entry has been read.
+	known := profileNames(out)
+	for name, p := range out {
+		sel := normalizeUpstreamName(p.VLMUpstream)
+		if sel == "" || sel == name {
+			continue
+		}
+		if !validProfileSelector(sel, known) {
+			return nil, fmt.Errorf("上游 profile %q 的 vlm_upstream 必须是已定义的上游 profile 名（或留空表示自身）", name)
+		}
+		if proto, ok := selectorProtocol(sel, out); ok && proto != protocolAnthropic {
+			return nil, fmt.Errorf("上游 profile %q 的 vlm_upstream 指向 %s 协议的 profile，图片描述调用必须是 %s 协议",
+				name, proto, protocolAnthropic)
 		}
 	}
 	return out, nil
 }
 
-// rejectRemovedProfiles refuses a save that drops a profile something still
+// encodeSchemeRouting turns a scheme's submitted model rows into the TOML values
+// its table holds. The table is scoped to one profile, so an entry's upstream is
+// never written — mergeSchemeRoutes rejects one that names a different profile.
+//
+// Every row is validated here, at the one point where the operator can still fix
+// it: an empty alias or model would be skipped by the loader with a warning,
+// which is a silent no-op from the page's point of view.
+func encodeSchemeRouting(profile string, entries []adminRoutingEntry) (map[string]toml.Primitive, error) {
+	if len(entries) == 0 {
+		// A non-nil empty map, not nil: the caller uses nil to mean "the client
+		// did not model this table", and an operator who deleted every row means
+		// the opposite.
+		return map[string]toml.Primitive{}, nil
+	}
+
+	// Render the rows as a small TOML document and let the parser produce the
+	// primitives. Building them by hand means reimplementing toml's value model;
+	// this reuses exactly the syntax the config file itself uses.
+	var b strings.Builder
+	for _, e := range entries {
+		alias := strings.TrimSpace(e.Alias)
+		model := strings.TrimSpace(e.Model)
+		if alias == "" {
+			return nil, fmt.Errorf("上游 profile %q 的路由别名不能为空", profile)
+		}
+		if model == "" {
+			return nil, fmt.Errorf("上游 profile %q 的路由 %q 的模型名不能为空", profile, alias)
+		}
+		if hasControlChars(alias) || hasControlChars(model) {
+			return nil, fmt.Errorf("上游 profile %q 的路由 %q 含非法控制字符", profile, alias)
+		}
+		if e.Upstream != "" && normalizeUpstreamName(e.Upstream) != normalizeUpstreamName(profile) {
+			return nil, fmt.Errorf("上游 profile %q 的路由 %q 不能指向别的 profile（方案的路由表只属于自己）", profile, alias)
+		}
+		key := tomlKey(alias)
+		if e.SupportsImage {
+			fmt.Fprintf(&b, "%s = { model = %s, supports_image = true }\n", key, tomlString(model))
+		} else {
+			fmt.Fprintf(&b, "%s = %s\n", key, tomlString(model))
+		}
+	}
+
+	var table map[string]toml.Primitive
+	if _, err := toml.Decode(b.String(), &table); err != nil {
+		return nil, fmt.Errorf("上游 profile %q 的路由表无法生成: %v", profile, err)
+	}
+	// Decoding collapses duplicate keys, so check for them before the round trip
+	// rather than after: a duplicate is a mistake the operator has to see.
+	seen := map[string]bool{}
+	for _, e := range entries {
+		alias := strings.TrimSpace(e.Alias)
+		if seen[alias] {
+			return nil, fmt.Errorf("上游 profile %q 的路由别名 %q 重复", profile, alias)
+		}
+		seen[alias] = true
+	}
+	return table, nil
+}
+
 // points at, naming each referrer. The config load tolerates a route to a missing
 // profile by skipping it, but a save happens while the operator is looking at the
 // page, so this is the moment to tell them what has to change first.
@@ -762,11 +958,9 @@ func rejectRemovedProfiles(p *adminConfigPayload, old, next map[string]UpstreamP
 		if selectorRefersTo(p.Proxy.ChatUpstream, name) {
 			refs = append(refs, "chat_upstream")
 		}
-		for _, e := range p.Routing {
-			if selectorRefersTo(e.Upstream, name) {
-				refs = append(refs, "路由 "+e.Alias)
-			}
-		}
+		// A profile's model table needs no check here: those entries belong to the
+		// profile that declares them, so deleting that profile deletes them too, and
+		// an entry can no longer name some other profile.
 		if len(refs) > 0 {
 			return fmt.Errorf("上游 profile %q 仍被引用，无法删除：%s", name, strings.Join(refs, "、"))
 		}
@@ -779,7 +973,7 @@ func rejectRemovedProfiles(p *adminConfigPayload, old, next map[string]UpstreamP
 // anthropic profile, so it counts as a reference to it.
 func selectorRefersTo(value, profile string) bool {
 	name := normalizeUpstreamName(value)
-	if name == "claude" {
+	if name == profileNameClaudeAlias {
 		name = profileNameAnthropic
 	}
 	return name != "" && name == profile
@@ -808,7 +1002,7 @@ func checkProtocolSelector(field, value string, profiles map[string]UpstreamProf
 	if name == "" {
 		return nil
 	}
-	if name == "claude" {
+	if name == profileNameClaudeAlias {
 		name = profileNameAnthropic
 	}
 	got, ok := selectorProtocol(name, profiles)
@@ -844,7 +1038,7 @@ func selectorProtocol(name string, profiles map[string]UpstreamProfile) (string,
 // names stays legible.
 func validUpstreamName(s string) bool {
 	switch normalizeUpstreamName(s) {
-	case "", "claude", profileNameAnthropic, profileNameOpenAI:
+	case "", profileNameClaudeAlias, profileNameAnthropic, profileNameOpenAI:
 		return true
 	}
 	return false
@@ -950,24 +1144,8 @@ func renderConfigTOML(p adminConfigPayload, adminTok, sophnetKey string, profile
 	b.WriteString("# entirely. LLM_PROXY_ADMIN_TOKEN overrides this value.\n")
 	fmt.Fprintf(&b, "token = %s\n\n", tomlString(adminTok))
 
-	b.WriteString("[routing]\n")
-	b.WriteString("# Builtin aliases (sonnet/opus/haiku) and custom aliases alike. A plain string\n")
-	b.WriteString("# uses default_upstream; a table may pick a profile and declare image support.\n")
-	for _, e := range p.Routing {
-		key := tomlKey(e.Alias)
-		if e.Upstream == "" && !e.SupportsImage {
-			fmt.Fprintf(&b, "%s = %s\n", key, tomlString(e.Model))
-			continue
-		}
-		parts := []string{fmt.Sprintf("model = %s", tomlString(e.Model))}
-		if e.Upstream != "" {
-			parts = append(parts, fmt.Sprintf("upstream = %s", tomlString(e.Upstream)))
-		}
-		if e.SupportsImage {
-			parts = append(parts, "supports_image = true")
-		}
-		fmt.Fprintf(&b, "%s = { %s }\n", key, strings.Join(parts, ", "))
-	}
+	// No top-level [routing] on purpose: every alias lives in the model table of
+	// the upstream profile that serves it, written by writeUpstreamProfiles.
 	return b.String()
 }
 
@@ -1018,6 +1196,44 @@ func writeUpstreamProfiles(b *strings.Builder, profiles map[string]UpstreamProfi
 		}
 		if p.MaxRetries > 0 {
 			fmt.Fprintf(b, "max_retries = %d\n", p.MaxRetries)
+		}
+		// The scheme's own describe pass. Only what the scheme declares is written:
+		// an inherited value stays inherited, so a later change to [proxy] still
+		// flows through instead of being pinned by this save.
+		if p.VLMModel != "" {
+			b.WriteString("# Vision model this scheme describes images with. Empty inherits [proxy].\n")
+			fmt.Fprintf(b, "vlm_model = %s\n", tomlString(p.VLMModel))
+		}
+		if p.VLMMaxTokens > 0 {
+			fmt.Fprintf(b, "vlm_max_tokens = %d\n", p.VLMMaxTokens)
+		}
+		if p.VLMUpstream != "" {
+			b.WriteString("# Profile serving this scheme's describe calls (must speak the anthropic\n")
+			b.WriteString("# protocol). Empty means the scheme serves them itself.\n")
+			fmt.Fprintf(b, "vlm_upstream = %s\n", tomlString(p.VLMUpstream))
+		}
+		// A scheme's model mapping table is emitted as a sub-table. Its entries
+		// always name this scheme implicitly, so only the model and image flag are
+		// written — an upstream field here would be rejected on the next load.
+		if len(p.Routing) > 0 {
+			aliases := make([]string, 0, len(p.Routing))
+			for alias := range p.Routing {
+				aliases = append(aliases, alias)
+			}
+			sort.Strings(aliases)
+			fmt.Fprintf(b, "\n[upstreams.%s.routing]\n", tomlKey(name))
+			for _, alias := range aliases {
+				e, err := decodeRouteEntry(p.Routing[alias])
+				if err != nil {
+					continue
+				}
+				key := tomlKey(alias)
+				if !e.SupportsImage {
+					fmt.Fprintf(b, "%s = %s\n", key, tomlString(e.Model))
+					continue
+				}
+				fmt.Fprintf(b, "%s = { model = %s, supports_image = true }\n", key, tomlString(e.Model))
+			}
 		}
 		b.WriteString("\n")
 	}
@@ -1109,7 +1325,12 @@ func unknownConfigKeys(path string) []string {
 	if toml.Unmarshal(data, &raw) != nil {
 		return nil
 	}
-	known := map[string]bool{"proxy": true, "upstream": true, "upstreams": true, "keys": true, "admin": true, "routing": true}
+	// "routing" is deliberately absent: the top-level section is no longer
+	// modelled, and a save rewrites the file without it. Listing it here would
+	// suppress the warning that tells an operator their old global table is about
+	// to disappear — they need that warning to move the aliases into the profiles
+	// first.
+	known := map[string]bool{"proxy": true, "upstream": true, "upstreams": true, "keys": true, "admin": true}
 	var unknown []string
 	for k := range raw {
 		if !known[k] {

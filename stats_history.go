@@ -315,11 +315,31 @@ func (c *statsCollector) historySnapshotLocked(now time.Time, rangeSec int, mode
 		})
 	}
 	if snap.ModelsExcluded > 0 {
+		// The collector has a bucket literally named "(other)" — the one it folds
+		// traffic into once it tracks maxTrackedModels models. When that bucket is
+		// one of the plotted series, folding the tail into a second "(other)" would
+		// put two same-named series in the payload: the page assigns one colour per
+		// name, so the two would draw on top of each other and the tooltip would
+		// report only one of them. Merge into the existing series instead.
 		other := make([]historyPoint, points)
 		for i := range other {
 			other[i].TS = timestamps[i]
 		}
 		var otherRead, otherCreation, otherInput int64
+
+		existing := -1
+		for i := range snap.Models {
+			if snap.Models[i].Model == otherModelKey {
+				existing = i
+				otherRead, otherCreation, otherInput =
+					snap.Models[i].CacheRead, snap.Models[i].CacheCreation, 0
+				for j := range other {
+					other[j] = snap.Models[i].Points[j]
+				}
+				break
+			}
+		}
+
 		for _, r := range all[historyMaxSeries:] {
 			otherRead += r.cacheRead
 			otherCreation += r.cacheCreation
@@ -344,13 +364,18 @@ func (c *statsCollector) historySnapshotLocked(now time.Time, rangeSec int, mode
 			}
 			other[i].CacheHitRate = cacheHitRate(other[i].CacheRead, other[i].CacheCreation, other[i].Input)
 		}
-		snap.Models = append(snap.Models, historyModelSeries{
+		merged := historyModelSeries{
 			Model:         otherModelKey,
 			Points:        other,
 			CacheRead:     otherRead,
 			CacheCreation: otherCreation,
 			CacheHitRate:  cacheHitRate(otherRead, otherCreation, otherInput),
-		})
+		}
+		if existing >= 0 {
+			snap.Models[existing] = merged
+		} else {
+			snap.Models = append(snap.Models, merged)
+		}
 	}
 
 	// Totals cover every model in the window, not just the plotted ones, so the

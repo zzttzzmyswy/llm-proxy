@@ -379,7 +379,33 @@ test("profilePayloadFromRow reads a blank key as keep", () => {
     header_timeout_seconds: 30,
     body_idle_seconds: 0,
     max_retries: 4,
+    // A blank scheme VLM means "inherit [proxy]"; it must reach the server as an
+    // absence, not as a frozen copy of the global value.
+    vlm_model: "",
+    vlm_max_tokens: 0,
+    vlm_upstream: "",
+    // The page always models the scheme's own model table, so an untouched row
+    // submits an empty list rather than omitting the field.
+    routing: [],
   });
+});
+
+// A scheme's own describe pass travels with the row. It is the whole point of
+// per-scheme VLMs, so the payload must carry it rather than dropping it.
+test("profilePayloadFromRow carries the scheme's VLM fields", () => {
+  const row = admin.profilePayloadFromRow({
+    name: "alpha",
+    protocol: "anthropic",
+    url: "https://alpha/api",
+    vlmModel: " alpha-vision ",
+    vlmMaxTokens: "1234",
+    vlmUpstream: " gamma ",
+  });
+  assert.equal(row.vlm_model, "alpha-vision");
+  assert.equal(row.vlm_max_tokens, 1234);
+  assert.equal(row.vlm_upstream, "gamma");
+  assert.equal(admin.profilePayloadFromRow({}).vlm_model, "");
+  assert.equal(admin.profilePayloadFromRow({}).vlm_upstream, "");
 });
 
 test("profilePayloadFromRow reads a typed key as set", () => {
@@ -410,17 +436,17 @@ test("profilePayloadFromRow tolerates absent fields", () => {
   assert.equal(row.header_timeout_seconds, 0);
 });
 
-// An empty routing row is a line the operator left behind; submitting it would be
-// rejected as an empty alias, so it has to be dropped instead.
-test("routePayloadFromRow drops an empty row", () => {
-  assert.equal(admin.routePayloadFromRow({ alias: "  ", model: "  " }), null);
-  assert.equal(admin.routePayloadFromRow({}), null);
-});
-
-test("routePayloadFromRow trims and keeps a filled row", () => {
-  assert.deepEqual(
-    admin.routePayloadFromRow({ alias: " sonnet ", model: " deepseek-chat ", upstream: "deepseek", supportsImage: true }),
-    { alias: "sonnet", model: "deepseek-chat", upstream: "deepseek", supports_image: true },
-  );
-  assert.equal(admin.routePayloadFromRow({ alias: "x", model: "y" }).supports_image, false);
+// A scheme's own model rows are read from the card and submitted without an
+// upstream: the entry belongs to the profile that declares it, so offering a
+// choice there would let the page build a table the loader rejects.
+test("schemeRoutePayload never carries an upstream", () => {
+  assert.deepEqual(admin.schemeRoutePayload(" alpha-fast ", " alpha-model ", false), {
+    alias: "alpha-fast",
+    model: "alpha-model",
+    upstream: "",
+    supports_image: false,
+  });
+  assert.equal(admin.schemeRoutePayload("v", "m", true).supports_image, true);
+  // An entirely blank row is a line the operator left behind.
+  assert.equal(admin.schemeRoutePayload("  ", "  ", false), null);
 });

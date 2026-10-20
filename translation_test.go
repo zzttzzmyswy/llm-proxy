@@ -94,10 +94,12 @@ openai_url = "https://api.sophnet.com/v1/chat/completions"
 [keys]
 sophnet = ""
 
-[routing]
+[upstreams.anthropic.routing]
 sonnet = "DeepSeek-V4-Flash-0731"
 opus = "GLM-5.3"
-flash = { model = "glm-5.3-flash", upstream = "openai" }
+
+[upstreams.openai.routing]
+flash = { model = "glm-5.3-flash" }
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -107,8 +109,8 @@ flash = { model = "glm-5.3-flash", upstream = "openai" }
 		t.Fatalf("loadConfig: %v", err)
 	}
 
-	if e := routeTargets["sonnet"]; e.Model != "DeepSeek-V4-Flash-0731" || e.Upstream != "" {
-		t.Fatalf("legacy string route must stay anthropic, got %+v", e)
+	if e := routeTargets["sonnet"]; e.Model != "DeepSeek-V4-Flash-0731" || e.Upstream != profileNameAnthropic {
+		t.Fatalf("a string route in the anthropic table must stay there, got %+v", e)
 	}
 	flash := routeTargets["flash"]
 	if flash.Model != "glm-5.3-flash" || flash.Upstream != "openai" {
@@ -126,7 +128,7 @@ func TestLoadConfigSkipsInvalidRoutingEntry(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg })
 
 	path := filepath.Join(t.TempDir(), "config.toml")
-	content := `[routing]
+	content := `[upstreams.anthropic.routing]
 sonnet = "DeepSeek-V4-Flash-0731"
 flash = 42
 `
@@ -182,9 +184,11 @@ func TestLoadConfigParsesBuiltinAliasTableRoute(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg; routeTargets = oldRoutes })
 
 	path := filepath.Join(t.TempDir(), "config.toml")
-	content := `[routing]
-sonnet = { model = "glm-5.3-flash", upstream = "openai" }
+	content := `[upstreams.anthropic.routing]
 opus = "GLM-5.3"
+
+[upstreams.openai.routing]
+sonnet = { model = "glm-5.3-flash" }
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -199,7 +203,7 @@ opus = "GLM-5.3"
 	if tr := snapshotConfig().routeTarget("haiku"); tr.Model != "glm-5.3-flash" || tr.Upstream != "openai" {
 		t.Fatalf("haiku must inherit sonnet's target including upstream, got %+v", tr)
 	}
-	if tr := snapshotConfig().routeTarget("opus"); tr.Model != "GLM-5.3" || tr.Upstream != "" {
+	if tr := snapshotConfig().routeTarget("opus"); tr.Model != "GLM-5.3" || tr.Upstream != profileNameAnthropic {
 		t.Fatalf("string-form opus must stay on the anthropic gateway, got %+v", tr)
 	}
 }
@@ -918,10 +922,12 @@ func TestLoadConfigParsesSupportsImageFlag(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg; routeTargets = oldRoutes })
 
 	path := filepath.Join(t.TempDir(), "config.toml")
-	content := `[routing]
+	content := `[upstreams.anthropic.routing]
 sonnet = { model = "DeepSeek-V4-Flash-0731", supports_image = true }
 opus = { model = "GLM-5.2", supports_image = false }
-haiku = { model = "glm-5.3-flash", upstream = "openai", supports_image = true }
+
+[upstreams.openai.routing]
+haiku = { model = "glm-5.3-flash", supports_image = true }
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -930,7 +936,7 @@ haiku = { model = "glm-5.3-flash", upstream = "openai", supports_image = true }
 	if err := loadConfig(); err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if tr := routeTargets["sonnet"]; !tr.SupportsImage || tr.Upstream != "" {
+	if tr := routeTargets["sonnet"]; !tr.SupportsImage || tr.Upstream != profileNameAnthropic {
 		t.Fatalf("sonnet must decode supports_image=true on the anthropic gateway, got %+v", tr)
 	}
 	if tr := routeTargets["opus"]; tr.SupportsImage {
@@ -1086,10 +1092,13 @@ anthropic_url = "https://www.sophnet.com/api/open-apis/anthropic"
 openai_url = "https://www.sophnet.com/api/open-apis/openai"
 default_upstream = "openai"
 
-[routing]
+[upstreams.openai.routing]
 sonnet = "DeepSeek-V4-Flash-0731"
 opus = { model = "GLM-5.2" }
-flash = { model = "glm-5.3-flash", upstream = "anthropic" }
+
+[upstreams.anthropic.routing]
+flash = { model = "glm-5.3-flash"}
+
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -1117,7 +1126,7 @@ func TestLoadConfigDefaultUpstreamDefaultsToClaude(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg; routeTargets = oldRoutes })
 
 	path := filepath.Join(t.TempDir(), "config.toml")
-	content := `[routing]
+	content := `[upstreams.anthropic.routing]
 sonnet = "DeepSeek-V4-Flash-0731"
 flash = { model = "glm-5.3-flash" }
 `
@@ -1128,11 +1137,11 @@ flash = { model = "glm-5.3-flash" }
 	if err := loadConfig(); err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if tr := routeTargets["sonnet"]; tr.Upstream != "" {
-		t.Fatalf("unset default_upstream must keep the anthropic gateway, got %+v", tr)
+	if tr := routeTargets["sonnet"]; tr.Upstream != profileNameAnthropic {
+		t.Fatalf("a route declared in the anthropic table must stay there, got %+v", tr)
 	}
-	if tr := routeTargets["flash"]; tr.Upstream != "" {
-		t.Fatalf("upstream-less table route must default to anthropic, got %+v", tr)
+	if tr := routeTargets["flash"]; tr.Upstream != profileNameAnthropic {
+		t.Fatalf("an alias with no explicit profile must resolve to anthropic, got %+v", tr)
 	}
 }
 
@@ -1169,8 +1178,9 @@ anthropic_url = "` + anthroUp.URL + `"
 openai_url = "` + openAIUp.URL + `"
 default_upstream = "openai"
 
-[routing]
+[upstreams.openai.routing]
 sonnet = "DeepSeek-V4-Flash-0731"
+
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)

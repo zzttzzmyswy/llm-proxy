@@ -1,0 +1,507 @@
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/BurntSushi/toml"
+)
+
+// configTOMLForTest loads content as the live config and returns the file path it
+// was written to, so a test can assert on what a save left behind.
+func configTOMLForTest(t *testing.T, content string) string {
+	t.Helper()
+	return withProfiles(t, content)
+}
+
+// profilesPayloadFromView builds the profile list the page submits: each declared
+// profile with its whole scheme, including its own model table. Builtin rows are
+// filtered out, because the page filters them too — sending one would write an
+// [upstreams.anthropic] table that shadows the implicit profile.
+func profilesPayloadFromView(t *testing.T, view adminConfigView) []adminUpstreamProfilePayload {
+	t.Helper()
+	var out []adminUpstreamProfilePayload
+	for _, prof := range view.Upstreams {
+		if prof.Builtin {
+			continue
+		}
+		out = append(out, adminUpstreamProfilePayload{
+			Name:                 prof.Name,
+			Protocol:             prof.Protocol,
+			URL:                  prof.URL,
+			KeyAction:            "keep",
+			KeyEnv:               prof.KeyEnv,
+			HeaderTimeoutSeconds: prof.HeaderTimeoutSeconds,
+			BodyIdleSeconds:      prof.BodyIdleSeconds,
+			MaxRetries:           prof.MaxRetries,
+			VLMModel:             prof.VLMModel,
+			VLMMaxTokens:         prof.VLMMaxTokens,
+			VLMUpstream:          prof.VLMUpstream,
+			Routing:              prof.Routing,
+		})
+	}
+	return out
+}
+
+// payloadFromViewWithProfiles is payloadFromView plus that profile list, which is
+// what the page actually posts. payloadFromView deliberately omits it (an older
+// page shape), so the scheme tests need their own builder.
+func payloadFromViewWithProfiles(t *testing.T, view adminConfigView) adminConfigPayload {
+	t.Helper()
+	p := payloadFromView(t, view)
+	p.Upstreams = profilesPayloadFromView(t, view)
+	return p
+}
+
+// setSchemeVLM edits one profile's VLM fields in a payload, as the page's form
+// would when an operator types into that row.
+func setSchemeVLM(p *adminConfigPayload, name, model, upstream string, maxTokens int) {
+	for i := range p.Upstreams {
+		if p.Upstreams[i].Name == name {
+			p.Upstreams[i].VLMModel = model
+			p.Upstreams[i].VLMUpstream = upstream
+			p.Upstreams[i].VLMMaxTokens = maxTokens
+		}
+	}
+}
+
+// loadFromDiskInto parses a config file into c without publishing it, so a test
+// can assert on exactly what the save wrote.
+func loadFromDiskInto(t *testing.T, path string, into *Config) error {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return toml.Unmarshal(data, into)
+}
+
+// A scheme's own VLM fields survive the admin round trip: the page reads them,
+// posts them back, and the rendered file parses to the same values. Without this
+// a save would silently strip every per-scheme vision model.
+func TestAdminRoundTripsSchemeVLMFields(t *testing.T) {
+	t.Setenv("SOPHNET_API_KEY", "")
+
+	path := configTOMLForTest(t, `
+[proxy]
+port = 8088
+vlm_model = "global-vision"
+
+[admin]
+token = "s3cret"
+
+[upstreams.alpha]
+protocol = "anthropic"
+url = "https://alpha.example/api"
+key = "sk-alpha"
+vlm_model = "alpha-vision"
+vlm_max_tokens = 1234
+
+[upstreams.beta]
+protocol = "anthropic"
+url = "https://beta.example/api"
+key = "sk-beta"
+vlm_model = "beta-vision"
+vlm_upstream = "gamma"
+
+[upstreams.gamma]
+protocol = "anthropic"
+url = "https://gamma.example/api"
+key = "sk-gamma"
+
+[upstreams.alpha.routing]
+sonnet = { model = "alpha-text"}
+
+`)
+
+	view := currentConfigView()
+	byName := map[string]adminUpstreamProfileView{}
+	for _, p := range view.Upstreams {
+		byName[p.Name] = p
+	}
+
+	alpha, ok := byName["alpha"]
+	if !ok {
+		t.Fatalf("alpha must be listed: %+v", view.Upstreams)
+	}
+	if alpha.VLMModel != "alpha-vision" || alpha.VLMMaxTokens != 1234 {
+		t.Fatalf("alpha's own VLM must be reported as declared, got %+v", alpha)
+	}
+	if alpha.EffectiveVLMModel != "alpha-vision" {
+		t.Fatalf("alpha's effective model must be its own, got %q", alpha.EffectiveVLMModel)
+	}
+
+	beta := byName["beta"]
+	if beta.VLMModel != "beta-vision" || beta.VLMUpstream != "gamma" {
+		t.Fatalf("beta's VLM selector must be reported, got %+v", beta)
+	}
+
+	// The builtin profiles inherit the global model, and the page says so.
+	builtin := byName[profileNameAnthropic]
+	if builtin.EffectiveVLMModel != "global-vision" {
+		t.Fatalf("a builtin profile must report the inherited global model, got %q", builtin.EffectiveVLMModel)
+	}
+	if builtin.VLMModel != "" {
+		t.Fatalf("a builtin profile must not claim a VLM of its own, got %q", builtin.VLMModel)
+	}
+
+	// Now post it back, as the page does, and check the file round trips.
+	w := postConfig(t, payloadFromViewWithProfiles(t, view), "s3cret")
+	if w.Code != http.StatusOK {
+		t.Fatalf("save must succeed: %d %s", w.Code, w.Body.String())
+	}
+
+	var reloaded Config
+	if err := loadFromDiskInto(t, path, &reloaded); err != nil {
+		t.Fatalf("the saved file must parse: %v", err)
+	}
+	normalizeUpstreamProfiles(&reloaded)
+	if got := reloaded.Upstreams["alpha"]; got.VLMModel != "alpha-vision" || got.VLMMaxTokens != 1234 {
+		t.Fatalf("alpha's VLM did not round trip: %+v", got)
+	}
+	if got := reloaded.Upstreams["beta"]; got.VLMUpstream != "gamma" {
+		t.Fatalf("beta's vlm_upstream did not round trip: %+v", got)
+	}
+}
+
+// An unset per-scheme VLM must stay unset across a save. Writing the inherited
+// [proxy] value into the scheme would freeze the inheritance, so a later change to
+// the global model would stop reaching the schemes that never declared one.
+func TestAdminSaveDoesNotFreezeAnInheritedSchemeVLM(t *testing.T) {
+	t.Setenv("SOPHNET_API_KEY", "")
+
+	path := configTOMLForTest(t, `
+[proxy]
+port = 8088
+vlm_model = "global-vision"
+
+[admin]
+token = "s3cret"
+
+[upstreams.plain]
+protocol = "anthropic"
+url = "https://plain.example/api"
+key = "sk-plain"
+
+[upstreams.plain.routing]
+sonnet = { model = "m"}
+
+`)
+
+	w := postConfig(t, payloadFromViewWithProfiles(t, currentConfigView()), "s3cret")
+	if w.Code != http.StatusOK {
+		t.Fatalf("save must succeed: %d %s", w.Code, w.Body.String())
+	}
+
+	var reloaded Config
+	if err := loadFromDiskInto(t, path, &reloaded); err != nil {
+		t.Fatalf("the saved file must parse: %v", err)
+	}
+	plain := reloaded.Upstreams["plain"]
+	if plain.VLMModel != "" || plain.VLMMaxTokens != 0 || plain.VLMUpstream != "" {
+		t.Fatalf("a scheme that declared no VLM must not gain one from a save: %+v", plain)
+	}
+	if reloaded.Proxy.VLMModel != "global-vision" {
+		t.Fatalf("the global model must be preserved, got %q", reloaded.Proxy.VLMModel)
+	}
+}
+
+// A scheme's vlm_upstream has to name an anthropic-protocol profile. Accepting an
+// openai one would save cleanly and then send /v1/messages to a chat-completions
+// endpoint at describe time.
+func TestAdminSaveRejectsSchemeVLMPointingAtOpenAIProfile(t *testing.T) {
+	t.Setenv("SOPHNET_API_KEY", "")
+
+	configTOMLForTest(t, `
+[proxy]
+port = 8088
+vlm_model = "global-vision"
+
+[admin]
+token = "s3cret"
+
+[upstreams.alpha]
+protocol = "anthropic"
+url = "https://alpha.example/api"
+key = "sk-alpha"
+
+[upstreams.chat]
+protocol = "openai"
+url = "https://chat.example/v1"
+key = "sk-chat"
+
+[upstreams.alpha.routing]
+sonnet = { model = "m"}
+
+`)
+
+	p := payloadFromViewWithProfiles(t, currentConfigView())
+	setSchemeVLM(&p, "alpha", "alpha-vision", "chat", 0)
+
+	w := postConfig(t, p, "s3cret")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("a describe call aimed at an openai profile must be rejected, got %d %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "vlm_upstream") {
+		t.Fatalf("the error must name the offending field: %s", w.Body.String())
+	}
+}
+
+// An unknown profile name in a scheme's vlm_upstream is rejected at save time,
+// where the operator can still fix it.
+func TestAdminSaveRejectsUnknownSchemeVLMUpstream(t *testing.T) {
+	t.Setenv("SOPHNET_API_KEY", "")
+
+	configTOMLForTest(t, `
+[proxy]
+port = 8088
+vlm_model = "global-vision"
+
+[admin]
+token = "s3cret"
+
+[upstreams.alpha]
+protocol = "anthropic"
+url = "https://alpha.example/api"
+key = "sk-alpha"
+
+[upstreams.alpha.routing]
+sonnet = { model = "m"}
+
+`)
+
+	p := payloadFromViewWithProfiles(t, currentConfigView())
+	setSchemeVLM(&p, "alpha", "alpha-vision", "does-not-exist", 0)
+
+	w := postConfig(t, p, "s3cret")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("an undefined vlm_upstream must be rejected, got %d %s", w.Code, w.Body.String())
+	}
+}
+
+// A scheme may name itself as its describe-call server; that is the normal
+// "images stay on my own upstream" shape and must not be rejected as an
+// unresolved reference.
+func TestAdminSaveAcceptsSchemeServingItsOwnVLMCalls(t *testing.T) {
+	t.Setenv("SOPHNET_API_KEY", "")
+
+	configTOMLForTest(t, `
+[proxy]
+port = 8088
+vlm_model = "global-vision"
+
+[admin]
+token = "s3cret"
+
+[upstreams.alpha]
+protocol = "anthropic"
+url = "https://alpha.example/api"
+key = "sk-alpha"
+
+[upstreams.alpha.routing]
+sonnet = { model = "m"}
+
+`)
+
+	p := payloadFromViewWithProfiles(t, currentConfigView())
+	setSchemeVLM(&p, "alpha", "alpha-vision", "alpha", 500)
+
+	w := postConfig(t, p, "s3cret")
+	if w.Code != http.StatusOK {
+		t.Fatalf("a scheme may serve its own describe calls, got %d %s", w.Code, w.Body.String())
+	}
+}
+
+// The scheme payload fields have to be on the wire for any of the above to work.
+func TestAdminSchemeVLMFieldsAreInTheJSONContract(t *testing.T) {
+	p := adminUpstreamProfilePayload{
+		Name: "alpha", Protocol: "anthropic", URL: "https://a/b",
+		VLMModel: "alpha-vision", VLMMaxTokens: 999, VLMUpstream: "gamma",
+	}
+	body, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"vlm_model":"alpha-vision"`, `"vlm_max_tokens":999`, `"vlm_upstream":"gamma"`} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("the payload must carry %s: %s", want, body)
+		}
+	}
+
+	view := adminUpstreamProfileView{Name: "alpha", VLMModel: "v", EffectiveVLMModel: "v"}
+	vb, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(vb), `"effective_vlm_model":"v"`) {
+		t.Fatalf("the view must report the effective model: %s", vb)
+	}
+}
+
+// A scheme's own model table has to survive a save that never mentions it. The
+// save rewrites every [upstreams.*] table from the payload, so a table the page
+// did not model would be silently dropped — and the aliases it served would stop
+// resolving, which is a routing change nobody asked for.
+func TestAdminSaveRoundTripsSchemeRoutingTables(t *testing.T) {
+	t.Setenv("SOPHNET_API_KEY", "")
+
+	path := configTOMLForTest(t, `
+[proxy]
+port = 8088
+vlm_model = "V"
+
+[admin]
+token = "s3cret"
+
+[upstreams.alpha]
+protocol = "anthropic"
+url = "https://alpha.example/api"
+key = "sk-a"
+
+[upstreams.alpha.routing]
+alpha-fast = { model = "alpha-fast-model" }
+alpha-vision = { model = "alpha-vl", supports_image = true }
+
+`)
+
+	view := currentConfigView()
+	var alpha adminUpstreamProfileView
+	for _, p := range view.Upstreams {
+		if p.Name == "alpha" {
+			alpha = p
+		}
+	}
+	if len(alpha.Routing) != 2 {
+		t.Fatalf("the view must report the scheme's two routes, got %+v", alpha.Routing)
+	}
+
+	p := adminConfigPayload{
+		Proxy: view.Proxy, Upstream: view.Upstream,
+		Keys: adminKeysPayload{Action: "keep"}, Admin: adminAuthPayload{Action: "keep"},
+		Upstreams: []adminUpstreamProfilePayload{{
+			Name: "alpha", Protocol: "anthropic", URL: "https://alpha.example/api",
+			KeyAction: "keep", Routing: alpha.Routing,
+		}},
+	}
+	w := postConfig(t, p, "s3cret")
+	if w.Code != http.StatusOK {
+		t.Fatalf("save must succeed: %d %s", w.Code, w.Body.String())
+	}
+
+	if got := snapshotConfig().routeTarget("alpha-fast"); got.Model != "alpha-fast-model" || got.Upstream != "alpha" {
+		t.Fatalf("the scheme route must survive the save, got %+v", got)
+	}
+	vis := snapshotConfig().routeTarget("alpha-vision")
+	if vis.Model != "alpha-vl" || !vis.SupportsImage {
+		t.Fatalf("the scheme route must keep supports_image, got %+v", vis)
+	}
+
+	// And the file itself must still carry the table, not only the live config.
+	var reloaded Config
+	if err := loadFromDiskInto(t, path, &reloaded); err != nil {
+		t.Fatalf("the saved file must parse: %v", err)
+	}
+	normalizeUpstreamProfiles(&reloaded)
+	if len(reloaded.Upstreams["alpha"].Routing) != 2 {
+		t.Fatalf("the saved file must keep both scheme routes, got %+v", reloaded.Upstreams["alpha"].Routing)
+	}
+}
+
+// An older page does not model a scheme's routing table at all. That absence must
+// read as "leave it alone", not as "delete every row".
+func TestAdminSaveWithoutSchemeRoutingKeepsTheTable(t *testing.T) {
+	t.Setenv("SOPHNET_API_KEY", "")
+
+	path := configTOMLForTest(t, `
+[proxy]
+port = 8088
+vlm_model = "V"
+
+[admin]
+token = "s3cret"
+
+[upstreams.alpha]
+protocol = "anthropic"
+url = "https://alpha.example/api"
+key = "sk-a"
+
+[upstreams.alpha.routing]
+alpha-fast = { model = "alpha-fast-model" }
+`)
+
+	// Build the payload the way an older page would: a profile with no Routing.
+	view := currentConfigView()
+	p := adminConfigPayload{
+		Proxy: view.Proxy, Upstream: view.Upstream,
+		Keys: adminKeysPayload{Action: "keep"}, Admin: adminAuthPayload{Action: "keep"},
+		Upstreams: []adminUpstreamProfilePayload{{
+			Name: "alpha", Protocol: "anthropic", URL: "https://alpha.example/api", KeyAction: "keep",
+		}},
+	}
+	w := postConfig(t, p, "s3cret")
+	if w.Code != http.StatusOK {
+		t.Fatalf("save must succeed: %d %s", w.Code, w.Body.String())
+	}
+
+	if got := snapshotConfig().routeTarget("alpha-fast"); got.Model != "alpha-fast-model" {
+		t.Fatalf("an unmodelled table must be carried over, got %+v", got)
+	}
+	var reloaded Config
+	if err := loadFromDiskInto(t, path, &reloaded); err != nil {
+		t.Fatal(err)
+	}
+	normalizeUpstreamProfiles(&reloaded)
+	if len(reloaded.Upstreams["alpha"].Routing) != 1 {
+		t.Fatalf("the file must keep the route, got %+v", reloaded.Upstreams["alpha"].Routing)
+	}
+}
+
+// An empty (non-nil) list is the operator having deleted every row, which must
+// take effect. This is the other side of the nil distinction above.
+func TestAdminSaveWithEmptySchemeRoutingClearsTheTable(t *testing.T) {
+	t.Setenv("SOPHNET_API_KEY", "")
+
+	path := configTOMLForTest(t, `
+[proxy]
+port = 8088
+vlm_model = "V"
+
+[admin]
+token = "s3cret"
+
+[upstreams.alpha]
+protocol = "anthropic"
+url = "https://alpha.example/api"
+key = "sk-a"
+
+[upstreams.alpha.routing]
+alpha-fast = { model = "alpha-fast-model" }
+`)
+
+	view := currentConfigView()
+	p := adminConfigPayload{
+		Proxy: view.Proxy, Upstream: view.Upstream,
+		Keys: adminKeysPayload{Action: "keep"}, Admin: adminAuthPayload{Action: "keep"},
+		Upstreams: []adminUpstreamProfilePayload{{
+			Name: "alpha", Protocol: "anthropic", URL: "https://alpha.example/api",
+			KeyAction: "keep", Routing: []adminRoutingEntry{},
+		}},
+	}
+	w := postConfig(t, p, "s3cret")
+	if w.Code != http.StatusOK {
+		t.Fatalf("save must succeed: %d %s", w.Code, w.Body.String())
+	}
+	if got := snapshotConfig().routeTarget("alpha-fast"); got.Model != "" {
+		t.Fatalf("the deleted route must be gone, got %+v", got)
+	}
+	var reloaded Config
+	if err := loadFromDiskInto(t, path, &reloaded); err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Upstreams["alpha"].Routing) != 0 {
+		t.Fatalf("the file must not keep the deleted route, got %+v", reloaded.Upstreams["alpha"].Routing)
+	}
+}

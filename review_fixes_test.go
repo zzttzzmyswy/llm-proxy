@@ -276,19 +276,26 @@ func TestReviewMissingUsageEstimatesInput(t *testing.T) {
 	}
 }
 
-// P2: the editor must expose the routing entries as declared, so a value
-// inherited from default_upstream is not frozen into the file by a save.
+// P2: a declared alias belongs to the profile whose table declares it, so a save
+// can never freeze an inherited gateway into the file — there is nothing inherited
+// to freeze. default_upstream now only decides where the *undeclared* builtin
+// fallbacks go.
 func TestReviewDefaultGatewayStaysInherited(t *testing.T) {
 	const inheritedConfig = `[upstream]
 default_upstream = "openai"
 
-[routing]
+[upstreams.anthropic.routing]
 sonnet = "Model-A"
 `
 	withTempConfig(t, inheritedConfig)
 
-	if got := snapshotConfig().routeTarget("sonnet").Upstream; got != "openai" {
-		t.Fatalf("sonnet must inherit the openai default, got %q", got)
+	// A declared alias is bound to its own profile, not to default_upstream.
+	if got := snapshotConfig().routeTarget("sonnet").Upstream; got != profileNameAnthropic {
+		t.Fatalf("sonnet must stay on the profile that declares it, got %q", got)
+	}
+	// An undeclared builtin alias still follows default_upstream.
+	if got := snapshotConfig().routeTarget("opus").Upstream; got != "openai" {
+		t.Fatalf("the undeclared opus fallback must follow default_upstream, got %q", got)
 	}
 
 	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "")
@@ -298,24 +305,32 @@ sonnet = "Model-A"
 	var view adminConfigView
 	decodeBody(t, w, &view)
 
-	// The form must show the declared entry, with no explicit gateway.
-	if len(view.Routing) != 1 || view.Routing[0].Alias != "sonnet" {
-		t.Fatalf("routing must list the declared aliases, got %+v", view.Routing)
+	// The form shows the alias in the anthropic profile's own table.
+	var sonnet *adminRoutingEntry
+	for _, prof := range view.Upstreams {
+		for i, e := range prof.Routing {
+			if e.Alias == "sonnet" {
+				sonnet = &prof.Routing[i]
+			}
+		}
 	}
-	if view.Routing[0].Upstream != "" {
-		t.Fatalf("an inherited gateway must not be materialised into the form, got %q", view.Routing[0].Upstream)
+	if sonnet == nil || sonnet.Model != "Model-A" {
+		t.Fatalf("the declared alias must be listed in its profile's table, got %+v", view.Upstreams)
 	}
 
 	// Switch the default gateway to Anthropic and save.
-	p := payloadFromView(t, view)
+	p := payloadFromViewWithProfiles(t, view)
 	p.Upstream.DefaultUpstream = ""
 	res := postConfig(t, p, "")
 	if res.Code != http.StatusOK {
 		t.Fatalf("save failed: %s", res.Body.String())
 	}
 
-	if got := snapshotConfig().routeTarget("sonnet").Upstream; got != "" {
-		t.Fatalf("sonnet must follow the new default gateway, still %q", got)
+	if got := snapshotConfig().routeTarget("opus").Upstream; got != "" {
+		t.Fatalf("the undeclared fallback must follow the new default gateway, still %q", got)
+	}
+	if got := snapshotConfig().routeTarget("sonnet").Upstream; got != profileNameAnthropic {
+		t.Fatalf("the declared alias must stay on its own profile, got %q", got)
 	}
 }
 
