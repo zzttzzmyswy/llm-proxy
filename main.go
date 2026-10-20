@@ -529,9 +529,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	vlmModel := rc.visionModel()
 	// vlmFallback is set when the describe pass failed: the original (still
-	// image-carrying) request must be routed to the VLM model via the anthropic
-	// upstream. An openai-route request in this state must NOT be translated to the
-	// openai text model, or the raw image fails again with
+	// image-carrying) request must be routed to the VLM model on the upstream that
+	// serves the describe pass. An openai text route in this state must NOT be sent
+	// to the openai text model, or the raw image fails again with
 	// "model ... do not support image params".
 	vlmFallback := false
 	// A route with SupportsImage=true (the upstream model natively handles image
@@ -560,8 +560,9 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// A scheme whose text upstream speaks the OpenAI protocol leaves this pipeline
-	// unless the describe pass failed, in which case the request must stay on the
-	// anthropic upstream the VLM lives on.
+	// unless the describe pass failed, in which case the request must go to the
+	// upstream the VLM lives on — in that upstream's own protocol, which may be
+	// either one.
 	gateway := textUp.Protocol
 	if vlmFallback {
 		gateway = vlmRC.up.Protocol
@@ -570,7 +571,10 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	tracker := stats.beginReqAt(startedAt, model, newModel, gateway)
 
 	if gateway == protocolOpenAI {
-		handleOpenAIRequest(w, r, req, target.Model, tracker, rc)
+		// newModel, not target.Model: on the describe-failed fallback the request was
+		// re-pointed at the VLM model, and translating it to the text model instead
+		// would send an image to a model that was never meant to receive one.
+		handleOpenAIRequest(w, r, req, newModel, tracker, rc)
 		return
 	}
 
@@ -601,11 +605,17 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(string(respBody), "do not support image") {
 			log.Printf("[RETRY] image 400 -> vlm %s\n", vlmModel)
 			req["model"] = vlmModel
-			body, _ = json.Marshal(req)
-			// The retry goes to the VLM, so it runs on the VLM profile and is
-			// accounted against the VLM model.
+			// The retry goes to the VLM, so it runs on the VLM upstream and is
+			// accounted against the VLM model. When that upstream speaks openai the
+			// request has to be translated, exactly as the openai text path does —
+			// the anthropic body above is what this upstream just rejected.
 			tracker.model = vlmModel
 			rc = vlmRC
+			if rc.up.Protocol == protocolOpenAI {
+				handleOpenAIRequest(w, r, req, vlmModel, tracker, rc)
+				return
+			}
+			body, _ = json.Marshal(req)
 			resp, err = doUpstreamRequest(body, r, rc)
 			if err != nil {
 				log.Printf("[RESP] retry error: %v\n", err)
@@ -1582,33 +1592,49 @@ func describeImageWithVLM(block map[string]interface{}, ctx string, rc reqConfig
 		prompt = fmt.Sprintf("请结合以下消息上下文，详细描述这张图片的内容，重点关注与上下文相关的细节。\n\n消息上下文：\n%s", truncate(ctx, maxImageCtxLen))
 	}
 
-	req := map[string]interface{}{
-		"model":      rc.visionModel(),
-		"max_tokens": rc.visionMaxTokens(),
-		"messages": []interface{}{
-			map[string]interface{}{
-				"role": "user",
-				"content": []interface{}{
-					img,
-					map[string]interface{}{"type": "text", "text": prompt},
-				},
-			},
-		},
+	// The describe call is framed for whichever protocol the serving upstream
+	// speaks. A scheme can point [vlm] at its own text gateway — including an openai
+	// one — so the request shape, the auth header and the reply parser all follow
+	// that upstream rather than being assumed to be anthropic.
+	var body []byte
+	var url string
+	var headers map[string]string
+	if rc.up.Protocol == protocolOpenAI {
+		var err error
+		body, err = json.Marshal(describeOpenAIRequest(img, prompt, rc))
+		if err != nil {
+			return "", false
+		}
+		url = rc.openAICompletionsURL()
+		headers = map[string]string{
+			"Content-Type":  "application/json",
+			"Authorization": "Bearer " + rc.apiKey(),
+			"Accept":        "application/json",
+		}
+	} else {
+		var err error
+		body, err = json.Marshal(describeAnthropicRequest(img, prompt, rc))
+		if err != nil {
+			return "", false
+		}
+		url = rc.anthropicMessagesURL()
+		headers = map[string]string{
+			"Content-Type":      "application/json",
+			"x-api-key":         rc.apiKey(),
+			"anthropic-version": "2023-06-01",
+			"Accept":            "application/json",
+		}
 	}
-	body, err := json.Marshal(req)
+
+	// One attempt, no retry: the describe pass already has a fallback (route the
+	// whole request to the VLM), so retrying here would just delay it.
+	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
 		return "", false
 	}
-
-	httpReq, err := http.NewRequest("POST", rc.anthropicMessagesURL(), bytes.NewReader(body))
-	if err != nil {
-		return "", false
+	for k, v := range headers {
+		httpReq.Header.Set(k, v)
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-api-key", rc.apiKey())
-	httpReq.Header.Set("anthropic-version", "2023-06-01")
-	httpReq.Header.Set("Accept", "application/json")
-
 	resp, err := rc.httpClient().Do(httpReq)
 	if err != nil {
 		log.Printf("[VLM] describe error: %v\n", err)
@@ -1622,7 +1648,12 @@ func describeImageWithVLM(block map[string]interface{}, ctx string, rc reqConfig
 		return "", false
 	}
 
-	desc := extractTextFromResponse(respBody)
+	desc := ""
+	if rc.up.Protocol == protocolOpenAI {
+		desc = extractOpenAIChatText(respBody)
+	} else {
+		desc = extractTextFromResponse(respBody)
+	}
 	if desc == "" {
 		log.Printf("[VLM] describe returned empty text\n")
 		return "", false
@@ -1638,6 +1669,101 @@ func describeImageWithVLM(block map[string]interface{}, ctx string, rc reqConfig
 		log.Printf("[VLM] described image (uncacheable): %s\n", truncate(desc, 200))
 	}
 	return desc, true
+}
+
+// describeAnthropicRequest builds the image-description call for an anthropic
+// upstream: one user message carrying the image block and the prompt.
+func describeAnthropicRequest(img map[string]interface{}, prompt string, rc reqConfig) map[string]interface{} {
+	return map[string]interface{}{
+		"model":      rc.visionModel(),
+		"max_tokens": rc.visionMaxTokens(),
+		"messages": []interface{}{
+			map[string]interface{}{
+				"role": "user",
+				"content": []interface{}{
+					img,
+					map[string]interface{}{"type": "text", "text": prompt},
+				},
+			},
+		},
+	}
+}
+
+// describeOpenAIRequest builds the same call for an openai upstream. The image
+// arrives as an Anthropic block, so it is converted to an image_url part first; a
+// block that cannot be converted (an unrecognized source) is dropped and the model
+// is asked to describe from the context alone rather than sent a malformed part.
+//
+// max_tokens and the OpenAI field name differ: this endpoint calls it
+// max_tokens too, but the reply shape does not, which is why the parser is chosen
+// alongside the request.
+func describeOpenAIRequest(img map[string]interface{}, prompt string, rc reqConfig) map[string]interface{} {
+	content := []interface{}{map[string]interface{}{"type": "text", "text": prompt}}
+	if part := imageBlockToOpenAIPart(img); part != nil {
+		content = []interface{}{
+			map[string]interface{}{"type": "text", "text": prompt},
+			part,
+		}
+	}
+	return map[string]interface{}{
+		"model":      rc.visionModel(),
+		"max_tokens": rc.visionMaxTokens(),
+		"messages": []interface{}{
+			map[string]interface{}{"role": "user", "content": content},
+		},
+	}
+}
+
+// imageBlockToOpenAIPart converts whichever image shape the request carried into an
+// OpenAI image_url part. A block that is already image_url passes its URL through;
+// an Anthropic image block is converted from its source.
+func imageBlockToOpenAIPart(block map[string]interface{}) interface{} {
+	if t, _ := block["type"].(string); t == "image_url" {
+		if u, ok := block["image_url"].(map[string]interface{}); ok {
+			if url, ok := u["url"].(string); ok && url != "" {
+				return map[string]interface{}{
+					"type":      "image_url",
+					"image_url": map[string]interface{}{"url": url},
+				}
+			}
+		}
+		return nil
+	}
+	return imageToOpenAIPart(block)
+}
+
+// extractOpenAIChatText pulls the assistant text out of a non-streaming
+// chat-completions reply.
+func extractOpenAIChatText(respBody []byte) string {
+	var resp struct {
+		Choices []struct {
+			Message struct {
+				Content interface{} `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return ""
+	}
+	if len(resp.Choices) == 0 {
+		return ""
+	}
+	switch c := resp.Choices[0].Message.Content.(type) {
+	case string:
+		return c
+	case []interface{}:
+		// Some gateways return the content as parts even without streaming.
+		var sb strings.Builder
+		for _, part := range c {
+			if m, ok := part.(map[string]interface{}); ok {
+				if s, ok := m["text"].(string); ok {
+					sb.WriteString(s)
+				}
+			}
+		}
+		return sb.String()
+	}
+	return ""
 }
 
 // anthropicToOpenAIRequest translates an Anthropic /v1/messages request into an
