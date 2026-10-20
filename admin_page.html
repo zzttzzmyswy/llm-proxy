@@ -97,14 +97,39 @@
   header h1 { font-size: 15px; margin: 0; font-weight: 650; letter-spacing: .01em; white-space: nowrap; }
   header .meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
   header .spacer { flex: 1; }
-  /* Section jump links: the page is long enough that scrolling to the config form
-     was the main way operators wasted time. */
-  nav.jump { display: flex; gap: 2px; flex-wrap: wrap; }
-  nav.jump a {
-    color: var(--muted); text-decoration: none; font-size: 12px;
-    padding: 4px 9px; border-radius: 6px; white-space: nowrap;
+  /* Page tabs. Each view is its own page rather than a section of one long
+     document: stats and configuration answer different questions and were only
+     sharing a scrollbar. */
+  nav.pages { display: flex; gap: 2px; flex-wrap: wrap; }
+  nav.pages a {
+    color: var(--muted); text-decoration: none; font-size: 13px;
+    padding: 5px 12px; border-radius: 7px; white-space: nowrap;
+    border: 1px solid transparent;
   }
-  nav.jump a:hover { color: var(--text); background: var(--panel-sunken); }
+  nav.pages a:hover { color: var(--text); background: var(--panel-sunken); }
+  nav.pages a[aria-current="page"] {
+    color: var(--text); background: var(--accent-soft); border-color: var(--accent);
+    font-weight: 600;
+  }
+  /* Only the current page is rendered; the rest stay in the document so their
+     controls keep their ids and state across a switch. */
+  .page { display: none; }
+  .page.is-active { display: block; }
+  /* Pagination bar shared by the model, failure and routing lists. */
+  .pager {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 8px 12px; border-bottom: 1px solid var(--border);
+    font-size: 12px; color: var(--muted);
+  }
+  .pager button { padding: 3px 9px; font-size: 12px; }
+  .pager button:disabled { opacity: .4; cursor: default; }
+  .pager .pager-info { font-variant-numeric: tabular-nums; }
+  .pager .pager-size { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+  .pager select { font: inherit; font-size: 12px; padding: 2px 4px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text); }
+  /* The routing editor sits on its own page, so its rows can be wider. */
+  #routing .route-row { padding: 8px 16px; }
+  #routing .route-row.empty-page { padding: 18px 16px; color: var(--muted); text-align: center; }
   main { padding: 20px 24px; max-width: 1440px; margin: 0 auto; }
   section { margin-bottom: 26px; scroll-margin-top: 64px; }
   section > h2 {
@@ -159,8 +184,6 @@
   .route-row { display: grid; grid-template-columns: 1.2fr 1.6fr 1fr auto auto auto; gap: 10px; align-items: end; padding: 10px 16px; border-bottom: 1px solid var(--border); }
   .route-row:last-child { border-bottom: none; }
   .route-row input[type=checkbox] { width: auto; }
-  /* A model-table row inside the scheme's mapping table. */
-  #routing .route-row { padding: 8px 16px; }
   .chk { display: flex; align-items: center; gap: 6px; padding-bottom: 8px; font-size: 13px; }
   .chk label { margin: 0; color: var(--text); }
   .banner { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 13px; display: none; white-space: pre-wrap; }
@@ -208,16 +231,15 @@
 <header>
   <h1>llm-proxy</h1>
   <span class="meta" id="head-meta">加载中…</span>
-  <nav class="jump">
-    <a href="#sec-overview">总览</a>
-    <a href="#sec-history">历史速率</a>
-    <a href="#sec-models">模型调用</a>
-    <a href="#sec-failures">失败</a>
-    <a href="#sec-config">配置</a>
+  <nav class="pages" id="nav-pages">
+    <a href="#/usage" data-page="usage">用量统计</a>
+    <a href="#/errors" data-page="errors">报错统计</a>
+    <a href="#/main" data-page="main">主配置</a>
+    <a href="#/schemes" data-page="schemes">方案文件</a>
   </nav>
   <span class="spacer"></span>
   <span class="legend" id="refresh-legend"></span>
-  <button id="btn-refresh" title="立即拉取最新统计">刷新</button>
+  <button id="btn-refresh" title="立即拉取最新数据">刷新</button>
   <button id="btn-auto" title="每 5 秒自动刷新统计">暂停自动刷新</button>
   <button id="btn-theme" class="icon" title="切换明暗配色" aria-label="切换明暗配色">◐</button>
   <button id="btn-reset" class="danger" title="把所有调用统计归零，此操作不可撤销">清零统计</button>
@@ -226,148 +248,194 @@
 <main>
   <div id="banner" class="banner"></div>
 
-  <section id="sec-overview">
-    <h2>总览</h2>
-    <div class="cards" id="totals"></div>
-  </section>
-  <section id="sec-history">
-    <h2>历史速率</h2>
-    <div class="panel">
-      <div class="chart-head" id="history-controls"></div>
-      <div class="chart-wrap"><div id="history-chart"></div></div>
-      <div id="history-summary"></div>
-      <div class="hint" id="history-meta" style="padding:0 16px 12px; margin:0"></div>
-    </div>
-  </section>
-
-  <section id="sec-models">
-    <h2>模型调用情况</h2>
-    <div class="panel scroll" id="models"></div>
-  </section>
-
-  <section id="sec-failures">
-    <h2>失败情况</h2>
-    <div class="panel scroll" id="failures"></div>
-  </section>
-
-  <section id="sec-config">
-    <h2>配置</h2>
-    <div id="save-banner" class="banner"></div>
-    <div class="panel">
-      <div class="form-body">
-        <div class="grid">
-          <div>
-            <label>监听端口</label>
-            <input type="number" id="cfg-port" min="1" max="65535">
-            <div class="hint">端口变更需重启服务，其余配置保存即生效。</div>
-          </div>
-          <div>
-            <label>生效方案</label>
-            <select id="cfg-scheme"></select>
-            <div class="hint" id="cfg-scheme-hint">每份方案是一个完整的上游配置，同一时刻只有一份生效。</div>
-          </div>
-        </div>
-        <div class="hint" id="cfg-paths" style="margin-top:8px"></div>
+  <!-- 用量统计 -->
+  <div class="page" data-page="usage">
+    <section>
+      <h2>总览</h2>
+      <div class="cards" id="totals"></div>
+    </section>
+    <section>
+      <h2>历史速率</h2>
+      <div class="panel">
+        <div class="chart-head" id="history-controls"></div>
+        <div class="chart-wrap"><div id="history-chart"></div></div>
+        <div id="history-summary"></div>
+        <div class="hint" id="history-meta" style="padding:0 16px 12px; margin:0"></div>
       </div>
+    </section>
+    <section>
+      <h2>模型调用情况</h2>
+      <div class="panel">
+        <div class="pager" id="models-pager"></div>
+        <div class="scroll" id="models"></div>
+      </div>
+    </section>
+  </div>
 
-      <div style="border-top:1px solid var(--border)">
-        <div class="form-body" style="padding-bottom:8px">
-          <strong style="font-size:13px">主上游（文本模型）</strong>
-          <span class="hint" style="margin-left:10px">当前生效方案的顶层配置：Claude Code 的 /v1/messages 请求最终发到这里。</span>
-        </div>
+  <!-- 报错统计 -->
+  <div class="page" data-page="errors">
+    <section>
+      <h2>失败情况</h2>
+      <div class="panel">
+        <div class="pager" id="failures-pager"></div>
+        <div class="scroll" id="failures"></div>
+      </div>
+    </section>
+  </div>
+
+  <!-- 主配置 -->
+  <div class="page" data-page="main">
+    <section>
+      <h2>主配置</h2>
+      <div id="main-banner" class="banner"></div>
+      <div class="panel">
         <div class="form-body">
-          <div class="grid wide" id="up-main"></div>
-        </div>
-      </div>
-
-      <div style="border-top:1px solid var(--border)">
-        <div class="form-body" style="padding-bottom:8px">
-          <strong style="font-size:13px">图片描述（VLM）</strong>
-          <span class="hint" style="margin-left:10px">带图请求先由视觉模型描述，再用文本发给主上游。</span>
-        </div>
-        <div class="form-body">
-          <div class="chk" style="margin-bottom:10px">
-            <input type="checkbox" id="cfg-vlm-active">
-            <label for="cfg-vlm-active">启用图片描述</label>
-            <span class="hint" style="margin-left:8px">关闭后带图请求原样转发给主上游，由其自行处理。</span>
-          </div>
-          <div id="vlm-body">
-            <div class="grid wide">
-              <div><label>视觉模型</label><input type="text" id="cfg-vlm-model"></div>
-              <div><label>每次最大输出 token</label><input type="number" id="cfg-vlm-max-tokens" min="0"></div>
+          <div class="grid">
+            <div>
+              <label>监听端口</label>
+              <input type="number" id="cfg-port" min="1" max="65535">
+              <div class="hint">端口变更需重启服务，其余配置保存即生效。</div>
             </div>
-            <div class="chk" style="margin:10px 0">
-              <input type="checkbox" id="cfg-vlm-inherit">
-              <label for="cfg-vlm-inherit">沿用主上游</label>
-              <span class="hint" style="margin-left:8px">勾选后描述调用走上面的主上游地址（要求 anthropic 协议），否则在下面单独配置。</span>
+            <div>
+              <label>当前生效方案</label>
+              <input type="text" id="cfg-active-scheme" readonly>
+              <div class="hint">切换方案在「方案文件」页面操作，这里只展示。</div>
             </div>
-            <div class="grid wide" id="up-vlm"></div>
           </div>
+          <div class="hint" id="cfg-paths" style="margin-top:8px"></div>
         </div>
-      </div>
-
-      <div style="border-top:1px solid var(--border)">
-        <div class="form-body" style="padding-bottom:8px">
-          <strong style="font-size:13px">chat 透传</strong>
-          <span class="hint" style="margin-left:10px">OpenAI 兼容端点 /v1/chat/completions 走哪个上游。</span>
-        </div>
-        <div class="form-body">
-          <div class="chk" style="margin-bottom:10px">
-            <input type="checkbox" id="cfg-chat-available">
-            <label for="cfg-chat-available">启用 chat 透传</label>
-            <span class="hint" style="margin-left:8px">关闭后该端点返回 502。要求 openai 协议的上游。</span>
-          </div>
-          <div id="chat-body">
-            <div class="chk" style="margin:0 0 10px">
-              <input type="checkbox" id="cfg-chat-inherit">
-              <label for="cfg-chat-inherit">沿用主上游</label>
-              <span class="hint" style="margin-left:8px">勾选后透传走上面的主上游地址（要求 openai 协议），否则在下面单独配置。</span>
-            </div>
-            <div class="grid wide" id="up-chat"></div>
-          </div>
-        </div>
-      </div>
-
-      <div style="border-top:1px solid var(--border)">
-        <div class="form-body" style="padding-bottom:8px; display:flex; align-items:center;">
-          <strong style="font-size:13px">模型映射表</strong>
-          <span class="hint" style="margin:0 0 0 10px">别名即客户端请求的模型名，映射到本方案的模型名。未声明的别名原样转发；haiku 未声明时沿用 sonnet。</span>
-        </div>
-        <div id="routing"></div>
         <div class="form-body" style="border-top:1px solid var(--border)">
-          <button id="btn-add-route">添加别名</button>
-        </div>
-      </div>
-
-      <div class="form-body" style="border-top:1px solid var(--border)">
-        <div class="grid">
-          <div>
-            <label>管理页面口令</label>
-            <input type="password" id="cfg-admin-token" placeholder="留空则保持原口令不变" autocomplete="new-password">
-            <div class="hint" id="cfg-admin-hint"></div>
+          <div class="grid">
+            <div>
+              <label>管理页面口令</label>
+              <input type="password" id="cfg-admin-token" placeholder="留空则保持原口令不变" autocomplete="new-password">
+              <div class="hint" id="cfg-admin-hint"></div>
+            </div>
+            <div class="chk"><input type="checkbox" id="cfg-admin-clear"><label for="cfg-admin-clear">清除口令（关闭管理页面）</label></div>
           </div>
-          <div class="chk"><input type="checkbox" id="cfg-admin-clear"><label for="cfg-admin-clear">清除口令（关闭管理页面）</label></div>
+        </div>
+        <div class="form-actions">
+          <button class="primary" id="btn-save-main">保存主配置</button>
+          <button id="btn-reload-main">放弃修改</button>
+          <span class="hint" id="main-save-hint" style="margin:0"></span>
         </div>
       </div>
+      <div class="hint">保存会先备份为 <code>&lt;配置文件&gt;.bak.&lt;时间戳&gt;</code>，再原子写入并立即生效（端口变更除外，需重启服务）。</div>
+    </section>
+  </div>
 
-      <div style="border-top:1px solid var(--border)">
-        <div class="form-body" style="padding-bottom:8px; display:flex; align-items:center;">
-          <strong style="font-size:13px">生效路由</strong>
-        </div>
+  <!-- 方案文件 -->
+  <div class="page" data-page="schemes">
+    <section>
+      <h2>方案文件</h2>
+      <div id="scheme-banner" class="banner"></div>
+      <div class="panel">
         <div class="form-body">
-          <div class="hint" style="margin:0 0 8px">经过 haiku 兜底之后，每个别名实际走哪个模型。这里的内容不会被保存。</div>
-          <div id="effective-routes"></div>
+          <div class="grid">
+            <div>
+              <label>编辑哪个方案</label>
+              <select id="cfg-scheme"></select>
+              <div class="hint" id="cfg-scheme-hint"></div>
+            </div>
+            <div>
+              <label>状态</label>
+              <div id="cfg-scheme-state" style="padding-top:6px"></div>
+              <div class="hint">切换只改主配置里选中的方案，不改动任何方案文件。</div>
+            </div>
+          </div>
+          <div class="hint" id="cfg-scheme-path" style="margin-top:8px"></div>
+        </div>
+        <div class="form-actions" style="border-top:1px solid var(--border)">
+          <button class="primary" id="btn-activate">启用该方案</button>
+          <span class="hint" id="activate-hint" style="margin:0"></span>
+        </div>
+
+        <div style="border-top:1px solid var(--border)">
+          <div class="form-body" style="padding-bottom:8px">
+            <strong style="font-size:13px">主上游（文本模型）</strong>
+            <span class="hint" style="margin-left:10px">该方案的顶层配置：Claude Code 的 /v1/messages 请求最终发到这里。</span>
+          </div>
+          <div class="form-body"><div class="grid wide" id="up-main"></div></div>
+        </div>
+
+        <div style="border-top:1px solid var(--border)">
+          <div class="form-body" style="padding-bottom:8px">
+            <strong style="font-size:13px">图片描述（VLM）</strong>
+            <span class="hint" style="margin-left:10px">带图请求先由视觉模型描述，再用文本发给主上游。</span>
+          </div>
+          <div class="form-body">
+            <div class="chk" style="margin-bottom:10px">
+              <input type="checkbox" id="cfg-vlm-active">
+              <label for="cfg-vlm-active">启用图片描述</label>
+              <span class="hint" style="margin-left:8px">关闭后带图请求原样转发给主上游，由其自行处理。</span>
+            </div>
+            <div id="vlm-body">
+              <div class="grid wide">
+                <div><label>视觉模型</label><input type="text" id="cfg-vlm-model"></div>
+                <div><label>每次最大输出 token</label><input type="number" id="cfg-vlm-max-tokens" min="0"></div>
+              </div>
+              <div class="chk" style="margin:10px 0">
+                <input type="checkbox" id="cfg-vlm-inherit">
+                <label for="cfg-vlm-inherit">沿用主上游</label>
+                <span class="hint" style="margin-left:8px">勾选后描述调用走上面的主上游地址（要求 anthropic 协议），否则在下面单独配置。</span>
+              </div>
+              <div class="grid wide" id="up-vlm"></div>
+            </div>
+          </div>
+        </div>
+
+        <div style="border-top:1px solid var(--border)">
+          <div class="form-body" style="padding-bottom:8px">
+            <strong style="font-size:13px">chat 透传</strong>
+            <span class="hint" style="margin-left:10px">OpenAI 兼容端点 /v1/chat/completions 走哪个上游。</span>
+          </div>
+          <div class="form-body">
+            <div class="chk" style="margin-bottom:10px">
+              <input type="checkbox" id="cfg-chat-available">
+              <label for="cfg-chat-available">启用 chat 透传</label>
+              <span class="hint" style="margin-left:8px">关闭后该端点返回 502。要求 openai 协议的上游。</span>
+            </div>
+            <div id="chat-body">
+              <div class="chk" style="margin:0 0 10px">
+                <input type="checkbox" id="cfg-chat-inherit">
+                <label for="cfg-chat-inherit">沿用主上游</label>
+                <span class="hint" style="margin-left:8px">勾选后透传走上面的主上游地址（要求 openai 协议），否则在下面单独配置。</span>
+              </div>
+              <div class="grid wide" id="up-chat"></div>
+            </div>
+          </div>
+        </div>
+
+        <div style="border-top:1px solid var(--border)">
+          <div class="form-body" style="padding-bottom:8px; display:flex; align-items:center;">
+            <strong style="font-size:13px">模型映射表</strong>
+            <span class="hint" style="margin:0 0 0 10px">别名即客户端请求的模型名，映射到本方案的模型名。未声明的别名原样转发；haiku 未声明时沿用 sonnet。</span>
+          </div>
+          <div class="pager" id="routing-pager"></div>
+          <div id="routing"></div>
+          <div class="form-body" style="border-top:1px solid var(--border)">
+            <button id="btn-add-route">添加别名</button>
+          </div>
+        </div>
+
+        <div style="border-top:1px solid var(--border)">
+          <div class="form-body" style="padding-bottom:8px; display:flex; align-items:center;">
+            <strong style="font-size:13px">生效路由</strong>
+          </div>
+          <div class="form-body">
+            <div class="hint" style="margin:0 0 8px">经过 haiku 兜底之后，每个别名实际走哪个模型。这里的内容不会被保存。</div>
+            <div id="effective-routes"></div>
+          </div>
+        </div>
+        <div class="form-actions">
+          <button class="primary" id="btn-save-scheme">保存方案</button>
+          <button id="btn-reload-scheme">放弃修改</button>
+          <span class="hint" id="scheme-save-hint" style="margin:0"></span>
         </div>
       </div>
-      <div class="form-actions">
-        <button class="primary" id="btn-save">保存配置</button>
-        <button id="btn-reload">放弃修改</button>
-        <span class="hint" id="save-hint" style="margin:0"></span>
-      </div>
-    </div>
-    <div class="hint">保存会先备份为 <code>&lt;配置文件&gt;.bak.&lt;时间戳&gt;</code>，再原子写入并立即生效（端口变更除外，需重启服务）。</div>
-  </section>
-</main>
+    </section>
+  </div>
+</main></main>
 
 <div class="tip" id="history-tip" role="tooltip"></div>
 
@@ -382,8 +450,12 @@
   var autoTimer = null;
   var autoOn = false;
   var config = null;
-  // The [proxy] vision model, so a scheme row's empty placeholder can say what it
-  // will inherit instead of leaving the operator to scroll up and look.
+  // schemeView is the scheme currently loaded in the editor, which may or may not
+  // be the running one.
+  var schemeView = null;
+  // routingEntries is the whole model table, including the rows on other pages, so
+  // a save never drops what the operator cannot see.
+  var routingEntries = [];
 
   function esc(v) {
     return String(v == null ? "" : v).replace(/[&<>"']/g, function (c) {
@@ -1023,14 +1095,68 @@
     }).join("");
   }
 
+  // ---- pages ----
+  //
+  // Four views, one visible at a time. The hash carries the view so a link can
+  // point at one, and a reload lands where the operator was.
+
+  var PAGES = ["usage", "errors", "main", "schemes"];
+  var currentPage = "usage";
+
+  // normalisePage maps a hash to a known page, defaulting to the first. An unknown
+  // or empty hash is not an error worth showing; it is just the default view.
+  function normalisePage(hash) {
+    var name = String(hash == null ? "" : hash).replace(/^#\/?/, "").trim();
+    return PAGES.indexOf(name) >= 0 ? name : PAGES[0];
+  }
+
+  // showPage reveals one view and marks its tab. Everything else is hidden rather
+  // than removed, so form state and the chart survive a switch.
+  function showPage(name) {
+    currentPage = normalisePage(name);
+    var views = document.querySelectorAll("main .page");
+    for (var i = 0; i < views.length; i++) {
+      views[i].classList.toggle("is-active", views[i].dataset.page === currentPage);
+    }
+    var tabs = document.querySelectorAll("#nav-pages a");
+    for (var j = 0; j < tabs.length; j++) {
+      if (tabs[j].dataset.page === currentPage) tabs[j].setAttribute("aria-current", "page");
+      else tabs[j].removeAttribute("aria-current");
+    }
+    // The chart measures its container, so it has to be laid out before it draws.
+    if (currentPage === "usage") renderHistory();
+    syncHeaderButtons();
+  }
+
+  // syncHeaderButtons hides the stats-only controls on the configuration pages and
+  // the save controls elsewhere, so every button on screen does something.
+  function syncHeaderButtons() {
+    var statsPage = currentPage === "usage" || currentPage === "errors";
+    ["btn-refresh", "btn-auto", "refresh-legend", "btn-reset"].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.style.display = statsPage ? "" : "none";
+    });
+  }
+
+  function initPages() {
+    window.addEventListener("hashchange", function () { showPage(location.hash); });
+    showPage(location.hash);
+  }
+
   function renderModels(stats) {
     var models = stats.models || [];
+    rowCounts.models = models.length;
     var host = document.getElementById("models");
+    var pager = document.getElementById("models-pager");
     if (!models.length) {
       host.innerHTML = '<div class="empty">还没有请求经过代理。</div>';
+      if (pager) pager.innerHTML = "";
       return;
     }
-    var rows = models.map(function (m) {
+    var win = pageWindow(models.length, pagedState.models.page, pagedState.models.size);
+    pagedState.models.page = win.page;
+    if (pager) pager.innerHTML = pagerHTML("models", win, pagedState.models.size);
+    var rows = models.slice(win.start, win.end).map(function (m) {
       var aliases = Object.keys(m.aliases || {}).map(function (a) { return a + " ×" + m.aliases[a]; }).join("、");
       var rate = m.failure_rate || 0;
       var rateCls = rate > 0 ? (rate >= 0.1 ? "bad" : "warn") : "ok";
@@ -1077,16 +1203,24 @@
       });
     });
     events.sort(function (a, b) { return new Date(b.e.time) - new Date(a.e.time); });
+    rowCounts.failures = events.length;
 
     if (!events.length) {
       host.innerHTML = '<div class="empty">没有失败记录。</div>';
+      var emptyPager = document.getElementById("failures-pager");
+      if (emptyPager) emptyPager.innerHTML = "";
       return;
     }
+
+    var win = pageWindow(events.length, pagedState.failures.page, pagedState.failures.size);
+    pagedState.failures.page = win.page;
+    var fPager = document.getElementById("failures-pager");
+    if (fPager) fPager.innerHTML = pagerHTML("failures", win, pagedState.failures.size);
 
     var summary = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; })
       .map(function (k) { return '<span class="tag">' + esc(k) + " ×" + num(counts[k]) + "</span>"; }).join(" ");
 
-    var rows = events.slice(0, 100).map(function (item) {
+    var rows = events.slice(win.start, win.end).map(function (item) {
       var e = item.e;
       return "<tr>" +
         "<td>" + esc(new Date(e.time).toLocaleString("zh-CN")) + "</td>" +
@@ -1104,9 +1238,14 @@
       rows + "</tbody></table>";
   }
 
+  // lastStats is the most recent snapshot, so a pager press repaints from memory
+  // instead of refetching the same numbers.
+  var lastStats = null;
+
   async function refresh() {
     try {
       var stats = await api("/admin/api/stats");
+      lastStats = stats;
       hideBanner("banner");
       renderTotals(stats);
       renderModels(stats);
@@ -1126,6 +1265,94 @@
     document.getElementById("btn-auto").textContent = on ? "暂停自动刷新" : "开启自动刷新";
     document.getElementById("refresh-legend").textContent = on ? "每 5 秒自动刷新" : "自动刷新已暂停";
   }
+
+  // ---- pagination ----
+  //
+  // The model, failure and routing lists all grow without bound (models to 128,
+  // failures to one page per model, aliases to whatever an operator types), so
+  // each is paged rather than scrolled. The pager is a pure function of the list
+  // length and the page state, which is what lets the node tests exercise it
+  // without a DOM.
+
+  // pageCount is how many pages a list of n rows occupies. An empty list still has
+  // one page, so the pager renders "(0)" rather than a page 0 of 0.
+  function pageCount(total, size) {
+    if (!(size > 0)) return 1;
+    return Math.max(1, Math.ceil(total / size));
+  }
+
+  // pageWindow resolves the rows one page shows: the clamped page, its offset and
+  // the slice bounds. Clamping matters because a list can shrink under the
+  // operator (a model ages out of the retained window) while they sit on page 3.
+  function pageWindow(total, page, size) {
+    var pages = pageCount(total, size);
+    var p = Math.min(Math.max(1, page), pages);
+    var start = (p - 1) * size;
+    var end = Math.min(total, start + size);
+    return { page: p, pages: pages, start: start, end: end, total: total };
+  }
+
+  // pagerHTML renders the bar itself. Buttons carry a data-pager-action so one
+  // delegated listener on the container can serve every list.
+  function pagerHTML(id, win, size, sizes) {
+    var opts = (sizes || [20, 50, 100]).map(function (s) {
+      return '<option value="' + s + '"' + (s === size ? " selected" : "") + ">" + s + " 条/页</option>";
+    }).join("");
+    return '' +
+      '<button data-pager-action="first" data-pager="' + esc(id) + '"' + (win.page <= 1 ? " disabled" : "") + ">« 首页</button>" +
+      '<button data-pager-action="prev" data-pager="' + esc(id) + '"' + (win.page <= 1 ? " disabled" : "") + ">‹ 上一页</button>" +
+      '<span class="pager-info">第 ' + win.page + " / " + win.pages + " 页 · 共 " + num(win.total) + " 条</span>" +
+      '<button data-pager-action="next" data-pager="' + esc(id) + '"' + (win.page >= win.pages ? " disabled" : "") + ">下一页 ›</button>" +
+      '<button data-pager-action="last" data-pager="' + esc(id) + '"' + (win.page >= win.pages ? " disabled" : "") + ">末页 »</button>" +
+      '<span class="pager-size">每页<select data-pager-size="' + esc(id) + '">' + opts + "</select></span>";
+  }
+
+  // pagedState is the page + size one list is on. Kept apart from the data so a
+  // stats refresh (every 5s) does not reset the operator's page.
+  var pagedState = {
+    models: { page: 1, size: 20 },
+    failures: { page: 1, size: 20 },
+    routing: { page: 1, size: 20 }
+  };
+
+  // applyPagerAction advances one list's state for a button press.
+  function applyPagerAction(state, action, total) {
+    var pages = pageCount(total, state.size);
+    switch (action) {
+      case "first": state.page = 1; break;
+      case "prev": state.page = Math.max(1, state.page - 1); break;
+      case "next": state.page = Math.min(pages, state.page + 1); break;
+      case "last": state.page = pages; break;
+    }
+    return state;
+  }
+
+  // mountPager wires one container's bar. The render callback re-runs on every
+  // interaction, so the caller only supplies how to draw its own rows.
+  function mountPager(hostId, listId, render) {
+    var host = document.getElementById(hostId);
+    if (!host) return;
+    host.addEventListener("click", function (ev) {
+      var btn = ev.target.closest ? ev.target.closest("[data-pager-action]") : null;
+      if (!btn) return;
+      var state = pagedState[listId];
+      applyPagerAction(state, btn.dataset.pagerAction, currentRowCount(listId));
+      render();
+    });
+    host.addEventListener("change", function (ev) {
+      var sel = ev.target.closest ? ev.target.closest("[data-pager-size]") : null;
+      if (!sel) return;
+      var state = pagedState[listId];
+      state.size = parseInt(sel.value, 10) || state.size;
+      state.page = 1;
+      render();
+    });
+  }
+
+  // rowCounts is what the pagers page over, refreshed each time the data changes.
+  var rowCounts = { models: 0, failures: 0, routing: 0 };
+
+  function currentRowCount(listId) { return rowCounts[listId] || 0; }
 
   // ---- config ----
   //
@@ -1235,21 +1462,30 @@
     return row;
   }
 
-  // readRouting collects the model table. An absent row is dropped, and the row
-  // validator rejects a half-filled one so the save fails with a message instead
-  // of silently losing it.
+  // readRouting collects the model table the save should write.
+  //
+  // Only one page of rows is in the DOM, so the entries behind the other pages
+  // have to come from the loaded table. The rows on screen replace their own slice;
+  // everything else is carried over unchanged. Reading the DOM alone would silently
+  // delete every alias the operator was not looking at.
   function readRouting() {
-    var out = [];
+    var win = pageWindow(routingEntries.length, pagedState.routing.page, pagedState.routing.size);
+    var edited = [];
     var bad = null;
-    document.querySelectorAll("#routing .route-row").forEach(function (row) {
-      var alias = row.querySelector(".r-alias").value;
-      var model = row.querySelector(".r-model").value;
-      var entry = schemeRoutePayload(alias, model, row.querySelector(".r-image").checked);
-      if (!entry) return;
+    var rows = document.querySelectorAll("#routing .route-row");
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i];
+      var entry = schemeRoutePayload(
+        row.querySelector(".r-alias").value,
+        row.querySelector(".r-model").value,
+        row.querySelector(".r-image").checked
+      );
+      if (!entry) continue;
       if (!entry.alias) bad = "有一个别名只填了模型名，请补上别名";
       if (!entry.model) bad = "别名 " + entry.alias + " 缺少上游模型名";
-      out.push(entry);
-    });
+      edited.push(entry);
+    }
+    var out = routingEntries.slice(0, win.start).concat(edited, routingEntries.slice(win.end));
     return { entries: out, error: bad };
   }
 
@@ -1262,23 +1498,22 @@
     document.getElementById("up-chat").innerHTML = upstreamFields("up-chat", true);
   }
 
-  function renderConfig(cfg) {
-    config = cfg;
-    document.getElementById("cfg-port").value = cfg.proxy.port;
-    document.getElementById("cfg-paths").textContent =
-      "主配置：" + cfg.config_path + "　方案文件：" + (cfg.scheme_path || "（未加载）");
-
-    fillSelect(document.getElementById("cfg-scheme"), (cfg.proxy.scheme_list || []).map(function (name) {
-      return { value: name, label: name };
-    }));
-    document.getElementById("cfg-scheme").value = cfg.proxy.scheme || "";
-    document.getElementById("cfg-scheme-hint").textContent =
-      (cfg.proxy.scheme_list || []).length + " 份方案位于 " + cfg.proxy.schemes_dir +
-      "。切换方案只改主配置里选中的那一份，不会改动任何方案文件的内容。";
+  // renderScheme fills the scheme editor from one scheme view. It is called for
+  // whichever scheme the selector names, so editing an inactive scheme shows that
+  // file's own values — not the running scheme's.
+  function renderScheme(view) {
+    schemeView = view;
+    document.getElementById("cfg-scheme").value = view.name || "";
+    document.getElementById("cfg-scheme-path").textContent = "方案文件：" + (view.path || "（未知）");
+    document.getElementById("cfg-scheme-state").innerHTML = view.active
+      ? '<span class="tag ok">生效中</span> <span class="muted">保存后立即生效</span>'
+      : '<span class="tag">未生效</span> <span class="muted">保存只写文件，需在主配置里启用后才生效</span>';
+    var actBtn = document.getElementById("btn-activate");
+    actBtn.disabled = !!view.active;
+    actBtn.textContent = view.active ? "已是当前方案" : "启用该方案";
 
     // Main upstream.
-    fillUpstream("up-main", cfg.upstream, true);
-    document.getElementById("up-main-key").placeholder = "留空则保持原密钥不变";
+    fillUpstream("up-main", view.upstream, true);
     var mainHintId = "up-main-key-hint";
     var mainHint = document.getElementById(mainHintId);
     if (!mainHint) {
@@ -1287,35 +1522,28 @@
       mainHint.className = "hint";
       document.getElementById("up-main").appendChild(mainHint);
     }
-    mainHint.textContent = keyHint(cfg.upstream);
+    mainHint.textContent = keyHint(view.upstream);
 
     // VLM.
-    document.getElementById("cfg-vlm-active").checked = !!cfg.vlm.active;
-    document.getElementById("cfg-vlm-model").value = cfg.vlm.model || "";
-    document.getElementById("cfg-vlm-max-tokens").value = cfg.vlm.max_tokens || 0;
-    document.getElementById("cfg-vlm-inherit").checked = !!cfg.vlm.inherit;
-    fillUpstream("up-vlm", cfg.vlm.upstream, true);
+    document.getElementById("cfg-vlm-active").checked = !!view.vlm.active;
+    document.getElementById("cfg-vlm-model").value = view.vlm.model || "";
+    document.getElementById("cfg-vlm-max-tokens").value = view.vlm.max_tokens || 0;
+    document.getElementById("cfg-vlm-inherit").checked = !!view.vlm.inherit;
+    fillUpstream("up-vlm", view.vlm.upstream, true);
     syncVLMSection();
 
     // Chat.
-    document.getElementById("cfg-chat-available").checked = !!cfg.chat.available;
-    document.getElementById("cfg-chat-inherit").checked = !!cfg.chat.inherit;
-    fillUpstream("up-chat", cfg.chat.upstream, true);
+    document.getElementById("cfg-chat-available").checked = !!view.chat.available;
+    document.getElementById("cfg-chat-inherit").checked = !!view.chat.inherit;
+    fillUpstream("up-chat", view.chat.upstream, true);
     syncChatSection();
 
-    document.getElementById("cfg-admin-token").value = "";
-    document.getElementById("cfg-admin-clear").checked = false;
-    document.getElementById("cfg-admin-hint").textContent = cfg.admin.token_from_env
-      ? "已通过环境变量 LLM_PROXY_ADMIN_TOKEN 配置（优先于此处，在此修改不会生效）"
-      : (cfg.admin.token_set ? "已配置（不回显明文）。修改后需用新口令重新登录。" : "未配置：管理页面当前已关闭");
-
-    var host = document.getElementById("routing");
-    host.innerHTML = "";
-    (cfg.routing || []).forEach(function (e) { host.appendChild(routeRow(e)); });
+    // The model table, paged.
+    renderRouting(view.routing || []);
 
     // The effective table is read-only: it includes the haiku fallback, which is
     // derived rather than written.
-    var eff = cfg.effective_routing || {};
+    var eff = view.effective_routing || {};
     var names = Object.keys(eff).sort();
     document.getElementById("effective-routes").innerHTML = names.length
       ? names.map(function (alias) {
@@ -1326,6 +1554,51 @@
                  (e.declared ? "" : " · 兜底") + "</span>";
         }).join(" ")
       : '<span class="muted">—</span>';
+  }
+
+  // renderRouting draws one page of the model table. The rows live in the DOM, so
+  // an edit made on page 2 has to survive a repaint: rows are only re-created when
+  // the list itself is replaced (a reload or a scheme switch), never when paging.
+  function renderRouting(entries) {
+    routingEntries = entries;
+    rowCounts.routing = entries.length;
+    var host = document.getElementById("routing");
+    var pager = document.getElementById("routing-pager");
+    if (!entries.length) {
+      host.innerHTML = '<div class="empty-page">还没有别名。点下面的「添加别名」新增。</div>';
+      if (pager) pager.innerHTML = "";
+      return;
+    }
+    var win = pageWindow(entries.length, pagedState.routing.page, pagedState.routing.size);
+    pagedState.routing.page = win.page;
+    if (pager) pager.innerHTML = pagerHTML("routing", win, pagedState.routing.size);
+    host.innerHTML = "";
+    entries.slice(win.start, win.end).forEach(function (e) { host.appendChild(routeRow(e)); });
+  }
+
+  // renderMain fills the main-configuration page.
+  function renderMain(cfg) {
+    config = cfg;
+    document.getElementById("cfg-port").value = cfg.proxy.port;
+    document.getElementById("cfg-active-scheme").value = cfg.proxy.scheme || "";
+    document.getElementById("cfg-paths").textContent =
+      "主配置：" + cfg.config_path + "　方案目录：" + cfg.proxy.schemes_dir;
+
+    document.getElementById("cfg-admin-token").value = "";
+    document.getElementById("cfg-admin-clear").checked = false;
+    document.getElementById("cfg-admin-hint").textContent = cfg.admin.token_from_env
+      ? "已通过环境变量 LLM_PROXY_ADMIN_TOKEN 配置（优先于此处，在此修改不会生效）"
+      : (cfg.admin.token_set ? "已配置（不回显明文）。修改后需用新口令重新登录。" : "未配置：管理页面当前已关闭");
+  }
+
+  // renderSchemeChoices rebuilds the scheme dropdown from the config view's list.
+  function renderSchemeChoices(cfg) {
+    var names = cfg.proxy.scheme_list || [];
+    fillSelect(document.getElementById("cfg-scheme"), names.map(function (name) {
+      return { value: name, label: name + (name === cfg.proxy.scheme ? " · 生效中" : "") };
+    }));
+    document.getElementById("cfg-scheme-hint").textContent =
+      names.length + " 份方案位于 " + cfg.proxy.schemes_dir + "。下拉选择要编辑的方案；保存只写该方案文件。";
   }
 
   // syncVLMSection disables the describe-pass fields that the checkboxes make
@@ -1348,18 +1621,30 @@
     });
   }
 
-  function collectPayload() {
+  // collectMainPayload is the main-configuration form's body.
+  function collectMainPayload() {
+    return {
+      port: intOr0(document.getElementById("cfg-port").value),
+      admin: {
+        token_action: keyActionOf(
+          document.getElementById("cfg-admin-token").value,
+          document.getElementById("cfg-admin-clear").checked
+        ),
+        token: document.getElementById("cfg-admin-token").value
+      }
+    };
+  }
+
+  // collectSchemePayload is the scheme editor's body. The name says which file it
+  // writes; the server edits that file whether or not it is the running one.
+  function collectSchemePayload() {
     var routing = readRouting();
     if (routing.error) throw new Error(routing.error);
-    var vlmActive = document.getElementById("cfg-vlm-active").checked;
     return {
-      proxy: {
-        port: intOr0(document.getElementById("cfg-port").value),
-        scheme: document.getElementById("cfg-scheme").value
-      },
+      name: document.getElementById("cfg-scheme").value,
       upstream: readUpstream("up-main", true),
       vlm: {
-        active: vlmActive,
+        active: document.getElementById("cfg-vlm-active").checked,
         model: document.getElementById("cfg-vlm-model").value.trim(),
         max_tokens: intOr0(document.getElementById("cfg-vlm-max-tokens").value),
         inherit: document.getElementById("cfg-vlm-inherit").checked,
@@ -1370,57 +1655,124 @@
         inherit: document.getElementById("cfg-chat-inherit").checked,
         upstream: readUpstream("up-chat", true)
       },
-      admin: {
-        token_action: keyActionOf(
-          document.getElementById("cfg-admin-token").value,
-          document.getElementById("cfg-admin-clear").checked
-        ),
-        token: document.getElementById("cfg-admin-token").value
-      },
       routing: routing.entries
     };
   }
 
+  // loadConfig refreshes both configuration pages from one config read.
   async function loadConfig() {
     try {
-      renderConfig(await api("/admin/api/config"));
+      var cfg = await api("/admin/api/config");
+      renderMain(cfg);
+      renderSchemeChoices(cfg);
+      await loadScheme(document.getElementById("cfg-scheme").value);
     } catch (err) {
-      banner("save-banner", "err", "读取配置失败：" + err.message, true);
+      banner("scheme-banner", "err", "读取配置失败：" + err.message, true);
     }
   }
 
-  async function saveConfig() {
-    var btn = document.getElementById("btn-save");
+  // loadScheme loads one scheme file into the editor.
+  async function loadScheme(name) {
+    if (!name) {
+      banner("scheme-banner", "err", "没有可编辑的方案：方案目录里还没有 .toml 文件。", true);
+      return;
+    }
+    renderScheme(await api("/admin/api/schemes?name=" + encodeURIComponent(name)));
+  }
+
+  // saveMain posts only the main configuration, so a port or password change can
+  // never rewrite a scheme file as a side effect.
+  async function saveMain() {
+    var btn = document.getElementById("btn-save-main");
     btn.disabled = true;
-    document.getElementById("save-hint").textContent = "保存中…";
+    document.getElementById("main-save-hint").textContent = "保存中…";
     try {
-      var res = await api("/admin/api/config", {
+      var res = await api("/admin/api/config/main", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(collectPayload())
+        body: JSON.stringify(collectMainPayload())
       });
-      renderConfig(res.config);
-      var warns = res.warnings || [];
+      renderMain(res.config);
+      renderSchemeChoices(res.config);
+      reportSave("main-banner", "main-save-hint", res, "主配置已保存并生效。");
       if (res.reauth_required) {
-        // The old password no longer authenticates, so stop polling and reload
-        // to let the browser prompt for the new one.
         setAuto(false);
-        banner("save-banner", "warnbox", "配置已保存。" + (warns.length ? "\n· " + warns.join("\n· ") : "") +
-          "\n管理口令已更新，页面即将刷新，请用新口令登录。", true);
         setTimeout(function () { location.reload(); }, 2500);
-      } else if (warns.length) {
-        banner("save-banner", "warnbox", "已保存并生效。\n· " + warns.join("\n· "), true);
-      } else {
-        banner("save-banner", "ok", "已保存并生效。", true);
       }
-      document.getElementById("save-hint").textContent = "已保存 " + new Date().toLocaleTimeString("zh-CN");
-      if (!res.reauth_required) refresh();
     } catch (err) {
-      banner("save-banner", "err", "保存失败：" + err.message, true);
-      document.getElementById("save-hint").textContent = "";
+      banner("main-banner", "err", "保存失败：" + err.message, true);
+      document.getElementById("main-save-hint").textContent = "";
     } finally {
       btn.disabled = false;
     }
+  }
+
+  // saveScheme posts one scheme file. Whether that file is the running one decides
+  // what the page can promise: "生效" only when the server says it reloaded.
+  async function saveScheme() {
+    var btn = document.getElementById("btn-save-scheme");
+    btn.disabled = true;
+    document.getElementById("scheme-save-hint").textContent = "保存中…";
+    try {
+      var payload = collectSchemePayload();
+      var res = await api("/admin/api/config/scheme", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      renderSchemeChoices(res.config);
+      renderScheme(res.scheme);
+      reportSave("scheme-banner", "scheme-save-hint", res,
+        res.applied ? "方案已保存并生效。" : "方案已保存。它当前未启用，启用后才生效。");
+      if (res.applied) refresh();
+    } catch (err) {
+      banner("scheme-banner", "err", "保存失败：" + err.message, true);
+      document.getElementById("scheme-save-hint").textContent = "";
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // activateScheme switches the running scheme. It writes one line of the main
+  // file and no scheme file.
+  async function activateScheme() {
+    var btn = document.getElementById("btn-activate");
+    var name = document.getElementById("cfg-scheme").value;
+    btn.disabled = true;
+    document.getElementById("activate-hint").textContent = "切换中…";
+    try {
+      var res = await api("/admin/api/config/activate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scheme: name })
+      });
+      renderMain(res.config);
+      renderSchemeChoices(res.config);
+      renderScheme(res.scheme);
+      var warns = res.warnings || [];
+      banner("scheme-banner", "warnbox", "已启用方案 " + name + "。" + (warns.length ? "\n· " + warns.join("\n· ") : ""), true);
+      document.getElementById("activate-hint").textContent = "已启用 " + new Date().toLocaleTimeString("zh-CN");
+      refresh();
+    } catch (err) {
+      banner("scheme-banner", "err", "启用失败：" + err.message, true);
+      document.getElementById("activate-hint").textContent = "";
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // reportSave renders one save's outcome, including the backend's own warnings.
+  function reportSave(bannerId, hintId, res, okText) {
+    var warns = res.warnings || [];
+    if (res.reauth_required) {
+      banner(bannerId, "warnbox", okText + (warns.length ? "\n· " + warns.join("\n· ") : "") +
+        "\n管理口令已更新，页面即将刷新，请用新口令登录。", true);
+    } else if (warns.length) {
+      banner(bannerId, "warnbox", okText + "\n· " + warns.join("\n· "), true);
+    } else {
+      banner(bannerId, "ok", okText, true);
+    }
+    document.getElementById(hintId).textContent = "已保存 " + new Date().toLocaleTimeString("zh-CN");
   }
 
   // ---- theme ----
@@ -1483,6 +1835,7 @@
 
   function initAdmin() {
   initTheme();
+  initPages();
   document.getElementById("btn-refresh").addEventListener("click", refresh);
   document.getElementById("btn-auto").addEventListener("click", function () { setAuto(!autoTimer); });
   document.getElementById("btn-reset").addEventListener("click", async function () {
@@ -1495,19 +1848,58 @@
       banner("banner", "err", "清零失败：" + err.message);
     }
   });
+
+  // Pagers. Each list re-renders from the last snapshot it received, so paging does
+  // not refetch: the data is already in memory.
+  mountPager("models-pager", "models", function () { if (lastStats) { renderModels(lastStats); } });
+  mountPager("failures-pager", "failures", function () { if (lastStats) { renderFailures(lastStats); } });
+  mountPager("routing-pager", "routing", function () {
+    // Paging the model table has to keep the edits already typed, so the current
+    // rows are folded back into the stored list before the next page is drawn.
+    var current = readRouting();
+    if (!current.error) routingEntries = current.entries;
+    renderRouting(routingEntries);
+  });
+
   document.getElementById("btn-add-route").addEventListener("click", function () {
-    document.getElementById("routing").appendChild(routeRow({}));
+    // A new row joins the last page, which is where the operator will look for it.
+    var list = document.getElementById("routing");
+    if (list.querySelector(".empty-page")) {
+      pagedState.routing.page = 1;
+      renderRouting([]);
+    }
+    list.appendChild(routeRow({}));
+    rowCounts.routing = list.querySelectorAll(".route-row").length;
   });
   document.getElementById("cfg-vlm-active").addEventListener("change", syncVLMSection);
   document.getElementById("cfg-vlm-inherit").addEventListener("change", syncVLMSection);
   document.getElementById("cfg-chat-available").addEventListener("change", syncChatSection);
   document.getElementById("cfg-chat-inherit").addEventListener("change", syncChatSection);
   mountUpstreamForms();
-  document.getElementById("btn-save").addEventListener("click", saveConfig);
-  document.getElementById("btn-reload").addEventListener("click", function () {
-    hideBanner("save-banner");
-    document.getElementById("save-hint").textContent = "";
+
+  document.getElementById("cfg-scheme").addEventListener("change", function () {
+    hideBanner("scheme-banner");
+    document.getElementById("scheme-save-hint").textContent = "";
+    pagedState.routing.page = 1;
+    loadScheme(this.value).catch(function (err) {
+      banner("scheme-banner", "err", "读取方案失败：" + err.message, true);
+    });
+  });
+
+  document.getElementById("btn-save-main").addEventListener("click", saveMain);
+  document.getElementById("btn-reload-main").addEventListener("click", function () {
+    hideBanner("main-banner");
+    document.getElementById("main-save-hint").textContent = "";
     loadConfig();
+  });
+  document.getElementById("btn-save-scheme").addEventListener("click", saveScheme);
+  document.getElementById("btn-activate").addEventListener("click", activateScheme);
+  document.getElementById("btn-reload-scheme").addEventListener("click", function () {
+    hideBanner("scheme-banner");
+    document.getElementById("scheme-save-hint").textContent = "";
+    loadScheme(document.getElementById("cfg-scheme").value).catch(function (err) {
+      banner("scheme-banner", "err", "读取方案失败：" + err.message, true);
+    });
   });
   document.getElementById("cfg-admin-clear").addEventListener("change", function () {
     if (this.checked) document.getElementById("cfg-admin-token").value = "";
@@ -1570,6 +1962,22 @@
       // what the save validator has to accept.
       keyActionOf: keyActionOf,
       schemeRoutePayload: schemeRoutePayload,
+      // Paging and view routing are pure functions of their inputs, so the node
+      // tests can pin the edge cases (empty list, shrinking list, unknown hash)
+      // without a DOM.
+      pageCount: pageCount,
+      pageWindow: pageWindow,
+      applyPagerAction: applyPagerAction,
+      pagerHTML: pagerHTML,
+      normalisePage: normalisePage,
+      viewPages: PAGES,
+      // Hooks for the paged-list tests: they need to seed the stored table and the
+      // page state the same way a load does, then read back what a save would send.
+      __setRoutingEntries: function (entries, state) {
+        routingEntries = entries;
+        if (state) { pagedState.routing.page = state.page; pagedState.routing.size = state.size; }
+      },
+      __readRouting: readRouting,
     };
     return;
   }
