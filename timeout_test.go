@@ -10,8 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -46,13 +44,7 @@ func withStallRelease(t *testing.T, g *stallGate) {
 // previous values on cleanup.
 func setShortTimeouts(t *testing.T, headerSec, bodyIdleSec, maxRetries int) {
 	t.Helper()
-	oldH, oldB, oldR := cfg.Upstream.HeaderTimeoutSeconds, cfg.Upstream.BodyIdleSeconds, cfg.Upstream.MaxRetries
-	cfg.Upstream.HeaderTimeoutSeconds = headerSec
-	cfg.Upstream.BodyIdleSeconds = bodyIdleSec
-	cfg.Upstream.MaxRetries = maxRetries
-	t.Cleanup(func() {
-		cfg.Upstream.HeaderTimeoutSeconds, cfg.Upstream.BodyIdleSeconds, cfg.Upstream.MaxRetries = oldH, oldB, oldR
-	})
+	withTimeouts(t, headerSec, bodyIdleSec, maxRetries)
 }
 
 // openaiSSEChunk is a minimal OpenAI streaming chunk.
@@ -61,7 +53,7 @@ const openaiSSEChunk = `data: {"id":"c1","choices":[{"index":0,"delta":{"role":"
 // An upstream that stalls past the header timeout must be retried: the retry
 // succeeds and the client never sees a failure.
 func TestOpenAIHeaderTimeoutRetriesAndSucceeds(t *testing.T) {
-	setRoute(t, "flash", "glm-5.3-flash", "openai")
+	setRoute(t, "flash", "glm-5.3-flash", "")
 	setShortTimeouts(t, 1, 0, 2)
 	gate := newStallGate()
 
@@ -99,7 +91,7 @@ func TestOpenAIHeaderTimeoutRetriesAndSucceeds(t *testing.T) {
 // When every attempt times out, the client must receive a 502 carrying an
 // Anthropic error JSON body — never a hang and never a plain-text body.
 func TestOpenAIHeaderTimeoutExhaustedReturnsJSONError(t *testing.T) {
-	setRoute(t, "flash", "glm-5.3-flash", "openai")
+	setRoute(t, "flash", "glm-5.3-flash", "")
 	setShortTimeouts(t, 1, 0, 1)
 	gate := newStallGate()
 
@@ -129,7 +121,7 @@ func TestOpenAIHeaderTimeoutExhaustedReturnsJSONError(t *testing.T) {
 // A streaming upstream that goes silent mid-stream must terminate the client
 // stream with an Anthropic error event instead of hanging.
 func TestOpenAIStreamBodyStallEmitsSSEError(t *testing.T) {
-	setRoute(t, "flash", "glm-5.3-flash", "openai")
+	setRoute(t, "flash", "glm-5.3-flash", "")
 	setShortTimeouts(t, 0, 1, 0)
 	gate := newStallGate()
 
@@ -171,9 +163,7 @@ func TestAnthropicStreamBodyStallEmitsSSEError(t *testing.T) {
 		gate.hold()
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 	withStallRelease(t, gate)
 
 	resp := callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
@@ -222,35 +212,25 @@ func TestChatCompletionsRetriesOn503(t *testing.T) {
 	}
 }
 
-// loadConfig fills sensible timeout defaults when the file omits them.
+// loadConfig fills the documented timeout defaults when the scheme omits them.
 func TestTimeoutConfigDefaults(t *testing.T) {
-	oldCfg := cfg
-	oldRoutes := routeTargets
-	t.Cleanup(func() { cfg = oldCfg; routeTargets = oldRoutes })
+	withTempConfig(t, testMainTOML, `protocol = "anthropic"
+url = "https://anthropic.example/api"
+key = "sk"
 
-	path := filepath.Join(t.TempDir(), "config.toml")
-	content := `[proxy]
-port = 8088
-
-[upstreams.anthropic.routing]
+[routing]
 sonnet = "DeepSeek-V4-Flash-0731"
+`)
 
-`
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
+	up := currentScheme().Text
+	if got := int(up.HeaderTimeout.Seconds()); got != 120 {
+		t.Fatalf("header timeout default must be 120s, got %d", got)
 	}
-	t.Setenv("LLM_PROXY_CONFIG", path)
-	if err := loadConfig(); err != nil {
-		t.Fatalf("loadConfig: %v", err)
+	if got := int(up.BodyIdle.Seconds()); got != 90 {
+		t.Fatalf("body idle default must be 90s, got %d", got)
 	}
-	if cfg.Upstream.HeaderTimeoutSeconds != 120 {
-		t.Fatalf("header timeout default must be 120s, got %d", cfg.Upstream.HeaderTimeoutSeconds)
-	}
-	if cfg.Upstream.BodyIdleSeconds != 90 {
-		t.Fatalf("body idle default must be 90s, got %d", cfg.Upstream.BodyIdleSeconds)
-	}
-	if cfg.Upstream.MaxRetries != 2 {
-		t.Fatalf("max retries default must be 2, got %d", cfg.Upstream.MaxRetries)
+	if got := up.MaxRetries; got != 2 {
+		t.Fatalf("max retries default must be 2, got %d", got)
 	}
 }
 

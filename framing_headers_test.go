@@ -43,9 +43,7 @@ func withFramedAnthropicUpstream(t *testing.T, contentType, body string) {
 		io.WriteString(w, body)
 	}))
 	t.Cleanup(up.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = up.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, up.URL)
 }
 
 // A non-streaming reply that the proxy shortens (here by dropping the upstream's
@@ -127,9 +125,7 @@ func TestUpstreamPayloadHeadersAreStillForwarded(t *testing.T) {
 		io.WriteString(w, `{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":5}}`)
 	}))
 	t.Cleanup(up.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = up.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, up.URL)
 
 	_, hdr, _ := serveThroughRealServer(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
 	if hdr.Get("X-Request-Id") != "req-abc" {
