@@ -24,7 +24,7 @@ import (
 )
 
 // version is reported in the startup log and on the admin page.
-const version = "0.15.0"
+const version = "0.16.0"
 
 // The configuration layer lives in scheme.go: this process runs exactly one
 // scheme file, and that file is the only source of upstream, VLM and routing
