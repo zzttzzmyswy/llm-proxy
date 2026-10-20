@@ -762,20 +762,14 @@ func validateSchemePayload(p *adminSchemePayload, old *Scheme) (*SchemeFile, err
 	case strings.TrimSpace(p.VLM.Model) == "":
 		return nil, fmt.Errorf("启用图片描述时必须填写 vlm model")
 	default:
+		// Any upstream can serve the describe pass: the call is framed for whichever
+		// protocol it speaks, so an openai text gateway can describe its own images
+		// without a second, anthropic upstream.
 		sec := &VLMSection{Model: strings.TrimSpace(p.VLM.Model), MaxTokens: p.VLM.MaxTokens}
-		if p.VLM.Inherit {
-			// Inherited: no upstream fields at all, so the describe calls follow the
-			// scheme's text upstream.
-			if text.Protocol != protocolAnthropic {
-				return nil, fmt.Errorf("图片描述调用必须是 anthropic 协议；当前上游是 %q，请取消“沿用主上游”并为 [vlm] 指定一个 anthropic 上游", text.Protocol)
-			}
-		} else {
+		if !p.VLM.Inherit {
 			up, err := validateUpstreamPayload("[vlm]", p.VLM.Upstream, vlmBase(old), true)
 			if err != nil {
 				return nil, err
-			}
-			if up.Protocol != protocolAnthropic {
-				return nil, fmt.Errorf("[vlm] 协议必须是 %q（图片描述调用只说 anthropic）", protocolAnthropic)
 			}
 			sec.UpstreamSpec = up.Spec
 		}
