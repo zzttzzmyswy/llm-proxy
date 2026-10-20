@@ -18,7 +18,7 @@ max_tokens = 8000
 # for it explicitly (it cannot reuse an anthropic one).
 [chat]
 protocol = "openai"
-url = "https://api.sophnet.com/v1/chat/completions"
+url = "https://www.sophnet.com/api/open-apis/openai"
 key_env = "SOPHNET_API_KEY"
 
 [routing]

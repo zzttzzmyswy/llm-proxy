@@ -858,9 +858,7 @@ func probeFiles(active, mainTOML, schemePath, schemeTOML string) error {
 	return nil
 }
 
-// configWarnings reports what a save changed that the operator should know about,
-// including the settings the old global-config design honoured and this one does
-// not.
+// configWarnings reports what a save changed that the operator should know about.
 func configWarnings(payload *adminConfigPayload, switching bool) []string {
 	var warnings []string
 	if switching {
@@ -874,14 +872,30 @@ func configWarnings(payload *adminConfigPayload, switching bool) []string {
 			declared[alias] = true
 		}
 	}
+	// An alias the scheme leaves out is not necessarily forwarded under its own
+	// name: routeTarget maps a composed name (claude-sonnet-4-5) to the family
+	// alias, and haiku additionally inherits sonnet. Say which case applies, so
+	// the warning does not promise a passthrough that will not happen.
 	for _, alias := range []string{"sonnet", "opus", "haiku"} {
-		if !declared[alias] {
+		if declared[alias] {
+			continue
+		}
+		switch {
+		case alias == "haiku" && declared["sonnet"]:
+			warnings = append(warnings, "方案未声明 haiku：客户端请求 haiku（含 claude-haiku-4-5 这类完整名字）时沿用 sonnet 的映射。")
+		case aliasUndeclaredFallsBack(declared, alias):
+			// Nothing in this family is mapped, so the composed and exact names
+			// both go to the upstream as written.
 			warnings = append(warnings, fmt.Sprintf(
-				"方案未声明 %s：客户端请求该名字时会原样转发给上游（由上游决定是否支持该模型）。", alias))
+				"方案未声明 %s：客户端请求 %s（含 claude-%s-4-5 这类完整名字）时会原样转发给上游，由上游决定是否支持该模型。", alias, alias, alias))
 		}
 	}
-	if os.Getenv("SOPHNET_API_KEY") != "" {
-		warnings = append(warnings, "环境变量 SOPHNET_API_KEY 已设置，但当前版本不再读取它：每个上游只用自己的 key / key_env。")
+	// The scheme's own key_env is the supported way to keep a secret out of the
+	// file, and the shipped example uses SOPHNET_API_KEY for it. Only warn when
+	// the variable is set but no upstream in the saved scheme reads it — that is
+	// the leftover-from-the-old-global-config case.
+	if os.Getenv("SOPHNET_API_KEY") != "" && !schemeReferencesKeyEnv(payload, "SOPHNET_API_KEY") {
+		warnings = append(warnings, "环境变量 SOPHNET_API_KEY 已设置，但本方案的任何上游都没有引用它：每个上游只用自己的 key / key_env，该变量被忽略。")
 	}
 	if os.Getenv("LLM_PROXY_ADMIN_TOKEN") != "" {
 		if payload.Admin.Action == "clear" {
@@ -891,6 +905,34 @@ func configWarnings(payload *adminConfigPayload, switching bool) []string {
 		}
 	}
 	return warnings
+}
+
+// aliasUndeclaredFallsBack reports whether an alias the scheme leaves out will be
+// forwarded as written. haiku is excluded by the caller: it inherits sonnet.
+func aliasUndeclaredFallsBack(declared map[string]bool, alias string) bool {
+	return alias != "haiku" || !declared["sonnet"]
+}
+
+// schemeReferencesKeyEnv reports whether any upstream the save will actually write
+// reads the named environment variable.
+//
+// A section that inherits the text upstream contributes nothing of its own, so its
+// key_env is not a reference — the save discards it, which is why validateSchemePayload
+// never reads those fields in that case either.
+func schemeReferencesKeyEnv(p *adminConfigPayload, name string) bool {
+	referenced := []string{p.Upstream.KeyEnv}
+	if p.VLM.Active && !p.VLM.Inherit {
+		referenced = append(referenced, p.VLM.Upstream.KeyEnv)
+	}
+	if p.Chat.Available && !p.Chat.Inherit {
+		referenced = append(referenced, p.Chat.Upstream.KeyEnv)
+	}
+	for _, env := range referenced {
+		if strings.TrimSpace(env) == name {
+			return true
+		}
+	}
+	return false
 }
 
 func validateURL(field, raw string) error {
@@ -997,33 +1039,6 @@ func writeFileAtomic(path string, data []byte) error {
 		return err
 	}
 	return os.Rename(tmpName, path)
-}
-
-// unknownConfigKeys reports top-level config keys the admin page does not model,
-// so a save can warn that the rewrite would drop them.
-func unknownConfigKeys(path string) []string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	var raw map[string]interface{}
-	if toml.Unmarshal(data, &raw) != nil {
-		return nil
-	}
-	// "routing" is deliberately absent: the top-level section is no longer
-	// modelled, and a save rewrites the file without it. Listing it here would
-	// suppress the warning that tells an operator their old global table is about
-	// to disappear — they need that warning to move the aliases into the profiles
-	// first.
-	known := map[string]bool{"proxy": true, "upstream": true, "upstreams": true, "keys": true, "admin": true}
-	var unknown []string
-	for k := range raw {
-		if !known[k] {
-			unknown = append(unknown, k)
-		}
-	}
-	sort.Strings(unknown)
-	return unknown
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

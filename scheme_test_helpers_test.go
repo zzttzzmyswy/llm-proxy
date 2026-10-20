@@ -58,18 +58,27 @@ func testScheme(text Upstream, routes map[string]RouteEntry) *Scheme {
 // in either order.
 func ensureScheme(t *testing.T) *Scheme {
 	t.Helper()
-	if s := currentScheme(); s != nil {
+	// A test that publishes its own scheme keeps patching that one; the map also
+	// keeps a second call from replacing the first call's work.
+	if s, ok := ownedSchemes[t.Name()]; ok {
 		return s
 	}
 	s := testScheme(anthropicTextUpstream("http://127.0.0.1:1"), nil)
+	ownedSchemes[t.Name()] = s
 	withScheme(t, s)
 	return s
 }
+
+// ownedSchemes records the scheme each test is building, so the second and later
+// calls in one test patch the same scheme instead of replacing the first one's
+// work.
+var ownedSchemes = map[string]*Scheme{}
 
 // withScheme publishes a scheme for the duration of a test and restores the
 // previous one on cleanup, so tests never leak upstream state into each other.
 func withScheme(t *testing.T, s *Scheme) {
 	t.Helper()
+	ownedSchemes[t.Name()] = s
 	prevCfg, prevScheme := currentConfig(), currentScheme()
 	cfgMu.Lock()
 	cfg, scheme = prevCfg, s

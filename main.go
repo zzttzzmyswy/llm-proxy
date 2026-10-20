@@ -117,14 +117,34 @@ func (rc reqConfig) textUpstream() (Upstream, bool) {
 	return rc.scheme.Text, true
 }
 
-// routeTarget resolves the routing target for a client model name. An alias the
-// scheme declares is used as written; an undeclared one is passed through to the
-// text upstream under its own name, which is what lets Claude Code (or any
-// client) name an upstream model directly without a mapping entry.
+// routeTarget resolves the routing target for a client model name.
+//
+// Lookup order:
+//  1. an alias the scheme declares, matched exactly;
+//  2. a composed name — Claude Code does not ask for "sonnet", it asks for
+//     "claude-sonnet-4-5-20250929" — mapped to the scheme's sonnet/opus/haiku
+//     entry, whichever the name mentions. haiku already inherits sonnet when the
+//     scheme leaves it out (buildSchemeRoutes), so an undeclared haiku still
+//     resolves when sonnet is declared;
+//  3. otherwise the name is passed through to the text upstream unchanged, which
+//     is what lets a client name an upstream model directly without a mapping.
+//
+// Step 2 never invents a target: a family whose alias the scheme does not declare
+// falls through to step 3, so a scheme that maps only sonnet does not silently
+// send an opus request to the sonnet model.
 func (rc reqConfig) routeTarget(model string) RouteEntry {
 	if rc.scheme != nil {
 		if e, ok := rc.scheme.Routes[model]; ok {
 			return e
+		}
+		for _, family := range []string{"opus", "haiku", "sonnet"} {
+			if !strings.Contains(model, family) {
+				continue
+			}
+			if e, ok := rc.scheme.Routes[family]; ok {
+				return e
+			}
+			break
 		}
 	}
 	return RouteEntry{Model: model}

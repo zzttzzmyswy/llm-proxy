@@ -31,7 +31,7 @@ Claude Code 默认只认 Anthropic 官方模型名（`sonnet` / `opus` / `haiku`
 
 | 特性 | 说明 |
 |------|------|
-| 模型路由 | 方案文件的 `[routing]` 表把别名映射到上游模型名：`"模型名"` 或 `{ model = "...", supports_image = true }`。未声明的别名原样转发 |
+| 模型路由 | 方案文件的 `[routing]` 表把别名映射到上游模型名：`"模型名"` 或 `{ model = "...", supports_image = true }`。查找顺序：精确别名 → 名字含 `sonnet`/`opus`/`haiku` 时取对应别名（Claude Code 实际发的是 `claude-sonnet-4-5-20250929` 这类完整名）→ 都不命中才原样转发 |
 | 多方案（多配置文件） | 每份 `schemes/<名字>.toml` 是一套完整上游配置（协议 + URL + 密钥 + 超时 + VLM + 模型表），主配置用 `proxy.scheme` 选其中一份生效；各方案互不共享任何字段 |
 | OpenAI 网关路由 | 任意别名可配置 `{ model = "x", upstream = "openai" }`（或任一 openai 协议的 profile 名），请求自动翻译为 OpenAI 格式走该上游，回复翻译回 Anthropic（含流式 SSE） |
 | image 能力声明 | `supports_image = true` 表示上游模型原生支持图片输入，带图请求跳过内置 VLM 描述直接发给该模型（含 image 400 重试一并跳过）；缺省 `false` 走 VLM 描述 |
@@ -234,7 +234,24 @@ export ANTHROPIC_AUTH_TOKEN="<任意值，代理会替换为真实上游密钥>"
 |----|------|
 | `[vlm]` | 图片描述。`model`（视觉模型）+ `max_tokens`（默认 8000），以及可选的 `protocol`/`url`/`key`/`key_env`。**不写 protocol/url 就沿用本方案的文本上游**——只有当文本上游是 anthropic 协议时成立，因为描述调用走 `/v1/messages`。整个表或 `model` 留空 = 关闭描述，带图请求原样转发 |
 | `[chat]` | `/v1/chat/completions` 透传走哪个上游，**必须 openai 协议**。不写 protocol/url 就沿用文本上游（要求文本上游是 openai）。anthropic 方案又不写 `[chat]` 时，该端点返回 502 而不是乱转发 |
-| `[routing]` | 本方案的模型映射表：`<别名> = "模型名"` 或 `{ model = "...", supports_image = true }`。别名即客户端请求的模型名；**未声明的别名原样转发**，所以也能直接点名上游模型。`haiku` 未声明时沿用 `sonnet`。`supports_image = true` 表示该模型原生支持图片，带图请求跳过描述直发 |
+| `[routing]` | 本方案的模型映射表：`<别名> = "模型名"` 或 `{ model = "...", supports_image = true }`。别名即客户端请求的模型名，解析顺序见下。`supports_image = true` 表示该模型原生支持图片，带图请求跳过描述直发 |
+
+**别名怎么解析**（`[routing]` 按这个顺序查）：
+
+1. **精确匹配**：请求的模型名与某个别名完全相同。
+2. **模型家族匹配**：名字里含 `sonnet` / `opus` / `haiku` 时，取方案里同名别名的条目。Claude Code 实际发出的是
+   `claude-sonnet-4-5-20250929`、`claude-opus-4-5` 这类完整名字，靠这一步落到映射上。
+   `haiku` 未声明时已自动沿用 `sonnet`，所以方案只写 `sonnet` 也能接住 haiku 请求。
+3. **原样转发**：以上都没命中（包括「名字属于某个家族、但方案没声明那个别名」），模型名保持不变发给上游。
+   这也让客户端可以直接点名上游模型。
+
+```toml
+[routing]
+sonnet = "deepseek-chat"      # claude-sonnet-4-5-20250929 → deepseek-chat
+opus   = "deepseek-reasoner"  # claude-opus-4-5            → deepseek-reasoner
+# haiku 未写：沿用 sonnet，claude-haiku-4-5 → deepseek-chat
+# 其他名字（如 "my-model"）没有映射：原样转发 "my-model"
+```
 
 > **OpenAI 协议方案示例**：`protocol = "openai"` + `url = "https://api.deepseek.com"`，代理把请求翻译为
 > OpenAI 格式转发，并把回复（含流式）翻译回 Anthropic 格式。请求翻译会剥离 thinking 块、把图片转 `image_url`、
@@ -314,6 +331,120 @@ haiku  = { model = "DeepSeek-Flash-1017", supports_image = true }
 密钥沿用 `keep`/`set`/`clear` 三态（留空 = 保持原密钥不变）。保存校验覆盖：端口范围、协议合法、URL 合法、超时/重试
 非负、启用描述时 `model` 非空、描述/透传段协议匹配、别名与模型名非空且不重复、切换目标方案存在。保存流程：
 备份 `<文件>.bak.<时间戳>` → 原子写 → 重载失败自动回滚两份文件。
+
+### 从 0.14.x 升级
+
+0.15.0 删掉了所有全局 llm/vlm 配置，旧格式的主配置**不能直接加载**：`loadConfig` 会在启动时报
+`this is a pre-0.15 (old format) configuration` 并列出还残留的旧段，指向本节。
+
+**字段对照**
+
+| 0.14.x 里的位置 | 0.15.0 里放到哪 |
+|---|---|
+| `[upstream] anthropic_url` | 方案文件顶层 `protocol = "anthropic"` + `url` |
+| `[upstream] openai_url` | 方案文件顶层 `protocol = "openai"` + `url`（作为 `/v1/chat/completions` 透传时放 `[chat]`） |
+| `[upstream] default_upstream` | 删除。方案只有一个上游，没有「默认网关」可选 |
+| `[upstream] header_timeout_seconds` / `body_idle_seconds` / `max_retries` | 方案文件顶层同名字段（`[vlm]`/`[chat]` 需要独立值时写在对应表里） |
+| `[keys] sophnet` | 方案文件顶层 `key`（或 `key_env`） |
+| `SOPHNET_API_KEY` 环境变量 | 方案文件顶层 `key_env = "SOPHNET_API_KEY"`（写出来才会读，不再有隐式回退） |
+| `[proxy] vlm_model` / `vlm_max_tokens` | `[vlm] model` / `max_tokens` |
+| `[proxy] vlm_upstream` | 一般直接省略 `[vlm]` 的 upstream 字段（沿用本方案主上游）；需要别的上游时才写 `protocol`/`url`/`key_env` |
+| `[proxy] chat_upstream` | 一般直接省略 `[chat]` 的 upstream 字段（要求主上游是 openai）；否则在 `[chat]` 里写完整上游 |
+| `[upstreams.<名字>]` | 一个 profile 对应**一份方案文件**；同一时刻只有一份生效 |
+| `[upstreams.<名字>.routing]` / 顶层 `[routing]` | 方案文件的 `[routing]`（去掉 `upstream` 字段，方案只有一个上游） |
+| `[upstreams.<名字>] vlm_model` / `vlm_max_tokens` / `vlm_upstream` | 该方案自己的 `[vlm]` |
+| `[admin] token` | 不变，仍留在主配置 |
+
+**前后对照**
+
+```toml
+# ---- 0.14.x：一份文件装下所有东西 ----
+[proxy]
+port = 8088
+vlm_model = "glm-5.3-flashx"
+chat_upstream = "sophnet"
+
+[upstream]
+anthropic_url = "https://www.sophnet.com/api/open-apis/anthropic"
+openai_url = "https://api.sophnet.com/v1/chat/completions"
+default_upstream = "sophnet"
+max_retries = 5
+
+[upstreams.dso]
+protocol = "openai"
+url = "https://api.deepseek.com/chat/completions"
+key = "sk-..."
+[upstreams.dso.routing]
+sonnet = "deepseek-flash"
+haiku = "deepseek-flash"
+
+[upstreams.sophnet]
+protocol = "openai"
+url = "https://api.sophnet.com/v1/chat/completions"
+key = "hqez..."
+vlm_model = "DeepSeek-Flash-1017"
+vlm_upstream = "anthropic"
+[upstreams.sophnet.routing]
+sonnet = "DeepSeek-Flash-1017"
+
+[keys]
+sophnet = "kwd-..."
+
+[admin]
+token = "..."
+```
+
+```toml
+# ---- 0.15.0：主配置只留进程设置 ----
+# /etc/llm-proxy/config.toml
+[proxy]
+port = 8088
+scheme = "dso"          # 换成 "sophnet" 就切到另一份，其余不动
+
+[admin]
+token = "..."
+```
+
+```toml
+# /etc/llm-proxy/schemes/dso.toml —— 原来 [upstreams.dso] 的全部内容
+protocol = "openai"
+url = "https://api.deepseek.com"
+key = "sk-..."
+max_retries = 5
+
+[routing]
+sonnet = "deepseek-flash"
+haiku = "deepseek-flash"
+```
+
+```toml
+# /etc/llm-proxy/schemes/sophnet.toml —— 原来 [upstreams.sophnet] 的全部内容
+# 注意：原来 vlm_upstream = "anthropic" 指向另一份方案的地址，现在这个方案要自带描述上游
+protocol = "openai"
+url = "https://api.sophnet.com/v1/chat/completions"
+key = "hqez..."
+
+[vlm]
+model = "DeepSeek-Flash-1017"
+protocol = "anthropic"
+url = "https://www.sophnet.com/api/open-apis/anthropic"
+key_env = "SOPHNET_API_KEY"
+
+[routing]
+sonnet = "DeepSeek-Flash-1017"
+```
+
+**升级步骤**
+
+1. 备份 `/etc/llm-proxy/config.toml`。
+2. 把原来每一个 `[upstreams.<名字>]` 拆成 `schemes/<名字>.toml`（按上表搬字段）。
+3. 主配置裁剪成只剩 `[proxy] port` / `[proxy] scheme` / `[admin]`，`scheme` 填要生效的那份。
+4. 旧 `[keys].sophnet` 的值搬到对应方案文件的 `key`，或改用 `key_env`。
+5. **先在备用端口跑一遍**（`LLM_PROXY_CONFIG=... ./llm-proxy`）确认启动日志里的
+   `scheme=... upstream=... vlm=...` 与 `routes |` 两行符合预期，再切生产。
+
+> 原来靠 `default_upstream` 决定去向、自己没写 `upstream` 的别名，迁到方案文件后归属该方案唯一的上游；
+> 如果它们原本要去**另一个**网关，就放到那份网关的方案文件里。
 
 ### 配色
 

@@ -290,15 +290,21 @@ func parseSchemeFile(path, name string) (*Scheme, error) {
 }
 
 // resolveUpstream validates one upstream spec and resolves its key and timeouts.
-// When inherit is allowed and the spec names no URL, the caller's upstream is
-// returned unchanged — that is how [vlm] and [chat] stay on the scheme's own
-// gateway without repeating its address.
+//
+// A section without a URL inherits its caller's upstream, which is how [vlm] and
+// [chat] stay on the scheme's own gateway without repeating its address. That
+// inheritance carries the whole upstream, so a section that also sets protocol,
+// key, key_env or a timeout has nothing to apply them to: accepting the file
+// would silently discard them, which is the same silent fallback this design
+// exists to remove. Such a section is rejected instead.
 func resolveUpstream(label, name string, spec UpstreamSpec, requireURL bool) (Upstream, error) {
 	protocol := normalizeUpstreamName(spec.Protocol)
-	if protocol == "" && !requireURL {
-		// A [vlm] / [chat] section that names no protocol names no upstream at
-		// all: the section inherits the scheme's text upstream, which is how a
-		// single-gateway scheme avoids repeating its address three times.
+	if strings.TrimSpace(spec.URL) == "" && !requireURL {
+		if extra := inheritedFieldConflict(spec); extra != "" {
+			return Upstream{}, fmt.Errorf("scheme %s: no url, so this section inherits the scheme's own upstream, "+
+				"but it also sets %s — those fields would be discarded; either give this section its own url, "+
+				"or remove them and let it inherit", label, extra)
+		}
 		return Upstream{}, errInheritUpstream
 	}
 	if protocol != protocolAnthropic && protocol != protocolOpenAI {
@@ -306,10 +312,7 @@ func resolveUpstream(label, name string, spec UpstreamSpec, requireURL bool) (Up
 			label, spec.Protocol, protocolAnthropic, protocolOpenAI)
 	}
 	if err := validateProfileURL(spec.URL); err != nil {
-		if requireURL || strings.TrimSpace(spec.URL) != "" {
-			return Upstream{}, fmt.Errorf("scheme %s: %v", label, err)
-		}
-		return Upstream{}, errInheritUpstream
+		return Upstream{}, fmt.Errorf("scheme %s: %v", label, err)
 	}
 	return Upstream{
 		Name:          name,
@@ -321,6 +324,32 @@ func resolveUpstream(label, name string, spec UpstreamSpec, requireURL bool) (Up
 		MaxRetries:    retriesOrDefault(spec.MaxRetries),
 		Spec:          spec,
 	}, nil
+}
+
+// inheritedFieldConflict names the fields an inheriting section sets that would be
+// discarded, or "" when there are none. The wording lists every offending field so
+// one round of fixing is enough.
+func inheritedFieldConflict(spec UpstreamSpec) string {
+	var set []string
+	if strings.TrimSpace(spec.Protocol) != "" {
+		set = append(set, "protocol")
+	}
+	if spec.Key != "" {
+		set = append(set, "key")
+	}
+	if strings.TrimSpace(spec.KeyEnv) != "" {
+		set = append(set, "key_env")
+	}
+	if spec.HeaderTimeoutSeconds != 0 {
+		set = append(set, "header_timeout_seconds")
+	}
+	if spec.BodyIdleSeconds != 0 {
+		set = append(set, "body_idle_seconds")
+	}
+	if spec.MaxRetries != 0 {
+		set = append(set, "max_retries")
+	}
+	return strings.Join(set, ", ")
 }
 
 // errInheritUpstream is the sentinel resolveUpstream returns when a section
@@ -340,9 +369,6 @@ func resolveKey(spec UpstreamSpec) string {
 	return spec.Key
 }
 
-// resolveVLM builds the scheme's describe pass. The describe call always speaks
-// the anthropic framing (/v1/messages), so calling one through an openai upstream
-// is rejected at load rather than failing per image at request time.
 // resolveVLM builds the scheme's describe pass. The describe call always speaks
 // the anthropic framing (/v1/messages), so calling one through an openai upstream
 // is rejected at load rather than failing per image at request time.
@@ -549,10 +575,20 @@ func loadConfig() error {
 		return err
 	}
 	if c.Proxy.Scheme == "" {
-		return fmt.Errorf("config: no scheme selected; set [proxy] scheme = \"<name>\" to the scheme file to run")
+		// A main file carrying the old global sections is not a config that forgot
+		// one line — it is the previous format, and telling the operator to "add a
+		// scheme" would leave them with an upstream definition that no longer has
+		// anywhere to live. Point at the migration notes instead.
+		if legacy := legacySections(); len(legacy) > 0 {
+			return fmt.Errorf("这是 0.15 之前的旧格式配置（pre-0.15 old format）：仍带有 %s。"+
+				"上游与 VLM 设置现在放在方案文件里，由 [proxy] scheme 选择哪一份生效；"+
+				"字段对照与前后示例见 README「从 0.14.x 升级」",
+				strings.Join(legacy, ", "))
+		}
+		return fmt.Errorf("no scheme selected; set [proxy] scheme = \"<name>\" to the scheme file to run")
 	}
 	if !validSchemeName(c.Proxy.Scheme) {
-		return fmt.Errorf("config: scheme %q may only contain a-z, 0-9, '-' and '_' (max %d chars)",
+		return fmt.Errorf("scheme %q may only contain a-z, 0-9, '-' and '_' (max %d chars)",
 			c.Proxy.Scheme, maxSchemeNameLen)
 	}
 	dir := schemesDir(&c)
@@ -560,9 +596,9 @@ func loadConfig() error {
 	if _, err := os.Stat(path); err != nil {
 		available := listSchemes(dir)
 		if len(available) == 0 {
-			return fmt.Errorf("config: scheme %q not found in %s (the directory holds no scheme files)", c.Proxy.Scheme, dir)
+			return fmt.Errorf("scheme %q not found in %s (the directory holds no scheme files)", c.Proxy.Scheme, dir)
 		}
-		return fmt.Errorf("config: scheme %q not found in %s (available: %s)",
+		return fmt.Errorf("scheme %q not found in %s (available: %s)",
 			c.Proxy.Scheme, dir, strings.Join(available, ", "))
 	}
 	s, err := parseSchemeFile(path, c.Proxy.Scheme)
@@ -571,6 +607,38 @@ func loadConfig() error {
 	}
 	storeConfig(c, s)
 	return nil
+}
+
+// legacySections reports which top-level sections of the pre-0.15 format the main
+// file still carries. They are read only to produce a useful error: none of them
+// is modelled any more, and a file that has them is the old format rather than a
+// new one with a missing line.
+func legacySections() []string {
+	data, err := os.ReadFile(configPathFromEnv())
+	if err != nil {
+		return nil
+	}
+	var raw map[string]interface{}
+	if toml.Unmarshal(data, &raw) != nil {
+		return nil
+	}
+	var found []string
+	// [proxy] carried vlm_model / vlm_max_tokens / vlm_upstream / chat_upstream
+	// before; those names are gone from ProxyConfig, so probe the raw map.
+	if proxy, ok := raw["proxy"].(map[string]interface{}); ok {
+		for _, key := range []string{"vlm_model", "vlm_max_tokens", "vlm_upstream", "chat_upstream"} {
+			if _, present := proxy[key]; present {
+				found = append(found, "[proxy]."+key)
+			}
+		}
+	}
+	for _, section := range []string{"upstream", "keys", "upstreams", "routing"} {
+		if _, present := raw[section]; present {
+			found = append(found, "["+section+"]")
+		}
+	}
+	sort.Strings(found)
+	return found
 }
 
 // storeConfig publishes a freshly parsed config. It is the only writer of cfg and

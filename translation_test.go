@@ -23,6 +23,13 @@ func setRoute(t *testing.T, alias, model, upstream string) {
 	}
 	s.Routes[alias] = RouteEntry{Model: model}
 	s.DeclaredRoutes[alias] = true
+	// Mirror the loader: an undeclared haiku follows sonnet. Without this the
+	// helper would publish a scheme the loader can never produce.
+	if alias == "sonnet" {
+		if _, declared := s.DeclaredRoutes["haiku"]; !declared {
+			s.Routes["haiku"] = s.Routes["sonnet"]
+		}
+	}
 }
 
 // withOpenAIUpstream publishes an openai text upstream (and the matching chat
@@ -132,6 +139,50 @@ func TestRouteTargetResolution(t *testing.T) {
 	}
 	if tr := snapshotConfig().routeTarget("unknown-model"); tr.Model != "unknown-model" {
 		t.Fatalf("an undeclared alias must pass through under its own name, got %+v", tr)
+	}
+
+	// Claude Code never asks for the bare family name: it sends the full model
+	// id, so a scheme that maps only sonnet/opus/haiku has to still resolve.
+	if tr := snapshotConfig().routeTarget("claude-sonnet-4"); tr.Model != "DeepSeek-V4-Flash-0731" {
+		t.Fatalf("a composed sonnet name must resolve to the sonnet target, got %+v", tr)
+	}
+	if tr := snapshotConfig().routeTarget("claude-opus-4-5"); tr.Model != "GLM-5.3" {
+		t.Fatalf("a composed opus name must resolve to the opus target, got %+v", tr)
+	}
+	if tr := snapshotConfig().routeTarget("claude-haiku-4-5"); tr.Model != "DeepSeek-V4-Flash-0731" {
+		t.Fatalf("a composed haiku name must resolve to the haiku target, got %+v", tr)
+	}
+	if tr := snapshotConfig().routeTarget("claude-3-5-sonnet-20241022"); tr.Model != "DeepSeek-V4-Flash-0731" {
+		t.Fatalf("an older composed sonnet name must resolve too, got %+v", tr)
+	}
+}
+
+// A family alias the scheme does not declare must not borrow a sibling's target:
+// a scheme that maps only sonnet has no answer for an opus request, so the name is
+// forwarded as written rather than silently served by the sonnet model.
+func TestRouteTargetUndeclaredFamilyPassesThrough(t *testing.T) {
+	setRoute(t, "sonnet", "sonnet-target", "")
+
+	if tr := snapshotConfig().routeTarget("claude-opus-4-5"); tr.Model != "claude-opus-4-5" {
+		t.Fatalf("an undeclared opus must pass through, got %+v", tr)
+	}
+	if tr := snapshotConfig().routeTarget("claude-sonnet-4-5"); tr.Model != "sonnet-target" {
+		t.Fatalf("a declared sonnet must still resolve, got %+v", tr)
+	}
+	// haiku is the documented exception: it inherits sonnet, so it resolves.
+	if tr := snapshotConfig().routeTarget("claude-haiku-4-5"); tr.Model != "sonnet-target" {
+		t.Fatalf("haiku must fall back to sonnet, got %+v", tr)
+	}
+}
+
+// A scheme that declares nothing at all forwards every name unchanged.
+func TestRouteTargetWithNoTablePassesEverythingThrough(t *testing.T) {
+	withScheme(t, testScheme(anthropicTextUpstream("http://127.0.0.1:1"), nil))
+
+	for _, model := range []string{"claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5", "sonnet", "my-model"} {
+		if tr := snapshotConfig().routeTarget(model); tr.Model != model {
+			t.Fatalf("an empty table must forward %q unchanged, got %+v", model, tr)
+		}
 	}
 }
 

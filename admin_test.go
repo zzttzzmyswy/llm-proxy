@@ -693,3 +693,243 @@ func TestAdminHistoryCarriesCacheTotals(t *testing.T) {
 	}
 	stats.reset()
 }
+
+// A pre-0.15 main file still carries the old global sections. Telling its owner to
+// "add a scheme" would leave an upstream definition with nowhere to live, so the
+// error has to name the old format and point at the migration notes.
+func TestLoadConfigReportsTheOldFormatAndPointsAtTheMigration(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		main string
+		want []string
+	}{
+		{
+			name: "old global upstream and keys",
+			main: `[proxy]
+port = 8088
+
+[upstream]
+anthropic_url = "https://a.example/api"
+openai_url = "https://o.example/v1"
+
+[keys]
+sophnet = "k"
+`,
+			want: []string{"[keys]", "[upstream]", "旧格式", "从 0.14.x 升级"},
+		},
+		{
+			name: "old profiles and routing",
+			main: `[proxy]
+port = 8088
+vlm_model = "m"
+
+[upstreams.alpha]
+protocol = "openai"
+url = "https://a.example/v1"
+
+[routing]
+sonnet = "m"
+`,
+			want: []string{"[proxy].vlm_model", "[routing]", "[upstreams]", "旧格式"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeSchemeTree(t, tc.main, "unused", "")
+			err := loadConfig()
+			if err == nil {
+				t.Fatal("a pre-0.15 main file must be rejected")
+			}
+			msg := err.Error()
+			for _, want := range tc.want {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("the error must mention %q, got: %s", want, msg)
+				}
+			}
+		})
+	}
+}
+
+// A new-format file that merely forgot the scheme line gets the plain message: it
+// is not the old format and must not be sent to the migration notes.
+func TestLoadConfigMissingSchemeOnANewFileIsNotCalledLegacy(t *testing.T) {
+	writeSchemeTree(t, "[proxy]\nport = 8088\n", "unused", "")
+	err := loadConfig()
+	if err == nil {
+		t.Fatal("a file with no scheme must be rejected")
+	}
+	if strings.Contains(err.Error(), "旧格式") {
+		t.Fatalf("a new-format file must not be reported as legacy, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "scheme") {
+		t.Fatalf("the error must say what to set, got: %v", err)
+	}
+}
+
+// SOPHNET_API_KEY is the supported way to keep a key out of the file — the shipped
+// example uses it — so warning that it "is no longer read" whenever it is set is a
+// false alarm. The warning belongs to the leftover case: set in the environment,
+// referenced by no upstream in the scheme being saved.
+func TestAdminConfigSOPHNETKeyEnvWarningOnlyWhenUnreferenced(t *testing.T) {
+	withDefaultConfig(t)
+	t.Setenv("SOPHNET_API_KEY", "env-secret")
+
+	save := func(mutate func(*adminConfigPayload)) []string {
+		t.Helper()
+		p := payloadFromView(currentView(t))
+		mutate(&p)
+		res := postConfig(t, p, "s3cret")
+		if res.Code != http.StatusOK {
+			t.Fatalf("save failed: %d %s", res.Code, res.Body.String())
+		}
+		var out struct {
+			Warnings []string `json:"warnings"`
+		}
+		decodeBody(t, res, &out)
+		return out.Warnings
+	}
+
+	joined := strings.Join(save(func(p *adminConfigPayload) {
+		p.Upstream.KeyAction, p.Upstream.Key, p.Upstream.KeyEnv = "clear", "", "SOPHNET_API_KEY"
+	}), " | ")
+	if strings.Contains(joined, "都没有引用它") {
+		t.Fatalf("a scheme that reads the variable must not be warned about, got: %s", joined)
+	}
+
+	// The page resubmits the key_env it read back, so dropping the reference is an
+	// explicit act (the field cleared), not the default.
+	joined = strings.Join(save(func(p *adminConfigPayload) {
+		p.Upstream.KeyAction, p.Upstream.Key, p.Upstream.KeyEnv = "set", "sk-inline", ""
+	}), " | ")
+	if !strings.Contains(joined, "都没有引用它") {
+		t.Fatalf("an unreferenced variable must be reported, got: %s", joined)
+	}
+
+	// A [vlm] that reads it counts too.
+	joined = strings.Join(save(func(p *adminConfigPayload) {
+		p.VLM.Active, p.VLM.Model = true, "vl"
+		p.VLM.Inherit = false
+		p.VLM.Upstream = adminUpstreamPayload{
+			Protocol: protocolAnthropic, URL: "https://vlm.example/api", KeyAction: "clear", KeyEnv: "SOPHNET_API_KEY",
+		}
+	}), " | ")
+	if strings.Contains(joined, "都没有引用它") {
+		t.Fatalf("a [vlm] reference must count as using the variable, got: %s", joined)
+	}
+}
+
+// The haiku hint has two different truths: with sonnet declared, haiku inherits it;
+// with nothing declared, haiku passes through. Saying "passes through" in the first
+// case would be wrong.
+func TestAdminConfigHaikuHintReflectsTheInheritance(t *testing.T) {
+	withDefaultConfig(t)
+	save := func(routing []adminRoutingEntry) string {
+		t.Helper()
+		p := payloadFromView(currentView(t))
+		p.Routing = routing
+		res := postConfig(t, p, "s3cret")
+		if res.Code != http.StatusOK {
+			t.Fatalf("save failed: %d %s", res.Code, res.Body.String())
+		}
+		var out struct {
+			Warnings []string `json:"warnings"`
+		}
+		decodeBody(t, res, &out)
+		return strings.Join(out.Warnings, " | ")
+	}
+
+	// sonnet declared, haiku not: haiku inherits sonnet.
+	joined := save([]adminRoutingEntry{{Alias: "sonnet", Model: "m"}})
+	if !strings.Contains(joined, "沿用 sonnet") {
+		t.Fatalf("a declared sonnet must be reported as what haiku inherits, got: %s", joined)
+	}
+	if strings.Contains(joined, "未声明 haiku：客户端请求 haiku（含 claude-haiku-4-5 这类完整名字）时会原样转发") {
+		t.Fatalf("haiku must not be described as passing through when sonnet is declared, got: %s", joined)
+	}
+
+	// Nothing declared: haiku really does pass through.
+	joined = save(nil)
+	if !strings.Contains(joined, "未声明 haiku") || !strings.Contains(joined, "原样转发") {
+		t.Fatalf("with nothing declared haiku must be reported as passing through, got: %s", joined)
+	}
+}
+
+// A [vlm]/[chat] section with no url inherits the whole text upstream, so any
+// upstream field on it would be discarded. That is the silent fallback this design
+// removes, so the load fails and names the offending fields.
+func TestSchemeSectionWithoutURLRejectsDiscardedFields(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		scheme string
+		want   []string
+	}{
+		{
+			name: "vlm sets a key_env but no url",
+			scheme: `protocol = "anthropic"
+url = "https://anthropic.example/api"
+
+[vlm]
+model = "vl"
+key_env = "SOPHNET_API_KEY"
+`,
+			want: []string{"[vlm]", "key_env", "no url"},
+		},
+		{
+			name: "chat sets a protocol and key but no url",
+			scheme: `protocol = "openai"
+url = "https://openai.example/v1"
+
+[chat]
+protocol = "openai"
+key = "sk-x"
+`,
+			want: []string{"[chat]", "protocol", "key"},
+		},
+		{
+			name: "vlm sets a timeout but no url",
+			scheme: `protocol = "anthropic"
+url = "https://anthropic.example/api"
+
+[vlm]
+model = "vl"
+max_retries = 3
+`,
+			want: []string{"[vlm]", "max_retries"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, schemePath := writeSchemeTree(t, testMainTOML, "main", tc.scheme)
+			// The "fixed" half below loads successfully, so restore the published
+			// config afterwards like every other config-loading test does.
+			prevCfg, prevScheme := currentConfig(), currentScheme()
+			t.Cleanup(func() {
+				cfgMu.Lock()
+				cfg, scheme = prevCfg, prevScheme
+				cfgMu.Unlock()
+			})
+			err := loadConfig()
+			if err == nil {
+				t.Fatal("a section that would discard its own fields must be rejected")
+			}
+			msg := err.Error()
+			for _, want := range tc.want {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("the error must mention %q, got: %s", want, msg)
+				}
+			}
+
+			// The same file without the discarded fields loads, so the error is
+			// about the contradiction and not about inheriting in general.
+			fixed := strings.NewReplacer(
+				"key_env = \"SOPHNET_API_KEY\"\n", "",
+				"protocol = \"openai\"\nkey = \"sk-x\"\n", "",
+				"max_retries = 3\n", "",
+			).Replace(tc.scheme)
+			if err := os.WriteFile(schemePath, []byte(fixed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := loadConfig(); err != nil {
+				t.Fatalf("inheriting with no extra fields must load, got: %v\n%s", err, fixed)
+			}
+		})
+	}
+}
