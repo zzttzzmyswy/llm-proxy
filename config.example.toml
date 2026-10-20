@@ -1,133 +1,37 @@
-# Example configuration for llm-proxy.
-# Copy to /etc/llm-proxy/config.toml (or point LLM_PROXY_CONFIG at it) and fill in
-# your real upstream key. Never commit a config that contains a real key.
+# Example main configuration for llm-proxy.
+#
+# Copy to /etc/llm-proxy/config.toml (or point LLM_PROXY_CONFIG at it), then write
+# at least one scheme file under ./schemes/ next to it.
+#
+# There are NO global upstream or VLM settings. Everything about reaching a model
+# lives in a scheme file, and exactly one scheme is active at a time — see
+# schemes.example/ for complete examples.
 
 [proxy]
 port = 8088
-# VLM model used to describe image-carrying requests before they are routed to the
-# text model (the description is inserted in place of the image). Routes marked
-# supports_image = true (native image support) skip this entire describe pass.
-vlm_model = "MiniMax-M3"
-# Max output tokens for each image-description call.
-vlm_max_tokens = 8000
-# 图片描述调用走哪个上游 profile（必须为 anthropic 协议）。缺省 = 隐式
-# "anthropic" profile（即 [upstream].anthropic_url）。当 VLM 与文本模型不在同一个
-# 上游时，在这里指向一个 [upstreams.*] profile。
-# vlm_upstream = "anthropic"
-# /v1/chat/completions 透传端点走哪个上游 profile（必须为 openai 协议）。缺省 =
-# 隐式 "openai" profile（即 [upstream].openai_url）。
-# chat_upstream = "openai"
 
-[upstream]
-anthropic_url = "https://www.sophnet.com/api/open-apis/anthropic"
-openai_url = "https://www.sophnet.com/api/open-apis/openai"
-# 上游请求超时与重试（以下均有安全默认值，可省略）：
-#   header_timeout_seconds：每次尝试等待上游响应头（首包）的最长时间，超时按瞬态
-#     错误自动重试，重试耗尽后向下游报错而不是卡住。默认 120。
-#   body_idle_seconds：读取上游响应体时允许的最长静默时间。流式场景下上游若中途
-#     停住（模型挂起/连接假死），超过该值会向客户端发 SSE error 事件终止，而不是
-#     让 Claude Code 永久等待。默认 90。
-#   max_retries：遇到瞬态网络错误（超时/连接重置/EOF）或 429/5xx 状态码时的额外
-#     重试次数（总尝试 = max_retries + 1）。默认 2。
-# header_timeout_seconds = 120
-# body_idle_seconds = 90
-# max_retries = 2
-# 默认网关：routing 条目没有显式声明 upstream 时走哪个。
-#   "" / "claude" / "anthropic" → Anthropic（claude 格式）网关（默认）
-#   "openai"                     → OpenAI 网关（请求翻译为 OpenAI 协议转发）
-#   其他值                        → 下方 [upstreams.<名字>] 中定义的 profile
-# 显式声明 upstream 的条目不受影响。
-# default_upstream = "openai"
+# The active scheme: the file name (without .toml) under the schemes directory.
+# Switching providers is switching this value, never editing shared globals.
+scheme = "dso"
 
-# ---- 命名上游 profile（可选，多上游模式）----
-# 每个 [upstreams.<名字>] 是一份独立的上游定义，routing 条目用 upstream = "<名字>"
-# 引用。名字只能用 a-z 0-9 - _，1~32 字符，大小写不敏感。
-# 旧配置（只写 [upstream] anthropic_url/openai_url）无需任何修改即行为不变：解析时
-# 会自动合成两个隐式 profile —— "anthropic"（协议 anthropic，URL 取
-# anthropic_url）与 "openai"（协议 openai，URL 取 openai_url），密钥同为
-# SOPHNET_API_KEY 环境变量 > [keys].sophnet。
-# 需要时可用 [upstreams.anthropic] / [upstreams.openai] 覆盖这两个隐式 profile。
-#
-# [upstreams.deepseek]
-# # 必填：anthropic | openai，只能选一种协议。
-# protocol = "anthropic"
-# # 必填，http(s)。openai 协议下与 openai_url 同规则：可以是 base URL，也可以
-# # 直接写完整的 /chat/completions。
-# url = "https://api.deepseek.com/anthropic"
-# # 可选明文密钥。key_env 指向的环境变量非空时优先于 key，便于密钥不落盘。
-# key = ""
-# key_env = "DEEPSEEK_API_KEY"
-# # 以下可选，缺省（或 0）沿用 [upstream] 的全局值。
-# # header_timeout_seconds = 120
-# # body_idle_seconds = 90
-# # max_retries = 2
-#
-# # ---- 每个 profile 都是一份完整的上游方案 ----
-# # 下面三项让一个 profile 拥有自己的图片描述流程，而不是共用 [proxy] 的全局设置。
-# # 都不写 = 沿用 [proxy] 的 vlm_model / vlm_max_tokens / vlm_upstream，
-# # 也就是旧配置的行为完全不变。
-# # vlm_model = "glm-5v"           # 本 profile 的视觉模型
-# # vlm_max_tokens = 4000          # 本 profile 的每次描述输出上限
-# # vlm_upstream = "anthropic"     # 描述请求走哪个 profile（必须 anthropic 协议）；
-#                                   # 留空 = 走本 profile 自己（仅当本 profile 是
-#                                   # anthropic 协议时成立，否则回落到全局设置）
-#
-# [upstreams.local-glm]
-# protocol = "openai"
-# url = "http://127.0.0.1:9000/v1/chat/completions"
-# key = "sk-local"
-#
-# # ---- 每个 profile 可带自己的模型映射表 ----
-# # [upstreams.<名字>.routing] 里的别名只会路由到该 profile，写 model 与可选的
-# # supports_image 即可，不需要（也不允许）再写 upstream。
-# # 与全局 [routing] 冲突时全局优先；某个别名只属于一个 profile。
-# [upstreams.local-glm.routing]
-# local-fast = { model = "glm-5.3-flash" }
-# local-vision = { model = "glm-5v", supports_image = true }
-
-[keys]
-# Alternative: export SOPHNET_API_KEY=... and leave this empty.
-sophnet = ""
+# Optional. Defaults to $LLM_PROXY_SCHEMES_DIR, else a "schemes" directory next to
+# this file.
+# schemes_dir = "/etc/llm-proxy/schemes"
 
 [admin]
-# Web 管理页面口令（HTTP Basic，用户名任意，口令即此值）。页面地址为
-# http://<host>:<port>/admin，可可视化修改本文件并查看各模型调用情况。
-# 留空 = 关闭管理页面（fail closed）：所有 /admin* 返回 404。代理监听在可路由
-# 地址上，因此默认不开放匿名可用的配置编辑器。
-# 也可用环境变量 LLM_PROXY_ADMIN_TOKEN 覆盖，避免明文落盘；环境变量存在时
-# 页面上修改口令不会生效。
+# Web admin page password (HTTP Basic, username arbitrary). Page address is
+# http://<host>:<port>/admin — it edits the active scheme and shows per-model
+# traffic. Empty = the whole /admin subtree returns 404 (fail closed): the proxy
+# listens on a routable address, so an anonymous config editor would expose the
+# upstream keys and routing table to the network.
+# LLM_PROXY_ADMIN_TOKEN overrides this value.
 token = ""
 
-# ---- 模型映射表：每个上游方案自带一份 ----
-# 没有顶层 [routing]。别名即 Claude Code 请求的模型名，它定义在**负责该别名的
-# 上游 profile** 的 [upstreams.<名字>.routing] 表里，这样几套方案互不影响。
+# Environment variables a scheme can reference instead of storing a secret:
+#   LLM_PROXY_CONFIG        path to this file
+#   LLM_PROXY_SCHEMES_DIR   directory holding the scheme files
+#   LLM_PROXY_ADMIN_TOKEN   admin page password
+#   <anything>              any upstream's key_env, e.g. DEEPSEEK_API_KEY
 #
-# 表里只能写 model 与可选的 supports_image；所属 profile 由表的表名决定，
-# 不需要（也不允许）再写 upstream。
-
-[upstreams.anthropic.routing]
-# 纯字符串 = 转发给该上游的这个模型名。
-sonnet = "DeepSeek-V4-Flash-0731"
-opus = "DeepSeek-V4-Flash-0731"
-# haiku 未声明时沿用 sonnet 的目标。
-# haiku = "DeepSeek-V4-Flash-0731"
-# 表值可声明 supports_image = true：上游模型原生支持图片时，带图请求直接发给
-# 该模型，不经内置 VLM 描述（含 image 400 重试）。
-# vision = { model = "gpt-4o", supports_image = true }
-
-# 只有表、不写 protocol/url 也合法——这正是把别名挂到内置网关的简写：
-# 该 profile 的协议与 URL 从 [upstream] 的两个地址补齐。
-# [upstreams.openai.routing]
-# flash = { model = "glm-5.3-flash" }
-
-# 命名 profile 的表（见上方 [upstreams.deepseek] 示例）：
-# [upstreams.deepseek.routing]
-# sonnet = { model = "deepseek-chat" }
-
-# 规则：
-#   - 别名必须全局唯一。两个 profile 声明同一个别名时，按 profile 名排序取第一个
-#     并打 warning；同一个 profile 内重复则是配置错误。
-#   - [upstream] default_upstream 只决定**没有任何 profile 声明**的
-#     sonnet/opus/haiku 走哪个网关，不再影响已声明的别名。
-#   - 顶层 [routing] 已不再支持：加载时会被忽略并打 warning（会列出被丢弃的
-#     别名），请把每个别名搬到它所属 profile 的 .routing 表里。
+# SOPHNET_API_KEY is no longer read: every upstream authenticates with its own
+# key or key_env.

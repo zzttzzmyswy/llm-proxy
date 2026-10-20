@@ -1,0 +1,27 @@
+# A second scheme, on the anthropic protocol, so switching providers is just a
+# change of the main config's [proxy] scheme value.
+#
+# The two schemes share nothing: their own URL, credential, timeouts, vision model
+# and model table all live in their own file.
+
+protocol = "anthropic"
+url = "https://www.sophnet.com/api/open-apis/anthropic"
+key_env = "SOPHNET_API_KEY"
+
+# The text upstream is anthropic, so a describe pass with no upstream of its own
+# reuses it — no [vlm] protocol/url needed.
+[vlm]
+model = "DeepSeek-Flash-1017"
+max_tokens = 8000
+
+# The chat passthrough speaks openai, so this scheme must name an openai upstream
+# for it explicitly (it cannot reuse an anthropic one).
+[chat]
+protocol = "openai"
+url = "https://api.sophnet.com/v1/chat/completions"
+key_env = "SOPHNET_API_KEY"
+
+[routing]
+sonnet = { model = "DeepSeek-Flash-1017", supports_image = true }
+opus = { model = "DeepSeek-Flash-1017", supports_image = true }
+haiku = { model = "DeepSeek-Flash-1017", supports_image = true }
