@@ -17,13 +17,19 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// withStoredConfig installs a config directly, bypassing the file, and restores
+// withStoredScheme installs a scheme directly, bypassing the file, and restores
 // the previous one when the test ends.
-func withStoredConfig(t *testing.T, c Config, routes map[string]RouteEntry) {
+func withStoredScheme(t *testing.T, s *Scheme) {
 	t.Helper()
-	prevCfg, prevRoutes, prevDeclared := currentConfig(), currentRoutes(), currentDeclaredRoutes()
-	storeConfig(c, routes, routes)
-	t.Cleanup(func() { storeConfig(prevCfg, prevRoutes, prevDeclared) })
+	prevCfg, prevScheme := currentConfig(), currentScheme()
+	cfgMu.Lock()
+	scheme = s
+	cfgMu.Unlock()
+	t.Cleanup(func() {
+		cfgMu.Lock()
+		cfg, scheme = prevCfg, prevScheme
+		cfgMu.Unlock()
+	})
 }
 
 // P1: a config published while a request is in flight must not be picked up by
@@ -80,11 +86,12 @@ func TestReviewRequestKeepsOneConfigSnapshot(t *testing.T) {
 	}))
 	t.Cleanup(newSrv.Close)
 
-	withStoredConfig(t, Config{
-		Proxy:    ProxyConfig{VLMModel: "MiniMax-M3", VLMMaxTokens: 100},
-		Upstream: UpstreamConfig{AnthropicURL: oldSrv.URL, OpenAIURL: oldSrv.URL},
-		Keys:     KeysConfig{Sophnet: "old-key"},
-	}, map[string]RouteEntry{"sonnet": {Model: "Old-Model"}})
+	oldUp := testUpstream("test", protocolAnthropic, oldSrv.URL)
+	oldUp.Key = "old-key"
+	oldScheme := testScheme(oldUp, map[string]RouteEntry{"sonnet": {Model: "Old-Model"}})
+	oldScheme.VLM = &VLMScheme{Upstream: oldUp, Model: "MiniMax-M3", MaxTokens: 100}
+	oldScheme.VLMInheritsText = true
+	withStoredScheme(t, oldScheme)
 
 	done := make(chan struct{})
 	go func() {
@@ -94,15 +101,12 @@ func TestReviewRequestKeepsOneConfigSnapshot(t *testing.T) {
 
 	<-vlmStarted
 	// Publish a replacement config: different model, upstream and key.
-	storeConfig(
-		Config{
-			Proxy:    ProxyConfig{VLMModel: "MiniMax-M3", VLMMaxTokens: 100},
-			Upstream: UpstreamConfig{AnthropicURL: newSrv.URL, OpenAIURL: newSrv.URL},
-			Keys:     KeysConfig{Sophnet: "new-key"},
-		},
-		map[string]RouteEntry{"sonnet": {Model: "New-Model"}},
-		map[string]RouteEntry{"sonnet": {Model: "New-Model"}},
-	)
+	newUp := testUpstream("test", protocolAnthropic, newSrv.URL)
+	newUp.Key = "new-key"
+	newScheme := testScheme(newUp, map[string]RouteEntry{"sonnet": {Model: "New-Model"}})
+	newScheme.VLM = &VLMScheme{Upstream: newUp, Model: "MiniMax-M3", MaxTokens: 100}
+	newScheme.VLMInheritsText = true
+	storeConfig(currentConfig(), newScheme)
 	close(release)
 	<-done
 
@@ -198,16 +202,14 @@ func TestReviewAnthropicStreamErrorCountsAsFailure(t *testing.T) {
 
 func TestReviewOpenAIStreamErrorCountsAsFailure(t *testing.T) {
 	withCleanStats(t)
-	withRoutes(t, map[string]RouteEntry{"flash": {Model: "glm-5.3-flash", Upstream: "openai"}})
+	withRoutes(t, map[string]RouteEntry{"flash": {Model: "glm-5.3-flash"}})
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		io.WriteString(w, "data: {\"error\":{\"message\":\"overloaded\"}}\n\n")
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.OpenAIURL
-	cfg.Upstream.OpenAIURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.OpenAIURL = oldURL })
+	withOpenAITextUpstream(t, upstream.URL)
 
 	callHandleMessages(t, `{"model":"flash","max_tokens":10,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 
@@ -228,9 +230,7 @@ func TestReviewPassthroughStreamErrorCountsAsFailure(t *testing.T) {
 		io.WriteString(w, "data: {\"error\":{\"message\":\"overloaded\"}}\n\n")
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.OpenAIURL
-	cfg.Upstream.OpenAIURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.OpenAIURL = oldURL })
+	withOpenAITextUpstream(t, upstream.URL)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.3-flash","stream":true,"messages":[]}`))
 	w := httptest.NewRecorder()
@@ -249,7 +249,7 @@ func TestReviewPassthroughStreamErrorCountsAsFailure(t *testing.T) {
 // estimated from the request rather than reported as a hard zero.
 func TestReviewMissingUsageEstimatesInput(t *testing.T) {
 	withCleanStats(t)
-	withRoutes(t, map[string]RouteEntry{"flash": {Model: "glm-5.3-flash", Upstream: "openai"}})
+	withRoutes(t, map[string]RouteEntry{"flash": {Model: "glm-5.3-flash"}})
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -257,9 +257,7 @@ func TestReviewMissingUsageEstimatesInput(t *testing.T) {
 		io.WriteString(w, "data: [DONE]\n\n")
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.OpenAIURL
-	cfg.Upstream.OpenAIURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.OpenAIURL = oldURL })
+	withOpenAITextUpstream(t, upstream.URL)
 
 	prompt := strings.Repeat("请解释这段代码。", 20)
 	callHandleMessages(t, fmt.Sprintf(`{"model":"flash","max_tokens":10,"stream":true,"messages":[{"role":"user","content":%q}]}`, prompt))
@@ -276,61 +274,27 @@ func TestReviewMissingUsageEstimatesInput(t *testing.T) {
 	}
 }
 
-// P2: a declared alias belongs to the profile whose table declares it, so a save
-// can never freeze an inherited gateway into the file — there is nothing inherited
-// to freeze. default_upstream now only decides where the *undeclared* builtin
-// fallbacks go.
-func TestReviewDefaultGatewayStaysInherited(t *testing.T) {
-	const inheritedConfig = `[upstream]
-default_upstream = "openai"
+// Every alias a scheme declares is bound to that scheme's single text upstream:
+// there is no default gateway to inherit from, and no way to route one alias to a
+// different upstream than its neighbours.
+func TestReviewDeclaredAliasesUseTheSchemeUpstream(t *testing.T) {
+	withTempConfig(t, testMainTOML, `protocol = "anthropic"
+url = "https://anthropic.example/api"
+key = "sk"
 
-[upstreams.anthropic.routing]
+[routing]
 sonnet = "Model-A"
-`
-	withTempConfig(t, inheritedConfig)
+`)
 
-	// A declared alias is bound to its own profile, not to default_upstream.
-	if got := snapshotConfig().routeTarget("sonnet").Upstream; got != profileNameAnthropic {
-		t.Fatalf("sonnet must stay on the profile that declares it, got %q", got)
+	if got := snapshotConfig().routeTarget("sonnet").Model; got != "Model-A" {
+		t.Fatalf("the declared alias must resolve to its model, got %q", got)
 	}
-	// An undeclared builtin alias still follows default_upstream.
-	if got := snapshotConfig().routeTarget("opus").Upstream; got != "openai" {
-		t.Fatalf("the undeclared opus fallback must follow default_upstream, got %q", got)
+	// An alias the scheme does not declare is forwarded under its own name.
+	if got := snapshotConfig().routeTarget("opus").Model; got != "opus" {
+		t.Fatalf("an undeclared alias must pass through unchanged, got %q", got)
 	}
-
-	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "")
-	if w.Code != http.StatusOK {
-		t.Fatalf("status %d", w.Code)
-	}
-	var view adminConfigView
-	decodeBody(t, w, &view)
-
-	// The form shows the alias in the anthropic profile's own table.
-	var sonnet *adminRoutingEntry
-	for _, prof := range view.Upstreams {
-		for i, e := range prof.Routing {
-			if e.Alias == "sonnet" {
-				sonnet = &prof.Routing[i]
-			}
-		}
-	}
-	if sonnet == nil || sonnet.Model != "Model-A" {
-		t.Fatalf("the declared alias must be listed in its profile's table, got %+v", view.Upstreams)
-	}
-
-	// Switch the default gateway to Anthropic and save.
-	p := payloadFromViewWithProfiles(t, view)
-	p.Upstream.DefaultUpstream = ""
-	res := postConfig(t, p, "")
-	if res.Code != http.StatusOK {
-		t.Fatalf("save failed: %s", res.Body.String())
-	}
-
-	if got := snapshotConfig().routeTarget("opus").Upstream; got != "" {
-		t.Fatalf("the undeclared fallback must follow the new default gateway, still %q", got)
-	}
-	if got := snapshotConfig().routeTarget("sonnet").Upstream; got != profileNameAnthropic {
-		t.Fatalf("the declared alias must stay on its own profile, got %q", got)
+	if got := snapshotConfig().textUpstreamOrFail(t).URL; got != "https://anthropic.example/api" {
+		t.Fatalf("every alias uses the scheme upstream, got %q", got)
 	}
 }
 
@@ -371,19 +335,15 @@ func TestReviewBackupsAreUniquePerSave(t *testing.T) {
 
 // P2: concurrent saves must not leave the file and the running config disagreeing.
 func TestReviewConcurrentSavesStayConsistent(t *testing.T) {
-	path := withTempConfig(t, testConfigTOML)
-
-	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
-	var view adminConfigView
-	decodeBody(t, w, &view)
+	configPath, _ := withDefaultConfig(t)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			p := payloadFromView(t, view)
-			p.Proxy.VLMModel = fmt.Sprintf("VLM-%d", i)
+			p := payloadFromView(currentView(t))
+			p.VLM.Model = fmt.Sprintf("VLM-%d", i)
 			res := postConfig(t, p, "s3cret")
 			if res.Code != http.StatusOK {
 				t.Errorf("concurrent save %d failed: %d %s", i, res.Code, res.Body.String())
@@ -392,7 +352,7 @@ func TestReviewConcurrentSavesStayConsistent(t *testing.T) {
 	}
 	wg.Wait()
 
-	onDisk, err := os.ReadFile(path)
+	onDisk, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,8 +360,11 @@ func TestReviewConcurrentSavesStayConsistent(t *testing.T) {
 	if err := toml.Unmarshal(onDisk, &stored); err != nil {
 		t.Fatalf("saved config must stay parseable: %v", err)
 	}
-	if inMemory := currentConfig().Proxy.VLMModel; inMemory != stored.Proxy.VLMModel {
-		t.Fatalf("disk and memory disagree after concurrent saves: disk=%q memory=%q", stored.Proxy.VLMModel, inMemory)
+	if inMemory := currentConfig().Proxy.Port; inMemory != stored.Proxy.Port {
+		t.Fatalf("disk and memory disagree after concurrent saves: disk=%d memory=%d", stored.Proxy.Port, inMemory)
+	}
+	if inMemory := currentScheme().VLM.Model; !strings.HasPrefix(inMemory, "VLM-") {
+		t.Fatalf("the surviving save's scheme must be the live one, got %q", inMemory)
 	}
 }
 
@@ -419,13 +382,17 @@ func TestReviewSaveWarningsHaveTheirOwnRegion(t *testing.T) {
 	}
 }
 
-// The bypass helper used above must not leave the declared routes behind.
+// The bypass helper used above must publish the declared table alongside the
+// resolved one, so the admin page can tell a written alias from a derived one.
 func TestReviewStoreConfigPublishesDeclaredRoutes(t *testing.T) {
-	declared := map[string]RouteEntry{"alias": {Model: "declared-model"}}
-	withStoredConfig(t, Config{}, declared)
+	s := testScheme(anthropicTextUpstream("http://127.0.0.1:1"), map[string]RouteEntry{"alias": {Model: "declared-model"}})
+	withStoredScheme(t, s)
 
-	if got := currentDeclaredRoutes()["alias"].Model; got != "declared-model" {
+	if got := currentScheme().Routes["alias"].Model; got != "declared-model" {
 		t.Fatalf("declared routes must be published, got %q", got)
+	}
+	if !currentScheme().DeclaredRoutes["alias"] {
+		t.Fatal("the declared marker must be published too")
 	}
 }
 
@@ -446,14 +413,10 @@ func TestReviewSaveFailureMessageDoesNotPromiseRollback(t *testing.T) {
 // leaves the page open. The warning must describe that, not claim every /admin*
 // now returns 404.
 func TestReviewClearWarningRespectsEnvPassword(t *testing.T) {
-	withTempConfig(t, testConfigTOML)
+	withDefaultConfig(t)
 	t.Setenv("LLM_PROXY_ADMIN_TOKEN", "env-token")
 
-	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "env-token")
-	var view adminConfigView
-	decodeBody(t, w, &view)
-
-	p := payloadFromView(t, view)
+	p := payloadFromView(currentView(t))
 	p.Admin = adminAuthPayload{Action: "clear"}
 
 	var out struct {

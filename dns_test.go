@@ -240,7 +240,7 @@ func TestPostUpstreamRetriesResolverFailure(t *testing.T) {
 	upstreamDial = newUpstreamDialer(r)
 	t.Cleanup(func() { upstreamDial = old })
 
-	rc := reqConfig{cfg: Config{Upstream: UpstreamConfig{MaxRetries: 2}}}
+	rc := reqConfig{up: Upstream{MaxRetries: 2}}
 	_, err := postUpstream(context.Background(), "https://upstream.test/v1/messages", []byte("{}"), nil, rc)
 	if err == nil {
 		t.Fatal("postUpstream must report the failure once retries are exhausted")

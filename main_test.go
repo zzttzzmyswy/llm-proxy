@@ -5,8 +5,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -23,9 +21,7 @@ func withUpstreamCapture(t *testing.T, contentType, body string, capture func(*h
 	}))
 	t.Cleanup(upstream.Close)
 
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 	return upstream
 }
 
@@ -63,10 +59,10 @@ func callHandleMessages(t *testing.T, reqBody string) string {
 // by the VLM, then route the now-text-only request to the text model.
 func TestImageRequestDescribedThenRoutedToText(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		
 	})
 
 	got := modelSentToUpstream(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"describe"}]}]}`)
@@ -80,10 +76,10 @@ func TestImageRequestDescribedThenRoutedToText(t *testing.T) {
 // (text block "这里有一个 image，其内容如下：...") before being sent to the text model.
 func TestImageReplacedWithVLMDescription(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		
 	})
 
 	var describeCalls int
@@ -110,9 +106,7 @@ func TestImageReplacedWithVLMDescription(t *testing.T) {
 		io.WriteString(w, nonStreamJSONBody)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	reqBody := `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"describe"}]}]}`
 	callHandleMessages(t, reqBody)
@@ -139,10 +133,10 @@ func TestImageReplacedWithVLMDescription(t *testing.T) {
 // to the VLM model unchanged so the image is not lost.
 func TestImageDescribeFailFallsBackToVLM(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		
 	})
 
 	var calls int
@@ -173,9 +167,7 @@ func TestImageDescribeFailFallsBackToVLM(t *testing.T) {
 		io.WriteString(w, nonStreamJSONBody)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	reqBody := `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
 	resp := callHandleMessages(t, reqBody)
@@ -196,10 +188,10 @@ func TestImageDescribeFailFallsBackToVLM(t *testing.T) {
 // image block.
 func TestImageURLDataDescribedThenRoutedToText(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		
 	})
 
 	var describeBody string
@@ -223,9 +215,7 @@ func TestImageURLDataDescribedThenRoutedToText(t *testing.T) {
 		io.WriteString(w, nonStreamJSONBody)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	reqBody := `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,QUFB"}},{"type":"text","text":"describe"}]}]}`
 	callHandleMessages(t, reqBody)
@@ -246,10 +236,10 @@ func TestImageURLDataDescribedThenRoutedToText(t *testing.T) {
 // Images nested inside tool_result content must be described and replaced too.
 func TestNestedToolResultImageDescribed(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		
 	})
 
 	var finalBody string
@@ -271,9 +261,7 @@ func TestNestedToolResultImageDescribed(t *testing.T) {
 		io.WriteString(w, nonStreamJSONBody)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	reqBody := `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}]}`
 	callHandleMessages(t, reqBody)
@@ -291,10 +279,10 @@ func TestNestedToolResultImageDescribed(t *testing.T) {
 // A request with multiple images must describe each and replace them all in order.
 func TestMultipleImagesAllDescribed(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		
 	})
 
 	var describeCount int
@@ -318,9 +306,7 @@ func TestMultipleImagesAllDescribed(t *testing.T) {
 		io.WriteString(w, nonStreamJSONBody)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	reqBody := `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"A"}},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"B"}}]}]}`
 	callHandleMessages(t, reqBody)
@@ -339,10 +325,10 @@ func TestMultipleImagesAllDescribed(t *testing.T) {
 // request reuses the cached description without calling the VLM again.
 func TestImageDescriptionCachedAcrossRequests(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		
 	})
 
 	var describeCalls int
@@ -366,9 +352,7 @@ func TestImageDescriptionCachedAcrossRequests(t *testing.T) {
 		io.WriteString(w, nonStreamJSONBody)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	reqBody := `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"SAMEIMAGE"}},{"type":"text","text":"describe"}]}]}`
 	callHandleMessages(t, reqBody) // first turn: VLM call, cached
@@ -392,10 +376,10 @@ func TestImageDescriptionCachedAcrossRequests(t *testing.T) {
 // Different images must each be described; the cache must not conflate them.
 func TestDistinctImagesBothDescribed(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		
 	})
 
 	var describeCalls int
@@ -417,9 +401,7 @@ func TestDistinctImagesBothDescribed(t *testing.T) {
 		io.WriteString(w, nonStreamJSONBody)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"IMG-A"}}]}]}`)
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"IMG-B"}}]}]}`)
@@ -507,10 +489,10 @@ func TestImageCacheKey(t *testing.T) {
 // image (role + sibling text), so the description tracks what the user is asking.
 func TestVLMDescribeRequestCarriesMessageContext(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		
 	})
 
 	var describeBody string
@@ -532,9 +514,7 @@ func TestVLMDescribeRequestCarriesMessageContext(t *testing.T) {
 		io.WriteString(w, nonStreamJSONBody)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"请分析这个编译报错"}]}]}`)
 
@@ -552,10 +532,10 @@ func TestVLMDescribeRequestCarriesMessageContext(t *testing.T) {
 // description depends on the context, so the cache must not conflate contexts.
 func TestSameImageDifferentContextNotCached(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		
 	})
 
 	var describeCalls int
@@ -577,9 +557,7 @@ func TestSameImageDifferentContextNotCached(t *testing.T) {
 		io.WriteString(w, nonStreamJSONBody)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	// Same image bytes "AAAA", different sibling text → different context.
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},{"type":"text","text":"看这个报错A"}]}]}`)
@@ -596,10 +574,10 @@ func TestSameImageDifferentContextNotCached(t *testing.T) {
 // (tool name + input) from the matching assistant tool_use.
 func TestToolResultContextIncludesToolInfo(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		
 	})
 
 	var describeBody string
@@ -621,9 +599,7 @@ func TestToolResultContextIncludesToolInfo(t *testing.T) {
 		io.WriteString(w, nonStreamJSONBody)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	reqBody := `{"model":"sonnet","max_tokens":10,"messages":[
 		{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"bash","input":{"command":"ls -la"}}]},
@@ -652,35 +628,27 @@ func TestHaikuExplicitRouting(t *testing.T) {
 	}
 }
 
-// When the config declares no haiku, loadConfig must fall back to the sonnet target.
-// The test writes its own config file (the host's /etc/llm-proxy/config.toml may
-// declare a haiku route, which would make the assertion meaningless).
+// When a scheme declares no haiku, the loader must fall back to the sonnet target.
+// The test writes its own scheme tree (the host's config may declare a haiku route,
+// which would make the assertion meaningless).
 func TestHaikuFallsBackToSonnetWhenUnconfigured(t *testing.T) {
-	oldCfg := cfg
-	oldRoutes := routeTargets
-	t.Cleanup(func() {
-		cfg = oldCfg
-		routeTargets = oldRoutes
-	})
+	withTempConfig(t, testMainTOML, `protocol = "anthropic"
+url = "https://anthropic.example/api"
+key = "sk"
 
-	path := filepath.Join(t.TempDir(), "config.toml")
-	content := `[upstreams.anthropic.routing]
+[routing]
 sonnet = "DeepSeek-V4-Flash-0731"
-`
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	t.Setenv("LLM_PROXY_CONFIG", path)
+`)
 
-	if err := loadConfig(); err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	haiku := routeTargets["haiku"]
-	if haiku.Model == "" {
+	haiku, ok := currentScheme().Routes["haiku"]
+	if !ok || haiku.Model == "" {
 		t.Fatal("haiku must fall back to a non-empty target")
 	}
-	if haiku != routeTargets["sonnet"] {
+	if haiku != currentScheme().Routes["sonnet"] {
 		t.Fatalf("unconfigured haiku must fall back to sonnet target, got %+v", haiku)
+	}
+	if currentScheme().DeclaredRoutes["haiku"] {
+		t.Fatal("a derived haiku must not be reported as declared")
 	}
 }
 
@@ -732,27 +700,33 @@ func TestConfigPathFromEnv(t *testing.T) {
 	}
 }
 
-// SOPHNET_API_KEY env var overrides the key from the config file.
-func TestAPIKeyFromEnvOverridesConfig(t *testing.T) {
-	t.Setenv("SOPHNET_API_KEY", "env-key-123")
-	t.Setenv("LLM_PROXY_CONFIG", "/nonexistent-"+t.Name()+".toml")
-	cfg.Keys.Sophnet = "file-key"
-	t.Cleanup(func() { cfg.Keys.Sophnet = "" })
+// A scheme upstream's key_env wins over its plaintext key, so a deployment can keep
+// the secret out of the file. There is no global key any more: every upstream
+// authenticates with its own credential.
+func TestAPIKeyFromEnvOverridesTheSchemeKey(t *testing.T) {
+	t.Setenv("MYS_TEST_UPSTREAM_KEY", "env-key-123")
+	withTempConfig(t, testMainTOML, `protocol = "anthropic"
+url = "https://anthropic.example/api"
+key = "file-key"
+key_env = "MYS_TEST_UPSTREAM_KEY"
+`)
 
-	got := snapshotConfig().apiKey()
-	if got != "env-key-123" {
-		t.Fatalf("SOPHNET_API_KEY should override config key, got %q", got)
+	if got := currentScheme().Text.Key; got != "env-key-123" {
+		t.Fatalf("key_env should override the file key, got %q", got)
 	}
 }
 
-// Without the env var, the key comes from the config file.
-func TestAPIKeyFallsBackToConfig(t *testing.T) {
-	t.Setenv("SOPHNET_API_KEY", "")
-	cfg.Keys.Sophnet = "file-key"
-	t.Cleanup(func() { cfg.Keys.Sophnet = "" })
+// Without the env var, the key comes from the scheme file.
+func TestAPIKeyFallsBackToTheSchemeKey(t *testing.T) {
+	t.Setenv("MYS_TEST_UPSTREAM_KEY", "")
+	withTempConfig(t, testMainTOML, `protocol = "anthropic"
+url = "https://anthropic.example/api"
+key = "file-key"
+key_env = "MYS_TEST_UPSTREAM_KEY"
+`)
 
-	if got := snapshotConfig().apiKey(); got != "file-key" {
-		t.Fatalf("config key should be used when env var is empty, got %q", got)
+	if got := currentScheme().Text.Key; got != "file-key" {
+		t.Fatalf("the file key should be used when the env var is empty, got %q", got)
 	}
 }
 
@@ -823,9 +797,7 @@ func TestThinkingPassesThroughFirstAttempt(t *testing.T) {
 		io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 	}))
 	defer upstream.Close()
-	old := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	defer func() { cfg.Upstream.AnthropicURL = old }()
+	withAnthropicUpstream(t, upstream.URL)
 
 	handleMessages(w, req)
 	res := w.Result()
@@ -998,9 +970,7 @@ func TestThinkingPassBackPatchedBeforeForward(t *testing.T) {
 		io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	resp := callHandleMessages(t, body)
 	if !strings.Contains(resp, "message_stop") {
@@ -1016,7 +986,9 @@ func TestThinkingPassBackPatchedBeforeForward(t *testing.T) {
 // A request without thinking blocks must leave the body byte-for-byte identical
 // (no re-serialization) so the latency/risk of touching untouched requests is 0.
 func TestNoThinkingBlocksBodyUnchanged(t *testing.T) {
-	body := `{"model":"sonnet","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
+	// An undeclared model name is forwarded as-is, so nothing has to rewrite the
+	// body for routing; the pass-back patch must then leave it untouched.
+	body := `{"model":"passthrough-model","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
 	var capture []byte
 	withUpstreamCapture(t, "text/event-stream", "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", func(r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -1040,9 +1012,7 @@ func TestThinking400WithoutCurePassesThrough(t *testing.T) {
 		io.WriteString(w, `{"error":{"message":"The `+"`content[].thinking`"+` in the thinking mode must be passed back to the API.","reqid":"test-2","type":"invalid_request_error"},"type":"error"}`)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	resp := callHandleMessages(t, body)
 	if !strings.Contains(resp, "must be passed back") {
@@ -1057,10 +1027,10 @@ func TestThinking400WithoutCurePassesThrough(t *testing.T) {
 // retry with the VLM model and return the successful reply.
 func TestImageRejectRetriesWithVLM(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		
 	})
 
 	var mu sync.Mutex
@@ -1083,9 +1053,7 @@ func TestImageRejectRetriesWithVLM(t *testing.T) {
 		io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"ok"}],"model":"MiniMax-M3","id":"r1","usage":{"input_tokens":5,"output_tokens":5}}`)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	// A request whose image is missed by static detection (e.g. hidden in an
 	// unexpected nesting), sent as sonnet → DeepSeek → 400 → must retry as MiniMax.
@@ -1110,8 +1078,7 @@ func TestImageRejectRetriesWithVLM(t *testing.T) {
 
 // A non-image 400 must NOT trigger the VLM retry.
 func TestNonImage400DoesNotRetry(t *testing.T) {
-	cfg.Proxy.VLMModel = "MiniMax-M3"
-	t.Cleanup(func() { cfg.Proxy.VLMModel = "" })
+	withVLM(t, "MiniMax-M3", 8000)
 
 	var calls int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1121,9 +1088,7 @@ func TestNonImage400DoesNotRetry(t *testing.T) {
 		io.WriteString(w, `{"error":{"message":"some other error"}}`)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	resp := callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
 	if calls != 1 {
@@ -1139,8 +1104,7 @@ func TestNonImage400DoesNotRetry(t *testing.T) {
 
 // When the VLM model is not configured, an image 400 must pass through unchanged.
 func TestImage400WithoutVLMConfigPassesThrough(t *testing.T) {
-	cfg.Proxy.VLMModel = ""
-	t.Cleanup(func() { cfg.Proxy.VLMModel = "" })
+	
 
 	var calls int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1150,9 +1114,7 @@ func TestImage400WithoutVLMConfigPassesThrough(t *testing.T) {
 		io.WriteString(w, `{"error":{"message":"Model do not support image input"}}`)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
 	if calls != 1 {

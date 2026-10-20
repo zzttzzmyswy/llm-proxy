@@ -10,68 +10,70 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/BurntSushi/toml"
 )
 
-const testConfigTOML = `[proxy]
+// testMainTOML is the main configuration file the admin tests load: process
+// settings plus which scheme is active. Everything about reaching a model lives in
+// testSchemeTOML below.
+const testMainTOML = `[proxy]
 port = 8088
-vlm_model = "MiniMax-M3"
-
-[upstream]
-anthropic_url = "https://anthropic.example/api"
-openai_url = "https://openai.example/v1"
-
-[keys]
-sophnet = "sk-original"
+scheme = "main"
 
 [admin]
 token = "s3cret"
-
-# Every alias lives in the model table of the upstream profile that serves it;
-# there is no top-level [routing] any more.
-[upstreams.anthropic.routing]
-sonnet = { model = "DeepSeek-Flash", supports_image = true }
-
-[upstreams.openai.routing]
-haiku = { model = "glm-5.3-flash" }
 `
 
-// withTempConfig points the proxy at a throwaway config file, loads it, and
+// testSchemeTOML is one complete scheme: an anthropic text upstream, a VLM on the
+// same gateway, and a model table.
+const testSchemeTOML = `protocol = "anthropic"
+url = "https://anthropic.example/api"
+key = "sk-original"
+
+[vlm]
+model = "MiniMax-M3"
+max_tokens = 8000
+
+[chat]
+protocol = "openai"
+url = "https://openai.example/v1"
+key = "sk-chat"
+
+[routing]
+sonnet = { model = "DeepSeek-Flash", supports_image = true }
+opus = "GLM-5.2"
+"weird.alias" = "some-model"
+`
+
+// withTempConfig writes a scheme tree, points the proxy at it, loads it, and
 // restores the previous live config when the test ends.
-func withTempConfig(t *testing.T, content string) string {
+func withTempConfig(t *testing.T, mainTOML, schemeTOML string) (configPath, schemePath string) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("LLM_PROXY_CONFIG", path)
+	configPath, schemePath = writeSchemeTree(t, mainTOML, "main", schemeTOML)
 	t.Setenv("SOPHNET_API_KEY", "")
 	t.Setenv("LLM_PROXY_ADMIN_TOKEN", "")
 
-	cfgMu.Lock()
-	oldCfg, oldRoutes := cfg, routeTargets
-	cfgMu.Unlock()
+	prevCfg, prevScheme := currentConfig(), currentScheme()
 	t.Cleanup(func() {
 		cfgMu.Lock()
-		cfg, routeTargets = oldCfg, oldRoutes
+		cfg, scheme = prevCfg, prevScheme
 		cfgMu.Unlock()
 	})
 
 	if err := loadConfig(); err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	return path
+	return configPath, schemePath
+}
+
+// withDefaultConfig is the common setup: the test tree above.
+func withDefaultConfig(t *testing.T) (configPath, schemePath string) {
+	t.Helper()
+	return withTempConfig(t, testMainTOML, testSchemeTOML)
 }
 
 func adminCall(t *testing.T, handler http.HandlerFunc, method, target, body, password string) *httptest.ResponseRecorder {
 	t.Helper()
-	var reader *strings.Reader
-	if body == "" {
-		reader = strings.NewReader("")
-	} else {
-		reader = strings.NewReader(body)
-	}
-	req := httptest.NewRequest(method, target, reader)
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
 	if password != "" {
 		req.SetBasicAuth("admin", password)
 	}
@@ -90,7 +92,7 @@ func decodeBody(t *testing.T, w *httptest.ResponseRecorder, into interface{}) {
 // An unset admin token disables the whole subtree; a 404 keeps the endpoint's
 // existence unadvertised on a network-reachable port.
 func TestAdminDisabledWithoutToken(t *testing.T) {
-	withTempConfig(t, strings.Replace(testConfigTOML, `token = "s3cret"`, `token = ""`, 1))
+	withTempConfig(t, strings.Replace(testMainTOML, `token = "s3cret"`, `token = ""`, 1), testSchemeTOML)
 
 	for _, h := range []http.HandlerFunc{handleAdminPage, handleAdminConfig, handleAdminStats} {
 		w := adminCall(t, requireAdmin(h), http.MethodGet, "/admin", "", "")
@@ -101,7 +103,7 @@ func TestAdminDisabledWithoutToken(t *testing.T) {
 }
 
 func TestAdminRejectsBadCredentials(t *testing.T) {
-	withTempConfig(t, testConfigTOML)
+	withDefaultConfig(t)
 
 	w := adminCall(t, requireAdmin(handleAdminPage), http.MethodGet, "/admin", "", "")
 	if w.Code != http.StatusUnauthorized {
@@ -111,11 +113,9 @@ func TestAdminRejectsBadCredentials(t *testing.T) {
 		t.Fatalf("401 must carry a Basic challenge, got %q", w.Header().Get("WWW-Authenticate"))
 	}
 
-	w = adminCall(t, requireAdmin(handleAdminPage), http.MethodGet, "/admin", "", "wrong")
-	if w.Code != http.StatusUnauthorized {
+	if w := adminCall(t, requireAdmin(handleAdminPage), http.MethodGet, "/admin", "", "wrong"); w.Code != http.StatusUnauthorized {
 		t.Fatalf("wrong password must return 401, got %d", w.Code)
 	}
-
 	w = adminCall(t, requireAdmin(handleAdminPage), http.MethodGet, "/admin", "", "s3cret")
 	if w.Code != http.StatusOK {
 		t.Fatalf("correct password must return 200, got %d", w.Code)
@@ -128,7 +128,7 @@ func TestAdminRejectsBadCredentials(t *testing.T) {
 // The env var takes precedence so the password does not have to be stored in the
 // config file.
 func TestAdminTokenFromEnvOverridesConfig(t *testing.T) {
-	withTempConfig(t, testConfigTOML)
+	withDefaultConfig(t)
 	t.Setenv("LLM_PROXY_ADMIN_TOKEN", "env-token")
 
 	if w := adminCall(t, requireAdmin(handleAdminPage), http.MethodGet, "/admin", "", "s3cret"); w.Code != http.StatusUnauthorized {
@@ -139,61 +139,101 @@ func TestAdminTokenFromEnvOverridesConfig(t *testing.T) {
 	}
 }
 
+// The view reports the active scheme and every upstream's credential state without
+// ever returning a key.
 func TestAdminConfigViewRedactsKey(t *testing.T) {
-	withTempConfig(t, testConfigTOML)
+	withDefaultConfig(t)
 
 	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
 	if w.Code != http.StatusOK {
 		t.Fatalf("status %d", w.Code)
 	}
-	if strings.Contains(w.Body.String(), "sk-original") {
-		t.Fatal("the upstream key must never be returned to the page")
+	for _, secret := range []string{"sk-original", "sk-chat"} {
+		if strings.Contains(w.Body.String(), secret) {
+			t.Fatalf("the upstream key %q must never be returned to the page", secret)
+		}
 	}
 
 	var view adminConfigView
 	decodeBody(t, w, &view)
-	if !view.Keys.SophnetSet {
-		t.Fatal("the page must know a key is configured")
+	if view.Proxy.Scheme != "main" {
+		t.Fatalf("the active scheme must be reported, got %q", view.Proxy.Scheme)
 	}
-	if view.Keys.SophnetFromEnv {
-		t.Fatal("no env key is set in this test")
+	if len(view.Proxy.SchemeList) != 1 || view.Proxy.SchemeList[0] != "main" {
+		t.Fatalf("the scheme list must come from the schemes directory, got %v", view.Proxy.SchemeList)
 	}
-	if view.Proxy.VLMModel != "MiniMax-M3" || view.Upstream.HeaderTimeoutSeconds != 120 {
-		t.Fatalf("defaults must be applied to the view: %+v", view)
+	if !view.Upstream.KeySet || view.Upstream.KeyFromEnv {
+		t.Fatalf("text upstream key state: %+v", view.Upstream)
 	}
-	// Each profile reports the aliases its own table declares, so a save cannot
-	// freeze an inherited value into the file. The builtin opus fallback is not
-	// declared anywhere, so it shows up only in the effective view.
+	if view.Upstream.Protocol != protocolAnthropic || view.Upstream.URL != "https://anthropic.example/api" {
+		t.Fatalf("text upstream: %+v", view.Upstream)
+	}
+	if view.Upstream.HeaderTimeoutSeconds != 120 || view.Upstream.BodyIdleSeconds != 90 || view.Upstream.MaxRetries != 2 {
+		t.Fatalf("documented defaults must be applied to the view: %+v", view.Upstream)
+	}
+	if !view.VLM.Active || view.VLM.Model != "MiniMax-M3" || view.VLM.MaxTokens != 8000 {
+		t.Fatalf("the [vlm] table must be reported: %+v", view.VLM)
+	}
+	if !view.Chat.Available || view.Chat.Upstream.Protocol != protocolOpenAI {
+		t.Fatalf("the [chat] table must be reported: %+v", view.Chat)
+	}
+
+	// The editable table carries the aliases the file declares, exactly.
 	byAlias := map[string]adminRoutingEntry{}
-	for _, prof := range view.Upstreams {
-		for _, e := range prof.Routing {
-			byAlias[e.Alias] = e
-		}
+	for _, e := range view.Routing {
+		byAlias[e.Alias] = e
 	}
-	if len(byAlias) != 2 {
-		t.Fatalf("the profiles must report the declared aliases only, got %+v", byAlias)
-	}
-	if _, ok := byAlias["opus"]; ok {
-		t.Fatalf("an undeclared builtin fallback must not appear in the editable tables, got %+v", byAlias["opus"])
+	if len(byAlias) != 3 {
+		t.Fatalf("the view must report the declared aliases only, got %+v", byAlias)
 	}
 	if e := byAlias["sonnet"]; !e.SupportsImage || e.Model != "DeepSeek-Flash" {
 		t.Fatalf("sonnet route: %+v", e)
 	}
-	// The fallback is still reported as effective, so the operator can see it.
-	if e, ok := view.EffectiveRouting["opus"]; !ok || e.Model != "GLM-5.2" || e.Declared {
-		t.Fatalf("the builtin opus fallback must be reported as effective and undeclared, got %+v", e)
+	if _, ok := byAlias["weird.alias"]; !ok {
+		t.Fatalf("an alias needing a quoted TOML key must round-trip, got %+v", byAlias)
 	}
-	if e, ok := view.EffectiveRouting["haiku"]; !ok || !e.Declared || e.Upstream != "openai" {
-		t.Fatalf("a declared route must be reported as effective and declared, got %+v", e)
+	// haiku is derived from sonnet, so it is effective but not declared.
+	if e, ok := view.EffectiveRouting["haiku"]; !ok || e.Declared || e.Model != "DeepSeek-Flash" {
+		t.Fatalf("the derived haiku fallback must be reported as effective and undeclared, got %+v", e)
+	}
+	if e, ok := view.EffectiveRouting["sonnet"]; !ok || !e.Declared {
+		t.Fatalf("a declared route must be reported as declared, got %+v", e)
 	}
 }
 
-func payloadFromView(t *testing.T, view adminConfigView) adminConfigPayload {
-	t.Helper()
+// payloadFromView builds the save payload a round trip of the page would send: the
+// view's own values back, with every key action left at "keep".
+func payloadFromView(view adminConfigView) adminConfigPayload {
 	return adminConfigPayload{
 		Proxy:    view.Proxy,
-		Upstream: view.Upstream,
-		Keys:     adminKeysPayload{Action: "keep"},
+		Upstream: upstreamPayloadFromView(view.Upstream, "keep", ""),
+		VLM: adminVLMPayload{
+			Active:    view.VLM.Active,
+			Model:     view.VLM.Model,
+			MaxTokens: view.VLM.MaxTokens,
+			Inherit:   view.VLM.Inherit,
+			Upstream:  upstreamPayloadFromView(view.VLM.Upstream, "keep", ""),
+		},
+		Chat: adminChatPayload{
+			Available: view.Chat.Available,
+			Inherit:   view.Chat.Inherit,
+			Upstream:  upstreamPayloadFromView(view.Chat.Upstream, "keep", ""),
+		},
+		Admin:   adminAuthPayload{Action: "keep"},
+		Routing: view.Routing,
+	}
+}
+
+func upstreamPayloadFromView(v adminUpstreamView, keyAction, key string) adminUpstreamPayload {
+	return adminUpstreamPayload{
+		Protocol:             v.Protocol,
+		URL:                  v.URL,
+		KeyAction:            keyAction,
+		Key:                  key,
+		KeyEnv:               v.KeyEnv,
+		HeaderTimeoutSeconds: v.HeaderTimeoutSeconds,
+		BodyIdleSeconds:      v.BodyIdleSeconds,
+		MaxRetries:           v.MaxRetries,
 	}
 }
 
@@ -206,558 +246,326 @@ func postConfig(t *testing.T, p adminConfigPayload, password string) *httptest.R
 	return adminCall(t, handleAdminConfig, http.MethodPost, "/admin/api/config", string(body), password)
 }
 
-// A save must land on disk, be reloaded into the running process, and leave a
-// timestamped backup of what was there before.
-func TestAdminConfigSaveAppliesAndBacksUp(t *testing.T) {
-	path := withTempConfig(t, testConfigTOML)
-
+func currentView(t *testing.T) adminConfigView {
+	t.Helper()
 	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d", w.Code)
+	}
 	var view adminConfigView
 	decodeBody(t, w, &view)
+	return view
+}
 
-	p := payloadFromView(t, view)
-	p.Proxy.VLMModel = "Qwen3-VL"
-	p.Upstream.MaxRetries = 5
-	// The aliases live in the profiles' own tables, so edit them there.
-	p.Upstreams = profilesPayloadFromView(t, view)
-	for i := range p.Upstreams {
-		for j := range p.Upstreams[i].Routing {
-			if p.Upstreams[i].Routing[j].Alias == "sonnet" {
-				p.Upstreams[i].Routing[j].Model = "DeepSeek-V5"
-			}
-		}
-	}
+// A save rewrites the scheme file, backs the previous one up, and takes effect
+// without a restart.
+func TestAdminConfigSaveAppliesAndBacksUp(t *testing.T) {
+	_, schemePath := withDefaultConfig(t)
+
+	p := payloadFromView(currentView(t))
+	p.Upstream.URL = "https://changed.example/api"
+	p.VLM.Model = "Qwen-VL"
+	p.Routing = append(p.Routing, adminRoutingEntry{Alias: "fast", Model: "glm-flash"})
 
 	res := postConfig(t, p, "s3cret")
 	if res.Code != http.StatusOK {
-		t.Fatalf("save failed: %d %s", res.Code, res.Body.String())
+		t.Fatalf("save must succeed, got %d: %s", res.Code, res.Body.String())
 	}
-
-	// Live process picked the change up without a restart.
-	if got := routeModelName("sonnet"); got != "DeepSeek-V5" {
-		t.Fatalf("save must reload the running config, sonnet -> %q", got)
+	// The save is live without a reload of the process.
+	if got := currentScheme().Text.URL; got != "https://changed.example/api" {
+		t.Fatalf("the text upstream must be live, got %q", got)
 	}
-	if got := currentConfig().Proxy.VLMModel; got != "Qwen3-VL" {
-		t.Fatalf("save must reload the running config, vlm -> %q", got)
+	if got := currentScheme().VLM.Model; got != "Qwen-VL" {
+		t.Fatalf("the vlm model must be live, got %q", got)
 	}
-	if got := snapshotConfig().maxRetries(); got != 5 {
-		t.Fatalf("save must reload retries, got %d", got)
+	if e, ok := currentScheme().Routes["fast"]; !ok || e.Model != "glm-flash" {
+		t.Fatalf("the new route must be live, got %+v", currentScheme().Routes)
 	}
-
-	// And it survived to disk, parseable.
-	onDisk, err := os.ReadFile(path)
+	// The stored key survived a "keep" save even though the page never saw it.
+	if got := currentScheme().Text.Key; got != "sk-original" {
+		t.Fatalf("a keep save must preserve the stored key, got %q", got)
+	}
+	// The written file carries the new value and a backup holds the old one.
+	written, err := os.ReadFile(schemePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var reread Config
-	if err := toml.Unmarshal(onDisk, &reread); err != nil {
-		t.Fatalf("saved config must be valid TOML: %v\n%s", err, onDisk)
+	if !strings.Contains(string(written), "https://changed.example/api") {
+		t.Fatalf("the scheme file must carry the new URL, got:\n%s", written)
 	}
-	if reread.Proxy.VLMModel != "Qwen3-VL" {
-		t.Fatalf("disk copy out of sync: %+v", reread.Proxy)
+	backups, _ := filepath.Glob(schemePath + ".bak.*")
+	if len(backups) != 1 {
+		t.Fatalf("exactly one backup must be kept, got %v", backups)
 	}
-
-	backups, err := filepath.Glob(path + ".bak.*")
-	if err != nil || len(backups) != 1 {
-		t.Fatalf("exactly one timestamped backup expected, got %v (err=%v)", backups, err)
-	}
-	backup, _ := os.ReadFile(backups[0])
-	if !strings.Contains(string(backup), "MiniMax-M3") {
-		t.Fatal("the backup must hold the pre-save contents")
+	old, _ := os.ReadFile(backups[0])
+	if !strings.Contains(string(old), "https://anthropic.example/api") {
+		t.Fatalf("the backup must hold the previous file, got:\n%s", old)
 	}
 }
 
-// A rejected save must not touch the file or the running config.
+// A save that would produce an unservable scheme is rejected and nothing is
+// written.
 func TestAdminConfigRejectsInvalidPayloadWithoutWriting(t *testing.T) {
-	path := withTempConfig(t, testConfigTOML)
-	before, _ := os.ReadFile(path)
-
-	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
-	var view adminConfigView
-	decodeBody(t, w, &view)
+	_, schemePath := withDefaultConfig(t)
+	before, err := os.ReadFile(schemePath)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	cases := []struct {
 		name   string
 		mutate func(*adminConfigPayload)
+		want   string
 	}{
-		{"port out of range", func(p *adminConfigPayload) { p.Proxy.Port = 70000 }},
-		{"empty anthropic url", func(p *adminConfigPayload) { p.Upstream.AnthropicURL = "" }},
-		{"bad url scheme", func(p *adminConfigPayload) { p.Upstream.OpenAIURL = "ftp://x/y" }},
-		{"bad default upstream", func(p *adminConfigPayload) { p.Upstream.DefaultUpstream = "gemini" }},
-		{"duplicate alias", func(p *adminConfigPayload) {
-			// An alias is scoped to one profile, so the duplicate is inside a
-			// profile's own table.
-			p.Upstreams[0].Routing = append(p.Upstreams[0].Routing,
-				adminRoutingEntry{Alias: p.Upstreams[0].Routing[0].Alias, Model: "dup"})
-		}},
-		{"empty model", func(p *adminConfigPayload) { p.Upstreams[0].Routing[0].Model = "  " }},
-		{"empty alias", func(p *adminConfigPayload) { p.Upstreams[0].Routing[0].Alias = "" }},
-		{"bad route upstream", func(p *adminConfigPayload) { p.Upstreams[0].Routing[0].Upstream = "bedrock" }},
-		{"set without a key", func(p *adminConfigPayload) { p.Keys = adminKeysPayload{Action: "set"} }},
-		{"unknown key action", func(p *adminConfigPayload) { p.Keys = adminKeysPayload{Action: "wipe"} }},
-		{"negative retries", func(p *adminConfigPayload) { p.Upstream.MaxRetries = -1 }},
-		{"control char in model", func(p *adminConfigPayload) { p.Upstreams[0].Routing[0].Model = "bad\x00model" }},
+		{"empty url", func(p *adminConfigPayload) { p.Upstream.URL = "" }, "url"},
+		{"bad protocol", func(p *adminConfigPayload) { p.Upstream.Protocol = "grpc" }, "protocol"},
+		{"negative timeout", func(p *adminConfigPayload) { p.Upstream.BodyIdleSeconds = -1 }, "负数"},
+		{"vlm without model", func(p *adminConfigPayload) { p.VLM.Active = true; p.VLM.Model = "" }, "vlm model"},
+		{"vlm inheriting an openai upstream", func(p *adminConfigPayload) {
+			p.Upstream.Protocol = protocolOpenAI
+			p.Upstream.URL = "https://openai.example/v1"
+			p.VLM.Active = true
+			p.VLM.Inherit = true
+			p.VLM.Model = "m"
+		}, "anthropic"},
+		{"chat on an anthropic upstream", func(p *adminConfigPayload) {
+			p.Chat.Available = true
+			p.Chat.Inherit = true
+			p.Chat.Upstream = adminUpstreamPayload{}
+		}, "openai"},
+		{"empty route alias", func(p *adminConfigPayload) {
+			p.Routing = append(p.Routing, adminRoutingEntry{Alias: "", Model: "m"})
+		}, "别名"},
+		{"empty route model", func(p *adminConfigPayload) {
+			p.Routing = append(p.Routing, adminRoutingEntry{Alias: "x", Model: ""})
+		}, "模型名"},
+		{"duplicate route alias", func(p *adminConfigPayload) {
+			p.Routing = append(p.Routing, adminRoutingEntry{Alias: "sonnet", Model: "m"})
+		}, "重复"},
+		{"port out of range", func(p *adminConfigPayload) { p.Proxy.Port = 70000 }, "端口"},
+		{"switching to a missing scheme", func(p *adminConfigPayload) { p.Proxy.Scheme = "ghost" }, "不存在"},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := payloadFromViewWithProfiles(t, view)
+			p := payloadFromView(currentView(t))
 			tc.mutate(&p)
 			res := postConfig(t, p, "s3cret")
 			if res.Code != http.StatusBadRequest {
-				t.Fatalf("invalid payload must be rejected with 400, got %d %s", res.Code, res.Body.String())
+				t.Fatalf("want 400, got %d: %s", res.Code, res.Body.String())
 			}
-			after, _ := os.ReadFile(path)
+			if !strings.Contains(res.Body.String(), tc.want) {
+				t.Fatalf("the rejection must mention %q, got %s", tc.want, res.Body.String())
+			}
+			after, err := os.ReadFile(schemePath)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if string(after) != string(before) {
-				t.Fatal("a rejected save must leave the config file untouched")
-			}
-			if got := routeModelName("sonnet"); got != "DeepSeek-Flash" {
-				t.Fatalf("a rejected save must not touch the running config, sonnet -> %q", got)
+				t.Fatalf("a rejected save must not touch the file, got:\n%s", after)
 			}
 		})
 	}
 }
 
+// A key is a three-state choice: keep leaves it alone, set replaces it, clear
+// removes it.
 func TestAdminConfigKeyActions(t *testing.T) {
-	path := withTempConfig(t, testConfigTOML)
-	readKey := func(t *testing.T) string {
-		t.Helper()
-		data, _ := os.ReadFile(path)
-		var c Config
-		if err := toml.Unmarshal(data, &c); err != nil {
-			t.Fatal(err)
-		}
-		return c.Keys.Sophnet
+	withDefaultConfig(t)
+
+	for _, tc := range []struct {
+		action string
+		key    string
+		want   string
+	}{
+		{"keep", "ignored-when-keeping", "sk-original"},
+		{"set", "sk-new", "sk-new"},
+		{"clear", "", ""},
+	} {
+		t.Run(tc.action, func(t *testing.T) {
+			p := payloadFromView(currentView(t))
+			p.Upstream.KeyAction, p.Upstream.Key = tc.action, tc.key
+			if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", res.Code, res.Body.String())
+			}
+			if got := currentScheme().Text.Key; got != tc.want {
+				t.Fatalf("key after %s: got %q want %q", tc.action, got, tc.want)
+			}
+		})
 	}
 
-	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
-	var view adminConfigView
-	decodeBody(t, w, &view)
-
-	// keep leaves the stored key alone even though the page never sent one.
-	p := payloadFromView(t, view)
-	p.Keys = adminKeysPayload{Action: "keep"}
-	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
-		t.Fatalf("keep failed: %s", res.Body.String())
-	}
-	if got := readKey(t); got != "sk-original" {
-		t.Fatalf("keep must preserve the key, got %q", got)
-	}
-
-	// set replaces it.
-	p.Keys = adminKeysPayload{Action: "set", Sophnet: "sk-new"}
-	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
-		t.Fatalf("set failed: %s", res.Body.String())
-	}
-	if got := readKey(t); got != "sk-new" {
-		t.Fatalf("set must store the new key, got %q", got)
-	}
-
-	// clear empties it.
-	p.Keys = adminKeysPayload{Action: "clear"}
-	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
-		t.Fatalf("clear failed: %s", res.Body.String())
-	}
-	if got := readKey(t); got != "" {
-		t.Fatalf("clear must empty the key, got %q", got)
+	// "set" with an empty value is a mistake, not a clear.
+	p := payloadFromView(currentView(t))
+	p.Upstream.KeyAction, p.Upstream.Key = "set", ""
+	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusBadRequest {
+		t.Fatalf("set with an empty key must be rejected, got %d", res.Code)
 	}
 }
 
-// The admin token is editable from the page, but a save that does not ask to
-// change it must carry it over rather than locking the operator out.
+// A key_env reference survives a save verbatim and its value is resolved from the
+// environment rather than written into the file.
+func TestAdminConfigKeyEnvIsNotCopiedIntoTheFile(t *testing.T) {
+	_, schemePath := withDefaultConfig(t)
+	t.Setenv("MYS_TEST_SCHEME_KEY", "from-env")
+
+	p := payloadFromView(currentView(t))
+	p.Upstream.KeyAction, p.Upstream.Key, p.Upstream.KeyEnv = "clear", "", "MYS_TEST_SCHEME_KEY"
+	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
+	}
+	if got := currentScheme().Text.Key; got != "from-env" {
+		t.Fatalf("the env key must win, got %q", got)
+	}
+	written, _ := os.ReadFile(schemePath)
+	if strings.Contains(string(written), "from-env") {
+		t.Fatalf("a key resolved from the environment must not be written to the file, got:\n%s", written)
+	}
+	if !strings.Contains(string(written), `key_env = "MYS_TEST_SCHEME_KEY"`) {
+		t.Fatalf("the key_env reference must be written, got:\n%s", written)
+	}
+}
+
 func TestAdminConfigSaveKeepsAdminTokenByDefault(t *testing.T) {
-	path := withTempConfig(t, testConfigTOML)
-
-	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
-	var view adminConfigView
-	decodeBody(t, w, &view)
-	if res := postConfig(t, payloadFromView(t, view), "s3cret"); res.Code != http.StatusOK {
-		t.Fatalf("save failed: %s", res.Body.String())
+	withDefaultConfig(t)
+	p := payloadFromView(currentView(t))
+	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
-
-	data, _ := os.ReadFile(path)
-	var c Config
-	if err := toml.Unmarshal(data, &c); err != nil {
-		t.Fatal(err)
-	}
-	if c.Admin.Token != "s3cret" {
-		t.Fatalf("a save must preserve the admin token, got %q", c.Admin.Token)
-	}
-	// And the page is still reachable with the same password.
-	if w := adminCall(t, requireAdmin(handleAdminPage), http.MethodGet, "/admin", "", "s3cret"); w.Code != http.StatusOK {
-		t.Fatalf("the page must still accept the unchanged password, got %d", w.Code)
+	if got := currentConfig().Admin.Token; got != "s3cret" {
+		t.Fatalf("a keep save must preserve the password, got %q", got)
 	}
 }
 
 func TestAdminConfigViewReportsAdminTokenState(t *testing.T) {
-	withTempConfig(t, testConfigTOML)
-
-	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
-	var view adminConfigView
-	decodeBody(t, w, &view)
-	if !view.Admin.TokenSet {
-		t.Fatal("the page must know a password is configured")
+	withDefaultConfig(t)
+	if v := currentView(t); !v.Admin.TokenSet || v.Admin.TokenFromEnv {
+		t.Fatalf("token state: %+v", v.Admin)
 	}
-	if view.Admin.TokenFromEnv {
-		t.Fatal("no env password is set in this test")
-	}
-	if strings.Contains(w.Body.String(), "s3cret") {
-		t.Fatal("the admin password must never be returned to the page")
-	}
-
-	t.Setenv("LLM_PROXY_ADMIN_TOKEN", "env-token")
-	w = adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "env-token")
-	decodeBody(t, w, &view)
-	if !view.Admin.TokenFromEnv {
-		t.Fatal("the page must report when the env var supplies the password")
+	t.Setenv("LLM_PROXY_ADMIN_TOKEN", "env")
+	if v := currentView(t); !v.Admin.TokenFromEnv {
+		t.Fatalf("the env source must be reported: %+v", v.Admin)
 	}
 }
 
-// set replaces the password and makes the old one stop working; clear closes the
-// page entirely.
 func TestAdminConfigAdminTokenActions(t *testing.T) {
-	path := withTempConfig(t, testConfigTOML)
-	readToken := func(t *testing.T) string {
-		t.Helper()
-		data, _ := os.ReadFile(path)
-		var c Config
-		if err := toml.Unmarshal(data, &c); err != nil {
-			t.Fatal(err)
-		}
-		return c.Admin.Token
-	}
+	withDefaultConfig(t)
 
-	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
-	var view adminConfigView
-	decodeBody(t, w, &view)
-
-	p := payloadFromView(t, view)
-	p.Admin = adminAuthPayload{Action: "set", Token: "new-secret"}
+	p := payloadFromView(currentView(t))
+	p.Admin = adminAuthPayload{Action: "set", Token: "brand-new"}
 	res := postConfig(t, p, "s3cret")
 	if res.Code != http.StatusOK {
-		t.Fatalf("set failed: %s", res.Body.String())
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
-	if got := readToken(t); got != "new-secret" {
-		t.Fatalf("set must store the new password, got %q", got)
-	}
-	if w := adminCall(t, requireAdmin(handleAdminPage), http.MethodGet, "/admin", "", "new-secret"); w.Code != http.StatusOK {
-		t.Fatalf("the new password must authenticate, got %d", w.Code)
-	}
-	if w := adminCall(t, requireAdmin(handleAdminPage), http.MethodGet, "/admin", "", "s3cret"); w.Code != http.StatusUnauthorized {
-		t.Fatalf("the old password must stop working, got %d", w.Code)
-	}
-
-	// clear disables the page: requireAdmin then 404s.
-	p = payloadFromView(t, view)
-	p.Admin = adminAuthPayload{Action: "clear"}
-	if res := postConfig(t, p, "new-secret"); res.Code != http.StatusOK {
-		t.Fatalf("clear failed: %s", res.Body.String())
-	}
-	if got := readToken(t); got != "" {
-		t.Fatalf("clear must empty the password, got %q", got)
-	}
-	if w := adminCall(t, requireAdmin(handleAdminPage), http.MethodGet, "/admin", "", "new-secret"); w.Code != http.StatusNotFound {
-		t.Fatalf("a cleared password must close the page with 404, got %d", w.Code)
-	}
-}
-
-// Changing the password invalidates the credentials the browser is still
-// holding, so the page has to be told to re-authenticate. A password supplied by
-// the environment cannot change from the page, so it needs no re-auth.
-func TestAdminConfigSaveReportsReauthRequired(t *testing.T) {
-	withTempConfig(t, testConfigTOML)
-
-	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
-	var view adminConfigView
-	decodeBody(t, w, &view)
-
 	var out struct {
-		ReauthRequired bool     `json:"reauth_required"`
-		Warnings       []string `json:"warnings"`
+		ReauthRequired bool `json:"reauth_required"`
 	}
-
-	res := postConfig(t, payloadFromView(t, view), "s3cret")
 	decodeBody(t, res, &out)
-	if out.ReauthRequired {
-		t.Fatal("a save that keeps the password must not ask for re-auth")
-	}
-
-	p := payloadFromView(t, view)
-	p.Admin = adminAuthPayload{Action: "set", Token: "rotated"}
-	decodeBody(t, postConfig(t, p, "s3cret"), &out)
 	if !out.ReauthRequired {
-		t.Fatal("changing the password must ask the browser to re-authenticate")
+		t.Fatal("a changed password must ask the page to re-authenticate")
+	}
+	if got := currentConfig().Admin.Token; got != "brand-new" {
+		t.Fatalf("the new password must be live, got %q", got)
 	}
 
-	// With the env var in charge, a file edit has no effect, so no re-auth.
-	view = adminConfigView{}
-	w = adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
-	decodeBody(t, w, &view)
-	t.Setenv("LLM_PROXY_ADMIN_TOKEN", "env-token")
-	p = payloadFromView(t, view)
-	p.Admin = adminAuthPayload{Action: "set", Token: "ignored"}
-	decodeBody(t, postConfig(t, p, "env-token"), &out)
-	if out.ReauthRequired {
-		t.Fatal("a password supplied by the environment cannot change, so no re-auth is needed")
+	// Clearing closes the page.
+	p = payloadFromView(currentView(t))
+	p.Admin = adminAuthPayload{Action: "clear"}
+	if res := postConfig(t, p, "brand-new"); res.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
-	if !strings.Contains(strings.Join(out.Warnings, " | "), "LLM_PROXY_ADMIN_TOKEN") {
-		t.Fatalf("the env override must be reported, got %v", out.Warnings)
+	if got := currentConfig().Admin.Token; got != "" {
+		t.Fatalf("clear must remove the password, got %q", got)
 	}
 }
 
 func TestAdminConfigRejectsEmptyAdminTokenSet(t *testing.T) {
-	path := withTempConfig(t, testConfigTOML)
-	before, _ := os.ReadFile(path)
-
-	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
-	var view adminConfigView
-	decodeBody(t, w, &view)
-
-	for _, action := range []string{"set", "wipe"} {
-		p := payloadFromView(t, view)
-		p.Admin = adminAuthPayload{Action: action, Token: ""}
-		res := postConfig(t, p, "s3cret")
-		if res.Code != http.StatusBadRequest {
-			t.Fatalf("action %q must be rejected, got %d %s", action, res.Code, res.Body.String())
-		}
-	}
-	after, _ := os.ReadFile(path)
-	if string(after) != string(before) {
-		t.Fatal("a rejected save must leave the config file untouched")
+	withDefaultConfig(t)
+	p := payloadFromView(currentView(t))
+	p.Admin = adminAuthPayload{Action: "set", Token: ""}
+	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusBadRequest {
+		t.Fatalf("set with an empty password must be rejected, got %d", res.Code)
 	}
 }
 
 func TestAdminConfigSaveWarnsAboutPortChange(t *testing.T) {
-	withTempConfig(t, testConfigTOML)
-
-	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
-	var view adminConfigView
-	decodeBody(t, w, &view)
-
-	p := payloadFromViewWithProfiles(t, view)
-	p.Proxy.Port = 9099
-	// Drop a builtin alias from whatever profile table declares it, to check the
-	// fallback is reported.
-	for i := range p.Upstreams {
-		kept := p.Upstreams[i].Routing[:0]
-		for _, e := range p.Upstreams[i].Routing {
-			if e.Alias != "opus" {
-				kept = append(kept, e)
-			}
-		}
-		p.Upstreams[i].Routing = kept
-	}
-
+	withDefaultConfig(t)
+	p := payloadFromView(currentView(t))
+	p.Proxy.Port = 9090
 	res := postConfig(t, p, "s3cret")
 	if res.Code != http.StatusOK {
-		t.Fatalf("save failed: %s", res.Body.String())
-	}
-	var out struct {
-		Warnings []string `json:"warnings"`
-	}
-	decodeBody(t, res, &out)
-
-	joined := strings.Join(out.Warnings, " | ")
-	if !strings.Contains(joined, "重启") {
-		t.Fatalf("a port change must warn that a restart is required, got %q", joined)
-	}
-	if !strings.Contains(joined, "opus") {
-		t.Fatalf("an undeclared builtin alias must be flagged, got %q", joined)
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
 }
 
-// Anything the page does not model is dropped by the rewrite, so the operator has
-// to be told.
-func TestAdminConfigSaveWarnsAboutDroppedUnknownKeys(t *testing.T) {
-	withTempConfig(t, testConfigTOML+"\n[experimental]\nflag = true\n")
+// Declaring an anthropic-only scheme leaves the chat passthrough unavailable, and
+// a save that leaves it unavailable writes no [chat] table.
+func TestAdminConfigAnthropicOnlySchemeHasNoChatPassthrough(t *testing.T) {
+	_, schemePath := withTempConfig(t, testMainTOML, `protocol = "anthropic"
+url = "https://anthropic.example/api"
+key = "sk"
 
-	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
-	var view adminConfigView
-	decodeBody(t, w, &view)
-
-	res := postConfig(t, payloadFromView(t, view), "s3cret")
-	if res.Code != http.StatusOK {
-		t.Fatalf("save failed: %s", res.Body.String())
+[routing]
+sonnet = "m"
+`)
+	view := currentView(t)
+	if view.Chat.Available {
+		t.Fatalf("an anthropic-only scheme must report no chat upstream, got %+v", view.Chat)
 	}
-	var out struct {
-		Warnings []string `json:"warnings"`
+	if view.VLM.Active {
+		t.Fatalf("no [vlm] table means the describe pass is off, got %+v", view.VLM)
 	}
-	decodeBody(t, res, &out)
 
-	if !strings.Contains(strings.Join(out.Warnings, " | "), "experimental") {
-		t.Fatalf("dropping an unmodelled section must be reported, got %v", out.Warnings)
+	p := payloadFromView(view)
+	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
-}
-
-func TestAdminStatsEndpoint(t *testing.T) {
-	withTempConfig(t, testConfigTOML)
-	stats.reset()
-	t.Cleanup(stats.reset)
-
-	stats.beginReq("sonnet", "DeepSeek-Flash", "anthropic").success(tokenUsage{Input: 40, Output: 10, Reported: true})
-	stats.beginReq("sonnet", "DeepSeek-Flash", "anthropic").failure(catUpstream5xx, 503, "boom")
-
-	w := adminCall(t, handleAdminStats, http.MethodGet, "/admin/api/stats", "", "s3cret")
-	if w.Code != http.StatusOK {
-		t.Fatalf("status %d", w.Code)
-	}
-	var snap statsSnapshot
-	decodeBody(t, w, &snap)
-
-	if snap.Version != version {
-		t.Fatalf("the page needs the version, got %q", snap.Version)
-	}
-	if snap.Totals.Requests != 2 || snap.Totals.Failures != 1 {
-		t.Fatalf("totals: %+v", snap.Totals)
-	}
-	var found bool
-	for _, m := range snap.Models {
-		if m.Model != "DeepSeek-Flash" {
-			continue
-		}
-		found = true
-		if m.TPM != 50 || m.Failures != 1 || m.ErrorCounts[catUpstream5xx] != 1 {
-			t.Fatalf("model snapshot: %+v", m)
+	written, _ := os.ReadFile(schemePath)
+	// The file's own header comment names both sections, so look for the table
+	// headers at the start of a line rather than anywhere in the text.
+	for _, section := range []string{"\n[chat]", "\n[vlm]"} {
+		if strings.Contains(string(written), section) {
+			t.Fatalf("an unavailable section must not be written, got:\n%s", written)
 		}
 	}
-	if !found {
-		t.Fatal("the recorded model must appear in the snapshot")
-	}
 }
 
-func TestAdminStatsResetEndpoint(t *testing.T) {
-	withTempConfig(t, testConfigTOML)
-	stats.reset()
-	t.Cleanup(stats.reset)
+// Switching the active scheme re-points the main file and leaves every scheme file
+// untouched.
+func TestAdminConfigSchemeSwitchLeavesOtherFilesAlone(t *testing.T) {
+	configPath, mainSchemePath := withDefaultConfig(t)
+	// Add a second scheme file.
+	second := filepath.Join(filepath.Dir(mainSchemePath), "other.toml")
+	const otherBody = `protocol = "openai"
+url = "https://other.example/v1"
+key = "sk-other"
+`
+	if err := os.WriteFile(second, []byte(otherBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeMainFile, _ := os.ReadFile(mainSchemePath)
 
-	stats.beginReq("sonnet", "m", "anthropic").success(tokenUsage{Reported: true})
-
-	w := adminCall(t, handleAdminStatsReset, http.MethodPost, "/admin/api/stats/reset", "", "s3cret")
-	if w.Code != http.StatusOK {
-		t.Fatalf("status %d", w.Code)
+	p := payloadFromView(currentView(t))
+	p.Proxy.Scheme = "other"
+	if res := postConfig(t, p, "s3cret"); res.Code != http.StatusOK {
+		t.Fatalf("switch must succeed, got %d: %s", res.Code, res.Body.String())
 	}
-	if got := stats.snapshot().Totals.Requests; got != 0 {
-		t.Fatalf("reset must clear the collector, got %d", got)
+	if got := currentConfig().Proxy.Scheme; got != "other" {
+		t.Fatalf("the active scheme must change, got %q", got)
 	}
-}
-
-func TestAdminMethodsAreRestricted(t *testing.T) {
-	withTempConfig(t, testConfigTOML)
-
-	if w := adminCall(t, handleAdminConfig, http.MethodDelete, "/admin/api/config", "", "s3cret"); w.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("config delete must be rejected, got %d", w.Code)
+	if got := currentScheme().Text.URL; got != "https://other.example/v1" {
+		t.Fatalf("the newly active scheme must be live, got %q", got)
 	}
-	if w := adminCall(t, handleAdminStats, http.MethodPost, "/admin/api/stats", "", "s3cret"); w.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("stats post must be rejected, got %d", w.Code)
+	afterMainFile, _ := os.ReadFile(mainSchemePath)
+	if string(afterMainFile) != string(beforeMainFile) {
+		t.Fatal("switching must not rewrite the previously active scheme file")
 	}
-	if w := adminCall(t, handleAdminStatsReset, http.MethodGet, "/admin/api/stats/reset", "", "s3cret"); w.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("reset get must be rejected, got %d", w.Code)
+	afterOther, _ := os.ReadFile(second)
+	if string(afterOther) != otherBody {
+		t.Fatalf("switching must not rewrite the target scheme file, got:\n%s", afterOther)
 	}
-}
-
-// The generated TOML must survive a round trip through the parser the proxy uses
-// at startup, including aliases that need quoting.
-func TestRenderConfigTOMLRoundTrip(t *testing.T) {
-	p := adminConfigPayload{
-		Proxy: adminProxyView{Port: 8088, VLMModel: "MiniMax-M3", VLMMaxTokens: 8000},
-		Upstream: adminUpstreamView{
-			AnthropicURL:         "https://anthropic.example/api",
-			OpenAIURL:            "https://openai.example/v1",
-			DefaultUpstream:      "openai",
-			HeaderTimeoutSeconds: 120,
-			BodyIdleSeconds:      90,
-			MaxRetries:           2,
-		},
-		Upstreams: []adminUpstreamProfilePayload{
-			{
-				Name: "anthropic", Protocol: "anthropic", URL: "https://anthropic.example/api",
-				Routing: []adminRoutingEntry{
-					{Alias: "sonnet", Model: "DeepSeek-Flash", SupportsImage: true},
-					{Alias: "with space", Model: "quoted-alias"},
-					{Alias: "plain", Model: "plain-model"},
-				},
-			},
-			{
-				Name: "openai", Protocol: "openai", URL: "https://openai.example/v1",
-				Routing: []adminRoutingEntry{
-					{Alias: "opus", Model: "GLM-5.3"},
-				},
-			},
-		},
-	}
-
-	profiles := map[string]UpstreamProfile{
-		"anthropic": {
-			Protocol: protocolAnthropic, URL: "https://anthropic.example/api",
-			Routing: map[string]toml.Primitive{
-				"sonnet":     mustTOMLPrimitive(t, `{ model = "DeepSeek-Flash", supports_image = true }`),
-				"with space": mustTOMLPrimitive(t, `"quoted-alias"`),
-				"plain":      mustTOMLPrimitive(t, `"plain-model"`),
-			},
-		},
-		"openai": {
-			Protocol: protocolOpenAI, URL: "https://openai.example/v1",
-			Routing: map[string]toml.Primitive{
-				"opus": mustTOMLPrimitive(t, `{ model = "GLM-5.3" }`),
-			},
-		},
-	}
-	rendered := renderConfigTOML(p, "tok", "sk-x", profiles)
-
-	var got Config
-	if err := toml.Unmarshal([]byte(rendered), &got); err != nil {
-		t.Fatalf("rendered config must parse: %v\n%s", err, rendered)
-	}
-	if got.Keys.Sophnet != "sk-x" || got.Admin.Token != "tok" {
-		t.Fatalf("secrets must be carried over: %+v", got)
-	}
-
-	normalizeUpstreamProfiles(&got)
-	routes, _ := buildProfileRoutes(&got)
-	if routes["sonnet"].Model != "DeepSeek-Flash" || !routes["sonnet"].SupportsImage {
-		t.Fatalf("sonnet route lost its fields: %+v", routes["sonnet"])
-	}
-	// "opus" is declared on the openai profile, so it must route there.
-	if routes["opus"].Upstream != "openai" {
-		t.Fatalf("a per-profile alias must keep its profile: %+v", routes["opus"])
-	}
-	if routes["with space"].Model != "quoted-alias" {
-		t.Fatalf("a quoted alias must round trip: %+v", routes)
-	}
-	if routes["plain"].Upstream != "anthropic" {
-		t.Fatalf("an alias in the anthropic table must route there: %+v", routes["plain"])
-	}
-}
-
-// A save must not leave the file and the running config disagreeing when the new
-// file cannot be loaded.
-func TestAdminConfigSaveRollsBackOnReloadFailure(t *testing.T) {
-	path := withTempConfig(t, testConfigTOML)
-
-	w := adminCall(t, handleAdminConfig, http.MethodGet, "/admin/api/config", "", "s3cret")
-	var view adminConfigView
-	decodeBody(t, w, &view)
-
-	// Break the reload by pointing LLM_PROXY_CONFIG at a file that disappears
-	// between the write and the reload.
-	p := payloadFromView(t, view)
-	p.Proxy.VLMModel = "Should-Not-Stick"
-	body, _ := json.Marshal(p)
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/config", strings.NewReader(string(body)))
-	req.SetBasicAuth("admin", "s3cret")
-	rec := httptest.NewRecorder()
-
-	t.Setenv("LLM_PROXY_CONFIG", filepath.Join(t.TempDir(), "missing", "config.toml"))
-	handleAdminConfig(rec, req)
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("an unloadable save must fail, got %d %s", rec.Code, rec.Body.String())
-	}
-	if got := currentConfig().Proxy.VLMModel; got == "Should-Not-Stick" {
-		t.Fatal("a failed reload must not change the running config")
-	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("the original config file must still exist: %v", err)
+	mainWritten, _ := os.ReadFile(configPath)
+	if !strings.Contains(string(mainWritten), `scheme = "other"`) {
+		t.Fatalf("the main file must record the new scheme, got:\n%s", mainWritten)
 	}
 }
 
@@ -767,7 +575,7 @@ func TestAdminConfigSaveRollsBackOnReloadFailure(t *testing.T) {
 // a usable answer rather than an error, because the value only ever comes from
 // the page's own buttons.
 func TestAdminHistoryDefaultsTo24hAndEchoesRange(t *testing.T) {
-	withTempConfig(t, testConfigTOML)
+	withDefaultConfig(t)
 
 	for _, tc := range []struct{ query, want string }{
 		{"", "24h"},
@@ -794,7 +602,7 @@ func TestAdminHistoryDefaultsTo24hAndEchoesRange(t *testing.T) {
 // The series and the axis have to agree, or the page would plot points against
 // timestamps that do not line up.
 func TestAdminHistoryPointsMatchTheAxis(t *testing.T) {
-	withTempConfig(t, testConfigTOML)
+	withDefaultConfig(t)
 
 	w := adminCall(t, handleAdminStatsHistory, http.MethodGet, "/admin/api/stats/history?range=6h", "", "s3cret")
 	var snap historySnapshot
@@ -812,7 +620,7 @@ func TestAdminHistoryPointsMatchTheAxis(t *testing.T) {
 }
 
 func TestAdminHistoryRejectsNonGet(t *testing.T) {
-	withTempConfig(t, testConfigTOML)
+	withDefaultConfig(t)
 
 	w := adminCall(t, handleAdminStatsHistory, http.MethodPost, "/admin/api/stats/history", "", "s3cret")
 	if w.Code != http.StatusMethodNotAllowed {
@@ -823,12 +631,12 @@ func TestAdminHistoryRejectsNonGet(t *testing.T) {
 // The endpoint is as closed as the rest of /admin: no token configured means the
 // whole subtree is off, and a wrong password gets 401.
 func TestAdminHistoryIsBehindAuth(t *testing.T) {
-	withTempConfig(t, strings.Replace(testConfigTOML, `token = "s3cret"`, `token = ""`, 1))
+	withTempConfig(t, strings.Replace(testMainTOML, `token = "s3cret"`, `token = ""`, 1), testSchemeTOML)
 	if w := adminCall(t, requireAdmin(handleAdminStatsHistory), http.MethodGet, "/admin/api/stats/history", "", ""); w.Code != http.StatusNotFound {
 		t.Fatalf("without a token the route must 404, got %d", w.Code)
 	}
 
-	withTempConfig(t, testConfigTOML)
+	withDefaultConfig(t)
 	if w := adminCall(t, requireAdmin(handleAdminStatsHistory), http.MethodGet, "/admin/api/stats/history", "", "wrong"); w.Code != http.StatusUnauthorized {
 		t.Fatalf("a bad password must 401, got %d", w.Code)
 	}
@@ -840,7 +648,7 @@ func TestAdminHistoryIsBehindAuth(t *testing.T) {
 // A caller must not be able to make the server build an unbounded number of
 // series by repeating ?model=.
 func TestAdminHistoryCapsTheModelFilter(t *testing.T) {
-	withTempConfig(t, testConfigTOML)
+	withDefaultConfig(t)
 
 	q := "/admin/api/stats/history?range=1h"
 	for i := 0; i < historyMaxFilter+20; i++ {
@@ -860,7 +668,7 @@ func TestAdminHistoryCapsTheModelFilter(t *testing.T) {
 // The cache columns in the interval summary are read straight off the series, so
 // the payload has to carry the window totals and not only the per-bucket points.
 func TestAdminHistoryCarriesCacheTotals(t *testing.T) {
-	withTempConfig(t, testConfigTOML)
+	withDefaultConfig(t)
 
 	stats.reset()
 	c := stats.beginReq("sonnet", "DeepSeek-Flash", "anthropic")
@@ -884,4 +692,244 @@ func TestAdminHistoryCarriesCacheTotals(t *testing.T) {
 		t.Fatalf("the newest bucket must carry its own counters, got %+v", last)
 	}
 	stats.reset()
+}
+
+// A pre-0.15 main file still carries the old global sections. Telling its owner to
+// "add a scheme" would leave an upstream definition with nowhere to live, so the
+// error has to name the old format and point at the migration notes.
+func TestLoadConfigReportsTheOldFormatAndPointsAtTheMigration(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		main string
+		want []string
+	}{
+		{
+			name: "old global upstream and keys",
+			main: `[proxy]
+port = 8088
+
+[upstream]
+anthropic_url = "https://a.example/api"
+openai_url = "https://o.example/v1"
+
+[keys]
+sophnet = "k"
+`,
+			want: []string{"[keys]", "[upstream]", "旧格式", "从 0.14.x 升级"},
+		},
+		{
+			name: "old profiles and routing",
+			main: `[proxy]
+port = 8088
+vlm_model = "m"
+
+[upstreams.alpha]
+protocol = "openai"
+url = "https://a.example/v1"
+
+[routing]
+sonnet = "m"
+`,
+			want: []string{"[proxy].vlm_model", "[routing]", "[upstreams]", "旧格式"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeSchemeTree(t, tc.main, "unused", "")
+			err := loadConfig()
+			if err == nil {
+				t.Fatal("a pre-0.15 main file must be rejected")
+			}
+			msg := err.Error()
+			for _, want := range tc.want {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("the error must mention %q, got: %s", want, msg)
+				}
+			}
+		})
+	}
+}
+
+// A new-format file that merely forgot the scheme line gets the plain message: it
+// is not the old format and must not be sent to the migration notes.
+func TestLoadConfigMissingSchemeOnANewFileIsNotCalledLegacy(t *testing.T) {
+	writeSchemeTree(t, "[proxy]\nport = 8088\n", "unused", "")
+	err := loadConfig()
+	if err == nil {
+		t.Fatal("a file with no scheme must be rejected")
+	}
+	if strings.Contains(err.Error(), "旧格式") {
+		t.Fatalf("a new-format file must not be reported as legacy, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "scheme") {
+		t.Fatalf("the error must say what to set, got: %v", err)
+	}
+}
+
+// SOPHNET_API_KEY is the supported way to keep a key out of the file — the shipped
+// example uses it — so warning that it "is no longer read" whenever it is set is a
+// false alarm. The warning belongs to the leftover case: set in the environment,
+// referenced by no upstream in the scheme being saved.
+func TestAdminConfigSOPHNETKeyEnvWarningOnlyWhenUnreferenced(t *testing.T) {
+	withDefaultConfig(t)
+	t.Setenv("SOPHNET_API_KEY", "env-secret")
+
+	save := func(mutate func(*adminConfigPayload)) []string {
+		t.Helper()
+		p := payloadFromView(currentView(t))
+		mutate(&p)
+		res := postConfig(t, p, "s3cret")
+		if res.Code != http.StatusOK {
+			t.Fatalf("save failed: %d %s", res.Code, res.Body.String())
+		}
+		var out struct {
+			Warnings []string `json:"warnings"`
+		}
+		decodeBody(t, res, &out)
+		return out.Warnings
+	}
+
+	joined := strings.Join(save(func(p *adminConfigPayload) {
+		p.Upstream.KeyAction, p.Upstream.Key, p.Upstream.KeyEnv = "clear", "", "SOPHNET_API_KEY"
+	}), " | ")
+	if strings.Contains(joined, "都没有引用它") {
+		t.Fatalf("a scheme that reads the variable must not be warned about, got: %s", joined)
+	}
+
+	// The page resubmits the key_env it read back, so dropping the reference is an
+	// explicit act (the field cleared), not the default.
+	joined = strings.Join(save(func(p *adminConfigPayload) {
+		p.Upstream.KeyAction, p.Upstream.Key, p.Upstream.KeyEnv = "set", "sk-inline", ""
+	}), " | ")
+	if !strings.Contains(joined, "都没有引用它") {
+		t.Fatalf("an unreferenced variable must be reported, got: %s", joined)
+	}
+
+	// A [vlm] that reads it counts too.
+	joined = strings.Join(save(func(p *adminConfigPayload) {
+		p.VLM.Active, p.VLM.Model = true, "vl"
+		p.VLM.Inherit = false
+		p.VLM.Upstream = adminUpstreamPayload{
+			Protocol: protocolAnthropic, URL: "https://vlm.example/api", KeyAction: "clear", KeyEnv: "SOPHNET_API_KEY",
+		}
+	}), " | ")
+	if strings.Contains(joined, "都没有引用它") {
+		t.Fatalf("a [vlm] reference must count as using the variable, got: %s", joined)
+	}
+}
+
+// The haiku hint has two different truths: with sonnet declared, haiku inherits it;
+// with nothing declared, haiku passes through. Saying "passes through" in the first
+// case would be wrong.
+func TestAdminConfigHaikuHintReflectsTheInheritance(t *testing.T) {
+	withDefaultConfig(t)
+	save := func(routing []adminRoutingEntry) string {
+		t.Helper()
+		p := payloadFromView(currentView(t))
+		p.Routing = routing
+		res := postConfig(t, p, "s3cret")
+		if res.Code != http.StatusOK {
+			t.Fatalf("save failed: %d %s", res.Code, res.Body.String())
+		}
+		var out struct {
+			Warnings []string `json:"warnings"`
+		}
+		decodeBody(t, res, &out)
+		return strings.Join(out.Warnings, " | ")
+	}
+
+	// sonnet declared, haiku not: haiku inherits sonnet.
+	joined := save([]adminRoutingEntry{{Alias: "sonnet", Model: "m"}})
+	if !strings.Contains(joined, "沿用 sonnet") {
+		t.Fatalf("a declared sonnet must be reported as what haiku inherits, got: %s", joined)
+	}
+	if strings.Contains(joined, "未声明 haiku：客户端请求 haiku（含 claude-haiku-4-5 这类完整名字）时会原样转发") {
+		t.Fatalf("haiku must not be described as passing through when sonnet is declared, got: %s", joined)
+	}
+
+	// Nothing declared: haiku really does pass through.
+	joined = save(nil)
+	if !strings.Contains(joined, "未声明 haiku") || !strings.Contains(joined, "原样转发") {
+		t.Fatalf("with nothing declared haiku must be reported as passing through, got: %s", joined)
+	}
+}
+
+// A [vlm]/[chat] section with no url inherits the whole text upstream, so any
+// upstream field on it would be discarded. That is the silent fallback this design
+// removes, so the load fails and names the offending fields.
+func TestSchemeSectionWithoutURLRejectsDiscardedFields(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		scheme string
+		want   []string
+	}{
+		{
+			name: "vlm sets a key_env but no url",
+			scheme: `protocol = "anthropic"
+url = "https://anthropic.example/api"
+
+[vlm]
+model = "vl"
+key_env = "SOPHNET_API_KEY"
+`,
+			want: []string{"[vlm]", "key_env", "no url"},
+		},
+		{
+			name: "chat sets a protocol and key but no url",
+			scheme: `protocol = "openai"
+url = "https://openai.example/v1"
+
+[chat]
+protocol = "openai"
+key = "sk-x"
+`,
+			want: []string{"[chat]", "protocol", "key"},
+		},
+		{
+			name: "vlm sets a timeout but no url",
+			scheme: `protocol = "anthropic"
+url = "https://anthropic.example/api"
+
+[vlm]
+model = "vl"
+max_retries = 3
+`,
+			want: []string{"[vlm]", "max_retries"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, schemePath := writeSchemeTree(t, testMainTOML, "main", tc.scheme)
+			// The "fixed" half below loads successfully, so restore the published
+			// config afterwards like every other config-loading test does.
+			prevCfg, prevScheme := currentConfig(), currentScheme()
+			t.Cleanup(func() {
+				cfgMu.Lock()
+				cfg, scheme = prevCfg, prevScheme
+				cfgMu.Unlock()
+			})
+			err := loadConfig()
+			if err == nil {
+				t.Fatal("a section that would discard its own fields must be rejected")
+			}
+			msg := err.Error()
+			for _, want := range tc.want {
+				if !strings.Contains(msg, want) {
+					t.Fatalf("the error must mention %q, got: %s", want, msg)
+				}
+			}
+
+			// The same file without the discarded fields loads, so the error is
+			// about the contradiction and not about inheriting in general.
+			fixed := strings.NewReplacer(
+				"key_env = \"SOPHNET_API_KEY\"\n", "",
+				"protocol = \"openai\"\nkey = \"sk-x\"\n", "",
+				"max_retries = 3\n", "",
+			).Replace(tc.scheme)
+			if err := os.WriteFile(schemePath, []byte(fixed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := loadConfig(); err != nil {
+				t.Fatalf("inheriting with no extra fields must load, got: %v\n%s", err, fixed)
+			}
+		})
+	}
 }

@@ -38,9 +38,7 @@ func TestUpstreamConnectionsAreReusedAcrossRequests(t *testing.T) {
 	withRoutes(t, map[string]RouteEntry{"sonnet": {Model: "DeepSeek-Flash"}})
 
 	url, conns := countingUpstream(t, "application/json", nonStreamJSONBody)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = url
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, url)
 
 	const requests = 25
 	for i := 0; i < requests; i++ {
@@ -63,16 +61,14 @@ func TestUpstreamPoolSurvivesConfigReload(t *testing.T) {
 	withRoutes(t, map[string]RouteEntry{"sonnet": {Model: "DeepSeek-Flash"}})
 
 	url, conns := countingUpstream(t, "application/json", nonStreamJSONBody)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = url
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, url)
 
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
 	afterFirst := atomic.LoadInt64(conns)
 
 	// A reload republishes the same config, as a no-op save from the admin page
 	// does.
-	storeConfig(cfg, routeTargets, declaredRoutes)
+	storeConfig(currentConfig(), currentScheme())
 
 	for i := 0; i < 10; i++ {
 		callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
@@ -91,7 +87,7 @@ func TestUpstreamTransportIsSharedPerTimeout(t *testing.T) {
 	if a != b {
 		t.Fatal("the same header timeout must reuse one transport")
 	}
-	rc := reqConfig{cfg: Config{Upstream: UpstreamConfig{HeaderTimeoutSeconds: 120}}}
+	rc := reqConfig{up: Upstream{HeaderTimeout: 120 * time.Second}}
 	if got := rc.httpClient().Transport; got != a {
 		t.Fatalf("httpClient must use the shared transport, got %p want %p", got, a)
 	}

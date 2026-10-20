@@ -1,0 +1,66 @@
+# A complete scheme: one upstream, its optional image-describe pass, its optional
+# chat passthrough, and its model mapping table.
+#
+# The main config.toml selects which scheme runs via [proxy] scheme = "<name>".
+# Enable exactly one; the others sit on disk untouched.
+
+# ---- Text upstream ----
+# /v1/messages traffic goes here. protocol is required and picks the framing:
+#   anthropic -> POST <url>/v1/messages
+#   openai    -> POST <url>/v1/chat/completions, with the request and reply
+#               translated to and from the Anthropic format
+protocol = "openai"
+# A base URL gets the protocol's path appended; a full endpoint is used as-is.
+url = "https://api.deepseek.com"
+# Either a plaintext key or an environment variable (which wins when non-empty).
+# Prefer key_env so the secret stays out of the file.
+# key = "sk-..."
+key_env = "DEEPSEEK_API_KEY"
+
+# Optional; the defaults below apply when a field is omitted.
+#   header_timeout_seconds  per-attempt wait for upstream response headers (120)
+#   body_idle_seconds       longest silence tolerated mid-stream (90)
+#   max_retries             extra attempts after a transient error or 429/5xx (2)
+# header_timeout_seconds = 120
+# body_idle_seconds = 90
+# max_retries = 2
+
+# ---- Image description (optional) ----
+# Image-carrying requests are first described by a vision model, and the
+# description is inserted in place of the image before the request goes to the
+# text model. Routes marked supports_image = true skip this pass entirely.
+#
+# Omit the whole [vlm] table (or its model) to disable the pass; image requests
+# are then forwarded untouched.
+[vlm]
+model = "deepseek-vl"
+max_tokens = 8000
+# This scheme's text upstream is openai, and describe calls speak anthropic, so
+# [vlm] must name an anthropic upstream of its own. (Omit protocol/url only when
+# the text upstream above is anthropic.)
+protocol = "anthropic"
+url = "https://www.sophnet.com/api/open-apis/anthropic"
+key_env = "SOPHNET_API_KEY"
+
+# ---- Chat passthrough (optional) ----
+# The OpenAI-compatible /v1/chat/completions endpoint forwards here. Must speak
+# the openai protocol. Omit the table to reuse the text upstream when it is openai;
+# a scheme on the anthropic protocol with no [chat] table answers that endpoint
+# with 502 rather than misrouting it.
+[chat]
+# Omitted protocol/url reuse the text upstream (which is openai here).
+
+# ---- Model mapping table ----
+# Aliases are the model names a client asks for (Claude Code sends sonnet / opus /
+# haiku). Each maps to a model name this scheme's upstream understands.
+#
+#   sonnet = "model-name"                                  plain string
+#   sonnet = { model = "model-name", supports_image = true }  table form
+#
+# An alias that is not listed is forwarded under its own name, so an upstream
+# model can be requested directly. haiku falls back to sonnet when undeclared.
+[routing]
+sonnet = "deepseek-chat"
+opus = "deepseek-reasoner"
+# haiku = "deepseek-chat"
+# vision = { model = "deepseek-vl", supports_image = true }

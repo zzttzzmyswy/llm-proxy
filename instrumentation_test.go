@@ -8,20 +8,6 @@ import (
 	"testing"
 )
 
-// withRoutes installs a routing table for the duration of a test.
-func withRoutes(t *testing.T, routes map[string]RouteEntry) {
-	t.Helper()
-	cfgMu.Lock()
-	old := routeTargets
-	routeTargets = routes
-	cfgMu.Unlock()
-	t.Cleanup(func() {
-		cfgMu.Lock()
-		routeTargets = old
-		cfgMu.Unlock()
-	})
-}
-
 func withCleanStats(t *testing.T) {
 	t.Helper()
 	stats.reset()
@@ -94,9 +80,7 @@ func TestInstrumentUpstream5xx(t *testing.T) {
 		io.WriteString(w, `{"error":"overloaded"}`)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
 
@@ -120,9 +104,7 @@ func TestInstrumentUpstreamUnreachable(t *testing.T) {
 	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	deadURL := dead.URL
 	dead.Close()
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = deadURL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, deadURL)
 
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
 
@@ -151,16 +133,14 @@ func TestInstrumentEmptyResponse(t *testing.T) {
 // gateway serves, with the token counts it reported.
 func TestInstrumentOpenAIRoute(t *testing.T) {
 	withCleanStats(t)
-	withRoutes(t, map[string]RouteEntry{"flash": {Model: "glm-5.3-flash", Upstream: "openai"}})
+	withRoutes(t, map[string]RouteEntry{"flash": {Model: "glm-5.3-flash"}})
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"id":"c1","model":"glm-5.3-flash","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":33,"completion_tokens":7}}`)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.OpenAIURL
-	cfg.Upstream.OpenAIURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.OpenAIURL = oldURL })
+	withOpenAITextUpstream(t, upstream.URL)
 
 	callHandleMessages(t, `{"model":"flash","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
 
@@ -187,9 +167,7 @@ func TestInstrumentChatCompletionsPassthrough(t *testing.T) {
 		io.WriteString(w, upstreamBody)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.OpenAIURL
-	cfg.Upstream.OpenAIURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.OpenAIURL = oldURL })
+	withSchemeChat(t, upstream.URL)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.3-flash","messages":[]}`))
 	w := httptest.NewRecorder()
@@ -214,13 +192,11 @@ func TestInstrumentRoutingFollowsReload(t *testing.T) {
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
 	findModel(t, "Before-Model")
 
+	// Republish the scheme with a new model table, as a save from the admin page
+	// does: the request after it must use the new target.
+	next := testScheme(currentScheme().Text, map[string]RouteEntry{"sonnet": {Model: "After-Model"}})
 	cfgMu.Lock()
-	routes := make(map[string]RouteEntry, len(routeTargets))
-	for k, v := range routeTargets {
-		routes[k] = v
-	}
-	routes["sonnet"] = RouteEntry{Model: "After-Model"}
-	routeTargets = routes
+	scheme = next
 	cfgMu.Unlock()
 
 	callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)

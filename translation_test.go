@@ -5,45 +5,41 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 )
 
-// setRoute pins a routing entry for a test and restores the previous table on
-// cleanup so tests never leak route state into each other.
+// setRoute pins one routing entry on the active scheme, keeping the rest. The
+// scheme is restored by withScheme's cleanup.
 func setRoute(t *testing.T, alias, model, upstream string) {
 	t.Helper()
-	old := map[string]RouteEntry{}
-	if routeTargets != nil {
-		for k, v := range routeTargets {
-			old[k] = v
+	s := ensureScheme(t)
+	if s.Routes == nil {
+		s.Routes = map[string]RouteEntry{}
+	}
+	if s.DeclaredRoutes == nil {
+		s.DeclaredRoutes = map[string]bool{}
+	}
+	s.Routes[alias] = RouteEntry{Model: model}
+	s.DeclaredRoutes[alias] = true
+	// Mirror the loader: an undeclared haiku follows sonnet. Without this the
+	// helper would publish a scheme the loader can never produce.
+	if alias == "sonnet" {
+		if _, declared := s.DeclaredRoutes["haiku"]; !declared {
+			s.Routes["haiku"] = s.Routes["sonnet"]
 		}
 	}
-	if routeTargets == nil {
-		routeTargets = map[string]RouteEntry{}
-	}
-	routeTargets[alias] = RouteEntry{Model: model, Upstream: upstream}
-	t.Cleanup(func() {
-		if len(old) == 0 {
-			routeTargets = nil
-		} else {
-			routeTargets = old
-		}
-	})
 }
 
-// withOpenAIUpstream points cfg.Upstream.OpenAIURL at a test server and restores
-// the previous value on cleanup.
+// withOpenAIUpstream publishes an openai text upstream (and the matching chat
+// passthrough) at a test server, which is how the protocol-translation path is
+// exercised.
 func withOpenAIUpstream(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
-	old := cfg.Upstream.OpenAIURL
-	cfg.Upstream.OpenAIURL = srv.URL
-	t.Cleanup(func() { cfg.Upstream.OpenAIURL = old })
+	withSchemeChat(t, srv.URL)
 	return srv
 }
 
@@ -76,73 +72,48 @@ func ssePayloadsAll(stream, wantEvent string) []string {
 	return out
 }
 
-// loadConfig must accept a [routing] entry shaped as { model, upstream = "openai" }
-// for arbitrary aliases and keep the legacy string form for sonnet/opus/haiku.
-func TestLoadConfigParsesOpenAIRoute(t *testing.T) {
-	oldCfg := cfg
-	oldRoutes := routeTargets
-	t.Cleanup(func() { cfg = oldCfg; routeTargets = oldRoutes })
+// loadConfig decodes both routing forms: a plain model string and a table with
+// supports_image.
+func TestLoadConfigParsesBothRouteForms(t *testing.T) {
+	withTempConfig(t, testMainTOML, `protocol = "anthropic"
+url = "https://anthropic.example/api"
+key = "sk"
 
-	path := filepath.Join(t.TempDir(), "config.toml")
-	content := `[proxy]
-port = 8088
-
-[upstream]
-anthropic_url = "https://www.sophnet.com/api/open-apis/anthropic"
-openai_url = "https://api.sophnet.com/v1/chat/completions"
-
-[keys]
-sophnet = ""
-
-[upstreams.anthropic.routing]
+[routing]
 sonnet = "DeepSeek-V4-Flash-0731"
 opus = "GLM-5.3"
+flash = { model = "glm-5.3-flash", supports_image = true }
+`)
 
-[upstreams.openai.routing]
-flash = { model = "glm-5.3-flash" }
-`
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
+	s := currentScheme()
+	if e := s.Routes["sonnet"]; e.Model != "DeepSeek-V4-Flash-0731" {
+		t.Fatalf("a string route must decode, got %+v", e)
 	}
-	t.Setenv("LLM_PROXY_CONFIG", path)
-	if err := loadConfig(); err != nil {
-		t.Fatalf("loadConfig: %v", err)
+	if e := s.Routes["flash"]; e.Model != "glm-5.3-flash" || !e.SupportsImage {
+		t.Fatalf("a table route must decode with its image flag, got %+v", e)
 	}
-
-	if e := routeTargets["sonnet"]; e.Model != "DeepSeek-V4-Flash-0731" || e.Upstream != profileNameAnthropic {
-		t.Fatalf("a string route in the anthropic table must stay there, got %+v", e)
-	}
-	flash := routeTargets["flash"]
-	if flash.Model != "glm-5.3-flash" || flash.Upstream != "openai" {
-		t.Fatalf("table route must decode to openai target, got %+v", flash)
-	}
-	if e := routeTargets["haiku"]; e.Model != routeTargets["sonnet"].Model {
-		t.Fatalf("haiku must default to sonnet target, got %+v", e)
+	if e := s.Routes["haiku"]; e.Model != s.Routes["sonnet"].Model {
+		t.Fatalf("haiku must default to the sonnet target, got %+v", e)
 	}
 }
 
 // A malformed routing entry must not abort config loading: it is skipped with a
 // warning and the rest of the table survives.
 func TestLoadConfigSkipsInvalidRoutingEntry(t *testing.T) {
-	oldCfg := cfg
-	t.Cleanup(func() { cfg = oldCfg })
+	withTempConfig(t, testMainTOML, `protocol = "anthropic"
+url = "https://anthropic.example/api"
+key = "sk"
 
-	path := filepath.Join(t.TempDir(), "config.toml")
-	content := `[upstreams.anthropic.routing]
+[routing]
 sonnet = "DeepSeek-V4-Flash-0731"
 flash = 42
-`
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
+`)
+
+	s := currentScheme()
+	if e, ok := s.Routes["flash"]; ok {
+		t.Fatalf("an invalid entry must be skipped, got %+v", e)
 	}
-	t.Setenv("LLM_PROXY_CONFIG", path)
-	if err := loadConfig(); err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if e := routeTargets["flash"]; e.Model != "" {
-		t.Fatalf("invalid entry must be skipped, got %+v", e)
-	}
-	if e := routeTargets["sonnet"]; e.Model == "" {
+	if e := s.Routes["sonnet"]; e.Model == "" {
 		t.Fatal("valid entries must survive an invalid sibling")
 	}
 }
@@ -154,72 +125,100 @@ func TestRouteTargetResolution(t *testing.T) {
 	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 	setRoute(t, "opus", "GLM-5.3", "")
 	setRoute(t, "haiku", "DeepSeek-V4-Flash-0731", "")
-	setRoute(t, "flash", "glm-5.3-flash", "openai")
+	setRoute(t, "flash", "glm-5.3-flash", "")
 	setRoute(t, "main", "GLM-5.3", "")
 
-	if tr := snapshotConfig().routeTarget("flash"); tr.Model != "glm-5.3-flash" || tr.Upstream != "openai" {
+	if tr := snapshotConfig().routeTarget("flash"); tr.Model != "glm-5.3-flash" {
 		t.Fatalf("custom alias route must win, got %+v", tr)
 	}
-	if tr := snapshotConfig().routeTarget("sonnet"); tr.Model != "DeepSeek-V4-Flash-0731" || tr.Upstream != "" {
-		t.Fatalf("fixed key must resolve via legacy field, got %+v", tr)
+	if tr := snapshotConfig().routeTarget("sonnet"); tr.Model != "DeepSeek-V4-Flash-0731" {
+		t.Fatalf("a declared alias must resolve through the table, got %+v", tr)
 	}
 	if tr := snapshotConfig().routeTarget("main"); tr.Model != "GLM-5.3" {
 		t.Fatalf("string table entry must decode, got %+v", tr)
 	}
-	if tr := snapshotConfig().routeTarget("claude-sonnet-4"); tr.Model != "DeepSeek-V4-Flash-0731" {
-		t.Fatalf("composed name must match by substring, got %+v", tr)
+	if tr := snapshotConfig().routeTarget("unknown-model"); tr.Model != "unknown-model" {
+		t.Fatalf("an undeclared alias must pass through under its own name, got %+v", tr)
 	}
-	if tr := snapshotConfig().routeTarget("unknown-model"); tr.Model != "" || tr.Upstream != "" {
-		t.Fatalf("unknown model must passthrough untouched, got %+v", tr)
+
+	// Claude Code never asks for the bare family name: it sends the full model
+	// id, so a scheme that maps only sonnet/opus/haiku has to still resolve.
+	if tr := snapshotConfig().routeTarget("claude-sonnet-4"); tr.Model != "DeepSeek-V4-Flash-0731" {
+		t.Fatalf("a composed sonnet name must resolve to the sonnet target, got %+v", tr)
+	}
+	if tr := snapshotConfig().routeTarget("claude-opus-4-5"); tr.Model != "GLM-5.3" {
+		t.Fatalf("a composed opus name must resolve to the opus target, got %+v", tr)
+	}
+	if tr := snapshotConfig().routeTarget("claude-haiku-4-5"); tr.Model != "DeepSeek-V4-Flash-0731" {
+		t.Fatalf("a composed haiku name must resolve to the haiku target, got %+v", tr)
+	}
+	if tr := snapshotConfig().routeTarget("claude-3-5-sonnet-20241022"); tr.Model != "DeepSeek-V4-Flash-0731" {
+		t.Fatalf("an older composed sonnet name must resolve too, got %+v", tr)
 	}
 }
 
-// The builtin aliases (sonnet/opus/haiku) must accept table form exactly like
-// custom aliases: `sonnet = { model = "glm-5.3-flash", upstream = "openai" }`
-// routes the default Claude model to the OpenAI gateway. haiku (unset) inherits
-// sonnet's full target including its upstream.
+// A family alias the scheme does not declare must not borrow a sibling's target:
+// a scheme that maps only sonnet has no answer for an opus request, so the name is
+// forwarded as written rather than silently served by the sonnet model.
+func TestRouteTargetUndeclaredFamilyPassesThrough(t *testing.T) {
+	setRoute(t, "sonnet", "sonnet-target", "")
+
+	if tr := snapshotConfig().routeTarget("claude-opus-4-5"); tr.Model != "claude-opus-4-5" {
+		t.Fatalf("an undeclared opus must pass through, got %+v", tr)
+	}
+	if tr := snapshotConfig().routeTarget("claude-sonnet-4-5"); tr.Model != "sonnet-target" {
+		t.Fatalf("a declared sonnet must still resolve, got %+v", tr)
+	}
+	// haiku is the documented exception: it inherits sonnet, so it resolves.
+	if tr := snapshotConfig().routeTarget("claude-haiku-4-5"); tr.Model != "sonnet-target" {
+		t.Fatalf("haiku must fall back to sonnet, got %+v", tr)
+	}
+}
+
+// A scheme that declares nothing at all forwards every name unchanged.
+func TestRouteTargetWithNoTablePassesEverythingThrough(t *testing.T) {
+	withScheme(t, testScheme(anthropicTextUpstream("http://127.0.0.1:1"), nil))
+
+	for _, model := range []string{"claude-sonnet-4-5", "claude-opus-4-5", "claude-haiku-4-5", "sonnet", "my-model"} {
+		if tr := snapshotConfig().routeTarget(model); tr.Model != model {
+			t.Fatalf("an empty table must forward %q unchanged, got %+v", model, tr)
+		}
+	}
+}
+
+// The builtin aliases accept table form exactly like custom aliases, and an
+// undeclared haiku inherits sonnet's target.
 func TestLoadConfigParsesBuiltinAliasTableRoute(t *testing.T) {
-	oldCfg := cfg
-	oldRoutes := routeTargets
-	t.Cleanup(func() { cfg = oldCfg; routeTargets = oldRoutes })
+	withTempConfig(t, testMainTOML, `protocol = "anthropic"
+url = "https://anthropic.example/api"
+key = "sk"
 
-	path := filepath.Join(t.TempDir(), "config.toml")
-	content := `[upstreams.anthropic.routing]
+[routing]
 opus = "GLM-5.3"
+sonnet = { model = "glm-5.3-flash", supports_image = true }
+`)
 
-[upstreams.openai.routing]
-sonnet = { model = "glm-5.3-flash" }
-`
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
+	if tr := snapshotConfig().routeTarget("sonnet"); tr.Model != "glm-5.3-flash" || !tr.SupportsImage {
+		t.Fatalf("table-form sonnet must decode, got %+v", tr)
 	}
-	t.Setenv("LLM_PROXY_CONFIG", path)
-	if err := loadConfig(); err != nil {
-		t.Fatalf("loadConfig: %v", err)
+	if tr := snapshotConfig().routeTarget("haiku"); tr.Model != "glm-5.3-flash" || !tr.SupportsImage {
+		t.Fatalf("haiku must inherit sonnet's whole target, got %+v", tr)
 	}
-	if tr := snapshotConfig().routeTarget("sonnet"); tr.Model != "glm-5.3-flash" || tr.Upstream != "openai" {
-		t.Fatalf("table-form sonnet must route to the openai gateway, got %+v", tr)
-	}
-	if tr := snapshotConfig().routeTarget("haiku"); tr.Model != "glm-5.3-flash" || tr.Upstream != "openai" {
-		t.Fatalf("haiku must inherit sonnet's target including upstream, got %+v", tr)
-	}
-	if tr := snapshotConfig().routeTarget("opus"); tr.Model != "GLM-5.3" || tr.Upstream != profileNameAnthropic {
-		t.Fatalf("string-form opus must stay on the anthropic gateway, got %+v", tr)
+	if tr := snapshotConfig().routeTarget("opus"); tr.Model != "GLM-5.3" {
+		t.Fatalf("string-form opus must decode, got %+v", tr)
 	}
 }
 
 // openAICompletionsURL must not double-append the path when the configured URL
 // already carries the full /chat/completions endpoint.
 func TestOpenAICompletionsURLNoDoubleAppend(t *testing.T) {
-	old := cfg.Upstream.OpenAIURL
-	t.Cleanup(func() { cfg.Upstream.OpenAIURL = old })
-
-	cfg.Upstream.OpenAIURL = "https://api.sophnet.com/v1/chat/completions"
-	if got := snapshotConfig().openAICompletionsURL(); got != "https://api.sophnet.com/v1/chat/completions" {
+	full := reqConfig{up: testUpstream("t", protocolOpenAI, "https://api.sophnet.com/v1/chat/completions")}
+	if got := full.openAICompletionsURL(); got != "https://api.sophnet.com/v1/chat/completions" {
 		t.Fatalf("full endpoint must be used as-is, got %q", got)
 	}
-	cfg.Upstream.OpenAIURL = "https://www.sophnet.com/api/open-apis/openai"
-	if got := snapshotConfig().openAICompletionsURL(); got != "https://www.sophnet.com/api/open-apis/openai/v1/chat/completions" {
+
+	base := reqConfig{up: testUpstream("t", protocolOpenAI, "https://www.sophnet.com/api/open-apis/openai")}
+	if got := base.openAICompletionsURL(); got != "https://www.sophnet.com/api/open-apis/openai/v1/chat/completions" {
 		t.Fatalf("base URL must get the path appended, got %q", got)
 	}
 }
@@ -614,7 +613,7 @@ data: [DONE]
 // End to end: a request named "flash" hitting the openai route must reach the
 // OpenAI upstream in OpenAI format and come back as an Anthropic message.
 func TestE2EOpenAIRouteNonStream(t *testing.T) {
-	setRoute(t, "flash", "glm-5.3-flash", "openai")
+	setRoute(t, "flash", "glm-5.3-flash", "")
 
 	var upstreamBody string
 	var mu sync.Mutex
@@ -665,7 +664,7 @@ func TestE2EOpenAIRouteNonStream(t *testing.T) {
 // End to end: streaming through the openai route must surface as Anthropic SSE
 // events that Claude Code can consume.
 func TestE2EOpenAIRouteStreaming(t *testing.T) {
-	setRoute(t, "flash", "glm-5.3-flash", "openai")
+	setRoute(t, "flash", "glm-5.3-flash", "")
 
 	withOpenAIUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -697,7 +696,7 @@ func TestE2EOpenAIRouteStreaming(t *testing.T) {
 // End to end: an upstream 400 must pass through as an Anthropic error with the
 // same status, not get mangled into a success.
 func TestE2EOpenAIErrorPassthrough(t *testing.T) {
-	setRoute(t, "flash", "glm-5.3-flash", "openai")
+	setRoute(t, "flash", "glm-5.3-flash", "")
 
 	withOpenAIUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -726,7 +725,7 @@ func TestE2EOpenAIErrorPassthrough(t *testing.T) {
 // The sonnet route must keep using the Anthropic gateway untouched (regression):
 // the openai branch only fires for routes marked upstream=openai.
 func TestSonnetRouteStillUsesAnthropicGateway(t *testing.T) {
-	setRoute(t, "flash", "glm-5.3-flash", "openai")
+	setRoute(t, "flash", "glm-5.3-flash", "")
 	setRoute(t, "sonnet", "DeepSeek-V4-Flash-0731", "")
 
 	got := modelSentToUpstream(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
@@ -743,10 +742,10 @@ func TestSonnetRouteStillUsesAnthropicGateway(t *testing.T) {
 // "model ... do not support image params".
 func TestOpenAIRouteImageRequestVLMDescribed(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRoute(t, "flash", "DeepSeek-V4-Flash-0731", "openai")
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		withVLM(t, "", 8000)
 	})
 
 	var describeCalls int
@@ -777,9 +776,7 @@ func TestOpenAIRouteImageRequestVLMDescribed(t *testing.T) {
 		io.WriteString(w, nonStreamJSONBody)
 	}))
 	t.Cleanup(anthropicUp.Close)
-	oldAnthropic := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = anthropicUp.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldAnthropic })
+	withSchemeAnthropic(t, anthropicUp.URL)
 
 	openAIUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
@@ -790,9 +787,7 @@ func TestOpenAIRouteImageRequestVLMDescribed(t *testing.T) {
 		io.WriteString(w, `{"id":"c1","model":"DeepSeek-V4-Flash-0731","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
 	}))
 	t.Cleanup(openAIUp.Close)
-	oldOpenAI := cfg.Upstream.OpenAIURL
-	cfg.Upstream.OpenAIURL = openAIUp.URL
-	t.Cleanup(func() { cfg.Upstream.OpenAIURL = oldOpenAI })
+	withSchemeChat(t, openAIUp.URL)
 
 	reqBody := `{"model":"flash","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
 	resp := callHandleMessages(t, reqBody)
@@ -830,10 +825,10 @@ func TestOpenAIRouteImageRequestVLMDescribed(t *testing.T) {
 // so an image-carrying request went straight to the text model and failed.
 func TestOpenAIRouteImageDescribeFailFallsBackToVLM(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRoute(t, "flash", "DeepSeek-V4-Flash-0731", "openai")
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		withVLM(t, "", 8000)
 	})
 
 	var anthropicCalls int
@@ -871,9 +866,7 @@ func TestOpenAIRouteImageDescribeFailFallsBackToVLM(t *testing.T) {
 		io.WriteString(w, nonStreamJSONBody)
 	}))
 	t.Cleanup(anthropicUp.Close)
-	oldAnthropic := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = anthropicUp.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldAnthropic })
+	withSchemeAnthropic(t, anthropicUp.URL)
 
 	openAIUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
@@ -883,9 +876,7 @@ func TestOpenAIRouteImageDescribeFailFallsBackToVLM(t *testing.T) {
 		w.WriteHeader(500)
 	}))
 	t.Cleanup(openAIUp.Close)
-	oldOpenAI := cfg.Upstream.OpenAIURL
-	cfg.Upstream.OpenAIURL = openAIUp.URL
-	t.Cleanup(func() { cfg.Upstream.OpenAIURL = oldOpenAI })
+	withSchemeChat(t, openAIUp.URL)
 
 	reqBody := `{"model":"flash","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
 	resp := callHandleMessages(t, reqBody)
@@ -905,45 +896,43 @@ func TestOpenAIRouteImageDescribeFailFallsBackToVLM(t *testing.T) {
 
 // ---- MYS-940: supports_image 与 default_upstream ----
 
-// setRouteFull pins a routing entry including the supports_image flag and
-// restores the previous table on cleanup.
+// setRouteFull pins a routing entry including the supports_image flag.
 func setRouteFull(t *testing.T, alias, model, upstream string, supportsImage bool) {
 	t.Helper()
-	setRoute(t, alias, model, upstream)
-	routeTargets[alias] = RouteEntry{Model: model, Upstream: upstream, SupportsImage: supportsImage}
+	s := ensureScheme(t)
+	if s.Routes == nil {
+		s.Routes = map[string]RouteEntry{}
+	}
+	if s.DeclaredRoutes == nil {
+		s.DeclaredRoutes = map[string]bool{}
+	}
+	s.Routes[alias] = RouteEntry{Model: model, SupportsImage: supportsImage}
+	s.DeclaredRoutes[alias] = true
 }
 
 // [routing] table values must carry an optional supports_image flag. A route with
 // supports_image=true declares that the upstream model already understands images,
 // so the proxy must NOT run its builtin VLM describe pass for that model.
 func TestLoadConfigParsesSupportsImageFlag(t *testing.T) {
-	oldCfg := cfg
-	oldRoutes := routeTargets
-	t.Cleanup(func() { cfg = oldCfg; routeTargets = oldRoutes })
+	withTempConfig(t, testMainTOML, `protocol = "anthropic"
+url = "https://anthropic.example/api"
+key = "sk"
 
-	path := filepath.Join(t.TempDir(), "config.toml")
-	content := `[upstreams.anthropic.routing]
+[routing]
 sonnet = { model = "DeepSeek-V4-Flash-0731", supports_image = true }
 opus = { model = "GLM-5.2", supports_image = false }
-
-[upstreams.openai.routing]
 haiku = { model = "glm-5.3-flash", supports_image = true }
-`
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
+`)
+
+	s := currentScheme()
+	if tr := s.Routes["sonnet"]; !tr.SupportsImage {
+		t.Fatalf("sonnet must decode supports_image=true, got %+v", tr)
 	}
-	t.Setenv("LLM_PROXY_CONFIG", path)
-	if err := loadConfig(); err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if tr := routeTargets["sonnet"]; !tr.SupportsImage || tr.Upstream != profileNameAnthropic {
-		t.Fatalf("sonnet must decode supports_image=true on the anthropic gateway, got %+v", tr)
-	}
-	if tr := routeTargets["opus"]; tr.SupportsImage {
+	if tr := s.Routes["opus"]; tr.SupportsImage {
 		t.Fatalf("opus must decode supports_image=false, got %+v", tr)
 	}
-	if tr := routeTargets["haiku"]; !tr.SupportsImage || tr.Upstream != "openai" {
-		t.Fatalf("haiku must combine supports_image with upstream=openai, got %+v", tr)
+	if tr := s.Routes["haiku"]; !tr.SupportsImage {
+		t.Fatalf("haiku must keep its own supports_image rather than inherit sonnet's, got %+v", tr)
 	}
 }
 
@@ -952,10 +941,10 @@ haiku = { model = "glm-5.3-flash", supports_image = true }
 // is skipped entirely.
 func TestImageRequestSkipsVLMWhenRouteSupportsImage(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRouteFull(t, "vision", "GLM-5.3", "", true)
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		withVLM(t, "", 8000)
 	})
 
 	var vlmCalls int
@@ -981,9 +970,7 @@ func TestImageRequestSkipsVLMWhenRouteSupportsImage(t *testing.T) {
 		io.WriteString(w, nonStreamJSONBody)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	reqBody := `{"model":"vision","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
 	callHandleMessages(t, reqBody)
@@ -1005,22 +992,20 @@ func TestImageRequestSkipsVLMWhenRouteSupportsImage(t *testing.T) {
 // image_url payload (no VLM pass), so the openai text model receives it directly.
 func TestImageRequestSkipsVLMWhenSupportsImageOpenAIRoute(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRouteFull(t, "vision", "glm-5.3-flash", "openai", true)
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		withVLM(t, "", 8000)
 	})
 
-	oldAnthropic := cfg.Upstream.AnthropicURL
+	// The describe pass keeps an anthropic upstream; the text route is openai. A
+	// supports_image route must never touch the anthropic one.
 	switchAnthropic := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"unexpected anthropic call"}],"model":"x","id":"x","usage":{"input_tokens":1,"output_tokens":1}}`)
 	}))
-	cfg.Upstream.AnthropicURL = switchAnthropic.URL
-	t.Cleanup(func() {
-		switchAnthropic.Close()
-		cfg.Upstream.AnthropicURL = oldAnthropic
-	})
+	t.Cleanup(switchAnthropic.Close)
+	withSchemeAnthropic(t, switchAnthropic.URL)
 
 	var openAIBody string
 	openAIUp := withOpenAIUpstream(t, func(w http.ResponseWriter, r *http.Request) {
@@ -1050,10 +1035,10 @@ func TestImageRequestSkipsVLMWhenSupportsImageOpenAIRoute(t *testing.T) {
 // the model image-capable, so a rejection is a config error worth surfacing.
 func TestSupportsImageImage400PassesThroughNoRetry(t *testing.T) {
 	resetImageDescCacheForTests()
-	cfg.Proxy.VLMModel = "MiniMax-M3"
+	withVLM(t, "MiniMax-M3", 8000)
 	setRouteFull(t, "vision", "GLM-5.3", "", true)
 	t.Cleanup(func() {
-		cfg.Proxy.VLMModel = ""
+		withVLM(t, "", 8000)
 	})
 
 	var calls int
@@ -1064,9 +1049,7 @@ func TestSupportsImageImage400PassesThroughNoRetry(t *testing.T) {
 		io.WriteString(w, `{"error":{"message":"Model do not support image input"}}`)
 	}))
 	t.Cleanup(upstream.Close)
-	oldURL := cfg.Upstream.AnthropicURL
-	cfg.Upstream.AnthropicURL = upstream.URL
-	t.Cleanup(func() { cfg.Upstream.AnthropicURL = oldURL })
+	withAnthropicUpstream(t, upstream.URL)
 
 	reqBody := `{"model":"vision","max_tokens":10,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]}`
 	resp := callHandleMessages(t, reqBody)
@@ -1078,129 +1061,7 @@ func TestSupportsImageImage400PassesThroughNoRetry(t *testing.T) {
 	}
 }
 
-// [upstream] default_upstream chooses the gateway for routing entries that do not
-// name one explicitly: "openai" backfills those entries, "claude"/"anthropic" or
-// unset keeps the anthropic gateway.
-func TestLoadConfigDefaultUpstreamOpenAI(t *testing.T) {
-	oldCfg := cfg
-	oldRoutes := routeTargets
-	t.Cleanup(func() { cfg = oldCfg; routeTargets = oldRoutes })
 
-	path := filepath.Join(t.TempDir(), "config.toml")
-	content := `[upstream]
-anthropic_url = "https://www.sophnet.com/api/open-apis/anthropic"
-openai_url = "https://www.sophnet.com/api/open-apis/openai"
-default_upstream = "openai"
-
-[upstreams.openai.routing]
-sonnet = "DeepSeek-V4-Flash-0731"
-opus = { model = "GLM-5.2" }
-
-[upstreams.anthropic.routing]
-flash = { model = "glm-5.3-flash"}
-
-`
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("LLM_PROXY_CONFIG", path)
-	if err := loadConfig(); err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if tr := routeTargets["sonnet"]; tr.Upstream != "openai" {
-		t.Fatalf("default_upstream=openai must backfill the plain-string sonnet route, got %+v", tr)
-	}
-	if tr := routeTargets["opus"]; tr.Upstream != "openai" {
-		t.Fatalf("default_upstream=openai must backfill the upstream-less table route, got %+v", tr)
-	}
-	if tr := routeTargets["flash"]; tr.Upstream == "openai" {
-		t.Fatalf("an explicit upstream=anthropic entry must not be overridden, got %+v", tr)
-	}
-}
-
-// With no default_upstream (or "claude"/"anthropic"), routing entries default to
-// the claude-format anthropic gateway.
-func TestLoadConfigDefaultUpstreamDefaultsToClaude(t *testing.T) {
-	oldCfg := cfg
-	oldRoutes := routeTargets
-	t.Cleanup(func() { cfg = oldCfg; routeTargets = oldRoutes })
-
-	path := filepath.Join(t.TempDir(), "config.toml")
-	content := `[upstreams.anthropic.routing]
-sonnet = "DeepSeek-V4-Flash-0731"
-flash = { model = "glm-5.3-flash" }
-`
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("LLM_PROXY_CONFIG", path)
-	if err := loadConfig(); err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-	if tr := routeTargets["sonnet"]; tr.Upstream != profileNameAnthropic {
-		t.Fatalf("a route declared in the anthropic table must stay there, got %+v", tr)
-	}
-	if tr := routeTargets["flash"]; tr.Upstream != profileNameAnthropic {
-		t.Fatalf("an alias with no explicit profile must resolve to anthropic, got %+v", tr)
-	}
-}
-
-// default_upstream=openai must actually route requests through the OpenAI gateway,
-// not just fill the routing table: a plain-string sonnet entry (no explicit
-// upstream) with the openai default sends the translated request to openai_url and
-// never touches the anthropic upstream.
-func TestDefaultUpstreamOpenAIRoutesThroughOpenAIGateway(t *testing.T) {
-	resetImageDescCacheForTests()
-	oldCfg := cfg
-	oldRoutes := routeTargets
-	t.Cleanup(func() { cfg = oldCfg; routeTargets = oldRoutes })
-
-	var anthropicCalls int
-	anthroUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		anthropicCalls++
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"anthropic"}],"model":"x","id":"x","usage":{"input_tokens":1,"output_tokens":1}}`)
-	}))
-	t.Cleanup(anthroUp.Close)
-
-	var openAIBody string
-	openAIUp := withOpenAIUpstream(t, func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		openAIBody = string(b)
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"id":"c1","model":"DeepSeek-V4-Flash-0731","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
-	})
-	t.Cleanup(openAIUp.Close)
-
-	path := filepath.Join(t.TempDir(), "config.toml")
-	content := `[upstream]
-anthropic_url = "` + anthroUp.URL + `"
-openai_url = "` + openAIUp.URL + `"
-default_upstream = "openai"
-
-[upstreams.openai.routing]
-sonnet = "DeepSeek-V4-Flash-0731"
-
-`
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("LLM_PROXY_CONFIG", path)
-	if err := loadConfig(); err != nil {
-		t.Fatalf("loadConfig: %v", err)
-	}
-
-	resp := callHandleMessages(t, `{"model":"sonnet","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`)
-	if !strings.Contains(resp, `"ok"`) {
-		t.Fatalf("expected the openai gateway reply, got: %q", resp)
-	}
-	if anthropicCalls != 0 {
-		t.Fatalf("default_upstream=openai must not hit the anthropic upstream, got %d calls", anthropicCalls)
-	}
-	if !strings.Contains(openAIBody, `"role":"user"`) {
-		t.Fatalf("the translated openai request must carry the message, got: %s", openAIBody)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // Effort / reasoning pass-through on the OpenAI gateway.
